@@ -106,6 +106,9 @@ install_lid_switch_script() {
 #!/bin/bash
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
+LAPTOP_MODE="2880x1920@120"
+LAPTOP_POSITION="0x0"
+LAPTOP_SCALE="2"
 LOG_FILE="/tmp/hypr-lid-switch.log"
 
 log_message() {
@@ -121,14 +124,25 @@ get_external_display() {
     hyprctl monitors | grep -E "^Monitor (DP|HDMI|USB-C)" | grep -v "$LAPTOP_DISPLAY" | head -1 | cut -d' ' -f2
 }
 
+disable_laptop_display() {
+    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = true })"
+}
+
+enable_laptop_display() {
+    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE })"
+}
+
 handle_lid_close() {
     log_message "Lid closed - checking for external monitor"
     
     CURRENT_EXTERNAL=$(get_external_display)
     if [[ -n "$CURRENT_EXTERNAL" ]]; then
         log_message "External monitor detected: $CURRENT_EXTERNAL, disabling laptop display"
-        hyprctl keyword monitor "$LAPTOP_DISPLAY,disable" || log_message "Failed to disable laptop display"
-        log_message "Laptop display disabled, $CURRENT_EXTERNAL remains as primary"
+        if disable_laptop_display; then
+            log_message "Laptop display disabled, $CURRENT_EXTERNAL remains as primary"
+        else
+            log_message "Failed to disable laptop display"
+        fi
     else
         log_message "No external monitor detected, hibernating system"
         systemctl hibernate
@@ -141,11 +155,18 @@ handle_lid_open() {
     CURRENT_EXTERNAL=$(get_external_display)
     if [[ -n "$CURRENT_EXTERNAL" ]]; then
         log_message "External monitor detected: $CURRENT_EXTERNAL, setting up dual monitor configuration"
-        hyprctl keyword monitor "$LAPTOP_DISPLAY,2880x1920@120,0x0,2" || log_message "Failed to enable laptop display"
-        log_message "Dual monitor setup restored with $CURRENT_EXTERNAL"
+        if enable_laptop_display; then
+            log_message "Dual monitor setup restored with $CURRENT_EXTERNAL"
+        else
+            log_message "Failed to enable laptop display"
+        fi
     else
         log_message "No external monitor, enabling laptop display only"
-        hyprctl keyword monitor "$LAPTOP_DISPLAY,2880x1920@120,0x0,2" || log_message "Failed to enable laptop display"
+        if enable_laptop_display; then
+            log_message "Laptop display enabled"
+        else
+            log_message "Failed to enable laptop display"
+        fi
     fi
 }
 
