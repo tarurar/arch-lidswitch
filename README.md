@@ -7,23 +7,27 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 🔄 **Automatic Monitor Management**: Seamlessly switches between laptop and external monitors based on lid state
 - 🖥️ **Smart Detection**: Automatically detects laptop screen (eDP-*) and external monitors (DP-*/HDMI-*/USB-C-*)
 - ⚡ **Instant Response**: Real-time lid state monitoring with ~1 second response time  
-- 🛡️ **Safe Implementation**: Uses Hyprland's native `hyprctl` commands - no dangerous systemd modifications
+- 🛡️ **Hyprland Lua Compatible**: Uses `hyprctl eval`/`hl.monitor()` for modern Hyprland Lua configs
 - 🔧 **Zero Configuration**: Works out of the box after installation
 - 📝 **Comprehensive Logging**: Debug-friendly logs for troubleshooting
 - 🔁 **Automatic Startup**: Systemd user service starts with your session
 - 💤 **Smart Power Management**: Hibernates when lid closes without external monitor
+- 📊 **Waybar Layout Refresh**: Refreshes Waybar layer geometry without restarting the Waybar process
 
 ## How It Works
 
 ### Lid Closed + External Monitor Connected
 - Disables laptop internal display
-- External monitor becomes the primary display
+- Moves the external monitor to `0x0`
+- External monitor becomes the only active display
 - All workspaces remain accessible
+- Waybar is briefly hidden/shown with `SIGUSR1` so its layer geometry follows the new layout
 
 ### Lid Opened
 - Re-enables laptop internal display  
-- Restores dual monitor configuration
+- Restores dual monitor configuration with the external monitor at `auto-right`
 - Maintains your workspace layout
+- Refreshes Waybar layer geometry without restarting Waybar
 
 ### Lid Closed + No External Monitor
 - Hibernates the system automatically
@@ -40,14 +44,14 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 ### Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aserper/hyprland-lid-switch/main/install-hyprland-lid-switch.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tarurar/arch-lidswitch/main/install-hyprland-lid-switch.sh | bash
 ```
 
 ### Manual Install
 
 1. **Download the installer**:
    ```bash
-   wget https://raw.githubusercontent.com/aserper/hyprland-lid-switch/main/install-hyprland-lid-switch.sh
+   wget https://raw.githubusercontent.com/tarurar/arch-lidswitch/main/install-hyprland-lid-switch.sh
    chmod +x install-hyprland-lid-switch.sh
    ```
 
@@ -178,6 +182,32 @@ journalctl --user -u lid-monitor.service -f
    systemctl --user restart lid-monitor.service
    ```
 
+### Hyprland Reports "Use eval"
+
+Hyprland Lua configs do not accept dynamic monitor changes through the legacy `hyprctl keyword monitor ...` path. If you see:
+
+```text
+keyword can't work with non-legacy parsers. Use eval.
+```
+
+use the current script version. It configures monitors through Lua:
+
+```bash
+hyprctl eval 'hl.monitor({ output = "eDP-1", disabled = true })'
+```
+
+### Waybar Is Offset After Closing the Lid
+
+Some Waybar/Hyprland combinations keep stale layer geometry after a monitor is disabled. The script works around this by toggling Waybar visibility twice:
+
+```bash
+pkill -x -SIGUSR1 waybar
+sleep 0.1
+pkill -x -SIGUSR1 waybar
+```
+
+This forces Waybar to recalculate its layer position while keeping the same Waybar process alive. `SIGUSR2` is intentionally not used because it can terminate Waybar on some setups.
+
 ## Customization
 
 ### Monitor Resolution and Positioning
@@ -185,9 +215,16 @@ journalctl --user -u lid-monitor.service -f
 Edit `~/.config/hypr/scripts/lid-switch.sh` to customize monitor settings:
 
 ```bash
-# In handle_lid_open() function, modify these lines:
-hyprctl keyword monitor "$LAPTOP_DISPLAY,2880x1920@120,0x0,2"
-hyprctl keyword monitor "$CURRENT_EXTERNAL,5120x1440@144,1440x0,1"
+# Internal monitor defaults
+LAPTOP_MODE="2880x1920@120"
+LAPTOP_POSITION="0x0"
+LAPTOP_SCALE="2"
+
+# Clamshell mode puts the external monitor at 0x0.
+hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = true }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"0x0\", scale = 1 })"
+
+# Lid-open mode restores the external monitor to the right.
+hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"auto-right\", scale = 1 })"
 ```
 
 ### Response Timing
