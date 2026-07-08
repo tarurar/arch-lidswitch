@@ -124,12 +124,32 @@ get_external_display() {
     hyprctl monitors | grep -E "^Monitor (DP|HDMI|USB-C)" | grep -v "$LAPTOP_DISPLAY" | head -1 | cut -d' ' -f2
 }
 
-disable_laptop_display() {
-    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = true })"
+configure_clamshell_layout() {
+    local external_display="$1"
+
+    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = true }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"0x0\", scale = 1 })"
 }
 
 enable_laptop_display() {
     hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE })"
+}
+
+configure_dual_layout() {
+    local external_display="$1"
+
+    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"auto-right\", scale = 1 })"
+}
+
+restart_waybar() {
+    if pgrep -x waybar >/dev/null 2>&1; then
+        pkill -x waybar || {
+            log_message "Failed to stop Waybar"
+            return 1
+        }
+        sleep 0.2
+    fi
+
+    hyprctl dispatch 'hl.dsp.exec_cmd("waybar")' >/dev/null || log_message "Failed to start Waybar"
 }
 
 handle_lid_close() {
@@ -138,7 +158,8 @@ handle_lid_close() {
     CURRENT_EXTERNAL=$(get_external_display)
     if [[ -n "$CURRENT_EXTERNAL" ]]; then
         log_message "External monitor detected: $CURRENT_EXTERNAL, disabling laptop display"
-        if disable_laptop_display; then
+        if configure_clamshell_layout "$CURRENT_EXTERNAL"; then
+            restart_waybar
             log_message "Laptop display disabled, $CURRENT_EXTERNAL remains as primary"
         else
             log_message "Failed to disable laptop display"
@@ -155,7 +176,8 @@ handle_lid_open() {
     CURRENT_EXTERNAL=$(get_external_display)
     if [[ -n "$CURRENT_EXTERNAL" ]]; then
         log_message "External monitor detected: $CURRENT_EXTERNAL, setting up dual monitor configuration"
-        if enable_laptop_display; then
+        if configure_dual_layout "$CURRENT_EXTERNAL"; then
+            restart_waybar
             log_message "Dual monitor setup restored with $CURRENT_EXTERNAL"
         else
             log_message "Failed to enable laptop display"
@@ -163,6 +185,7 @@ handle_lid_open() {
     else
         log_message "No external monitor, enabling laptop display only"
         if enable_laptop_display; then
+            restart_waybar
             log_message "Laptop display enabled"
         else
             log_message "Failed to enable laptop display"
