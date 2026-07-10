@@ -48,8 +48,14 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         '@@LID_MONITOR_SCRIPT@@')
             sed -n 'p' "$ROOT_DIR/runtime/lid-monitor.sh"
             ;;
+        '@@LID_RESUME_MONITOR_SCRIPT@@')
+            sed -n 'p' "$ROOT_DIR/runtime/lid-resume-monitor.sh"
+            ;;
         '@@LID_MONITOR_SERVICE@@')
             sed -n 'p' "$ROOT_DIR/runtime/lid-monitor.service.in"
+            ;;
+        '@@LID_RESUME_MONITOR_SERVICE@@')
+            sed -n 'p' "$ROOT_DIR/runtime/lid-resume-monitor.service.in"
             ;;
         '@@HYPRLAND_SESSION_TARGET@@')
             sed -n 'p' "$ROOT_DIR/runtime/hyprland-session.target"

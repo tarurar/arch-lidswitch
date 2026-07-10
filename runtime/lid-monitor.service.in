@@ -1,5 +1,6 @@
 [Unit]
 Description=Hyprland Lid Switch Monitor
+Wants=lid-resume-monitor.service
 PartOf=graphical-session.target
 After=graphical-session.target
 ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
@@ -7,7 +8,7 @@ ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=exec
-ExecStartPre=$HYPRCTL_BIN monitors
+ExecStartPre=$TIMEOUT_BIN --kill-after=1s 2s $HYPRCTL_BIN monitors
 ExecStart=$SCRIPTS_DIR/lid-monitor.sh
 StandardOutput=journal
 StandardError=journal

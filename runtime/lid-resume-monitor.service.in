@@ -1,0 +1,17 @@
+[Unit]
+Description=Hyprland Lid Resume Signal Monitor
+BindsTo=lid-monitor.service
+PartOf=graphical-session.target
+After=graphical-session.target lid-monitor.service
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=exec
+ExecStart=$SCRIPTS_DIR/lid-resume-monitor.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arch-lidswitch-resume
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=2

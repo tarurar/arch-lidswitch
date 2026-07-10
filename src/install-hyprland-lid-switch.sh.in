@@ -31,8 +31,10 @@ SESSION_BRIDGE="$SCRIPTS_DIR/lid-session-bridge.sh"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SESSION_TARGET_FILE="$SYSTEMD_USER_DIR/hyprland-session.target"
 SERVICE_FILE="$SYSTEMD_USER_DIR/lid-monitor.service"
+RESUME_SERVICE_FILE="$SYSTEMD_USER_DIR/lid-resume-monitor.service"
 DOCTOR_FILE="$SCRIPTS_DIR/lid-switch-doctor.sh"
 MONITOR_STATE_FILE="$SCRIPTS_DIR/monitor-state.sh"
+RESUME_MONITOR_FILE="$SCRIPTS_DIR/lid-resume-monitor.sh"
 
 SESSION_CONFIG_BEGIN='-- BEGIN arch-lidswitch managed session integration'
 SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
@@ -41,6 +43,7 @@ SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
 laptop_monitor=""
 HYPRCTL_BIN=""
 JQ_BIN=""
+TIMEOUT_BIN=""
 HYPRLAND_MONITORS_JSON=""
 session_config_state=""
 legacy_default_target_service=false
@@ -191,6 +194,43 @@ check_hyprland_capabilities() {
     fi
 
     log_success "Hyprland $version_string capability profile is compatible (configProvider=lua instances=1)"
+}
+
+check_resume_runtime_dependencies() {
+    local version_output version_line version_major
+    local busctl_bin stdbuf_bin
+
+    if ! command_exists stdbuf; then
+        log_error "This installer requires stdbuf from GNU coreutils for the resume event stream"
+        return 1
+    fi
+    if ! command_exists timeout; then
+        log_error "This installer requires timeout from GNU coreutils for bounded Hyprland commands"
+        return 1
+    fi
+    if ! command_exists busctl; then
+        log_error "This installer requires busctl from systemd 257 or newer"
+        return 1
+    fi
+    stdbuf_bin=$(command -v stdbuf)
+    busctl_bin=$(command -v busctl)
+    TIMEOUT_BIN=$(command -v timeout)
+
+    if ! version_output=$("$stdbuf_bin" -oL "$busctl_bin" --version); then
+        log_error "Could not query systemd/busctl version"
+        return 1
+    fi
+    version_line=${version_output%%$'\n'*}
+    if [[ ! "$version_line" =~ ^systemd[[:space:]]+([0-9]{1,9})([[:space:]]|$) ]]; then
+        log_error "Could not parse systemd/busctl version: $version_line"
+        return 1
+    fi
+    version_major=$((10#${BASH_REMATCH[1]}))
+    if (( version_major < 257 )); then
+        log_error "systemd/busctl 257 or newer is required; found $version_major"
+        return 1
+    fi
+    log_success "systemd/busctl $version_major supports the resume event stream"
 }
 
 run_lid_switch_doctor() {
@@ -480,15 +520,30 @@ EOF
     log_success "Lid monitor script installed at $SCRIPTS_DIR/lid-monitor.sh"
 }
 
+install_lid_resume_monitor_script() {
+    log_info "Installing lid resume monitor script..."
+
+    cat > "$RESUME_MONITOR_FILE" << 'EOF'
+@@LID_RESUME_MONITOR_SCRIPT@@
+EOF
+
+    chmod +x "$RESUME_MONITOR_FILE"
+    log_success "Lid resume monitor installed at $RESUME_MONITOR_FILE"
+}
+
 # Install the systemd service
 install_systemd_service() {
-    log_info "Installing systemd user service..."
+    log_info "Installing systemd user services..."
     
     cat > "$SERVICE_FILE" << EOF
 @@LID_MONITOR_SERVICE@@
 EOF
+
+    cat > "$RESUME_SERVICE_FILE" << EOF
+@@LID_RESUME_MONITOR_SERVICE@@
+EOF
     
-    log_success "Systemd service installed at $SYSTEMD_USER_DIR/lid-monitor.service"
+    log_success "Systemd services installed at $SYSTEMD_USER_DIR"
 }
 
 detect_legacy_default_target_service() {
@@ -519,6 +574,7 @@ enable_service() {
 
     # Ensure the daemon is started even if the session target was already active.
     systemctl --user start lid-monitor.service
+    systemctl --user start lid-resume-monitor.service
     
     # Check if service started successfully
     if systemctl --user is-active --quiet lid-monitor.service; then
@@ -526,6 +582,13 @@ enable_service() {
     else
         log_error "Failed to start lid monitor service"
         systemctl --user status lid-monitor.service
+        exit 1
+    fi
+    if systemctl --user is-active --quiet lid-resume-monitor.service; then
+        log_success "Lid resume monitor service is running"
+    else
+        log_error "Failed to start lid resume monitor service"
+        systemctl --user status lid-resume-monitor.service
         exit 1
     fi
 }
@@ -550,11 +613,14 @@ backup_existing_files() {
     
     local backup_dir="$HYPR_CONFIG_DIR/scripts/.backup-$(date +%Y%m%d-%H%M%S)"
     
-    if [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] || [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]]; then
+    if [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] || \
+        [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]] || \
+        [[ -f "$RESUME_MONITOR_FILE" ]]; then
         mkdir -p "$backup_dir"
         
         [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] && cp "$SCRIPTS_DIR/lid-switch.sh" "$backup_dir/"
         [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]] && cp "$SCRIPTS_DIR/lid-monitor.sh" "$backup_dir/"
+        [[ -f "$RESUME_MONITOR_FILE" ]] && cp "$RESUME_MONITOR_FILE" "$backup_dir/"
         
         log_success "Existing files backed up to $backup_dir"
     fi
@@ -571,16 +637,19 @@ print_final_instructions() {
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
     echo "  • Lid switch doctor: $DOCTOR_FILE"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
+    echo "  • Resume event listener: $RESUME_MONITOR_FILE"
     echo "  • Hyprland session bridge: $SESSION_BRIDGE"
     echo "  • Hyprland session module: $SESSION_MODULE"
     echo "  • Hyprland session target: hyprland-session.target"
     echo "  • Systemd user service: lid-monitor.service"
+    echo "  • Systemd resume service: lid-resume-monitor.service"
     echo
     echo -e "${BLUE}How it works:${NC}"
     echo "  • When lid closes + an enabled external output: laptop screen turns off"
     echo "  • When lid closes without an enabled external output: systemd-logind owns the power action"
     echo "  • When lid opens: laptop screen turns back on (dual monitor setup)"
     echo "  • Awake output activation and hotplug changes are reconciled automatically"
+    echo "  • Resume events wait for stable lid and output topology before reconciliation"
     echo "  • Service starts automatically on login without changing the initial layout"
     echo
     echo -e "${BLUE}Useful commands:${NC}"
@@ -608,6 +677,7 @@ main() {
     log_info "Performing pre-installation checks..."
     check_hyprland
     inspect_session_config
+    check_resume_runtime_dependencies
     check_lid_power_policy
     check_hyprland_capabilities
     
@@ -630,6 +700,7 @@ main() {
     install_lid_switch_script "$laptop_monitor"
     install_lid_switch_doctor
     install_lid_monitor_script
+    install_lid_resume_monitor_script
     install_session_bridge
     install_session_module
     install_session_target

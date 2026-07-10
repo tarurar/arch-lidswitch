@@ -139,6 +139,28 @@ case "$command_name" in
     busctl)
         log_command "$@"
         case "${1:-}" in
+            --version)
+                printf 'systemd %s (test)\n' "${TEST_BUSCTL_VERSION:-261}"
+                ;;
+            --system)
+                if [[ "${2:-}" == --json=short && \
+                    "${3:-}" == --limit-messages=* && \
+                    "${4:-}" == wait ]]; then
+                    if [[ "${TEST_BUSCTL_WAIT_FAIL:-0}" == 1 ]]; then
+                        printf 'Configured busctl wait failure\n' >&2
+                        exit 94
+                    fi
+                    wait_output=${TEST_BUSCTL_WAIT_OUTPUT:-}
+                    if [[ -z "$wait_output" ]]; then
+                        wait_output='{"type":"b","data":[false]}'
+                    fi
+                    printf '%s\n' "$wait_output"
+                else
+                    printf 'Unsupported fake system busctl operation: %s %s %s\n' \
+                        "${2:-}" "${3:-}" "${4:-}" >&2
+                    exit 98
+                fi
+                ;;
             get-property)
                 property=${5:-}
                 if [[ -n "${TEST_BUSCTL_FAIL_PROPERTY:-}" && \
@@ -315,6 +337,9 @@ case "$command_name" in
             printf '%s\n' "$dpms_output_value"
         elif [[ "${1:-}" == "eval" ]]; then
             log_command "$@"
+            if [[ -n "${TEST_HYPRCTL_EVAL_DELAY_SECONDS:-}" ]]; then
+                "${TEST_REAL_SLEEP_BIN:?}" "$TEST_HYPRCTL_EVAL_DELAY_SECONDS"
+            fi
             if configured_failure_pending \
                 "${TEST_HYPRCTL_EVAL_FAILURES:-0}" \
                 "${TEST_HYPRCTL_EVAL_COUNTER:-}" eval; then
@@ -342,6 +367,19 @@ case "$command_name" in
         ;;
     systemctl)
         log_command "$@"
+        if [[ "${1:-}" == --user && "${2:-}" == kill ]]; then
+            if configured_failure_pending \
+                "${TEST_SYSTEMCTL_KILL_FAILURES:-0}" \
+                "${TEST_SYSTEMCTL_KILL_COUNTER:-}" systemctl-kill; then
+                printf 'Configured systemctl kill failure\n' >&2
+                exit 94
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
+            fi
+        fi
         if [[ "${1:-}" == "--user" && "${2:-}" == "disable" && "${3:-}" == "--now" && \
             -n "${TEST_REQUIRED_PATHS_BEFORE_DISABLE:-}" ]]; then
             IFS=':' read -r -a required_paths <<< "$TEST_REQUIRED_PATHS_BEFORE_DISABLE"

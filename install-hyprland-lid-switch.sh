@@ -31,8 +31,10 @@ SESSION_BRIDGE="$SCRIPTS_DIR/lid-session-bridge.sh"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SESSION_TARGET_FILE="$SYSTEMD_USER_DIR/hyprland-session.target"
 SERVICE_FILE="$SYSTEMD_USER_DIR/lid-monitor.service"
+RESUME_SERVICE_FILE="$SYSTEMD_USER_DIR/lid-resume-monitor.service"
 DOCTOR_FILE="$SCRIPTS_DIR/lid-switch-doctor.sh"
 MONITOR_STATE_FILE="$SCRIPTS_DIR/monitor-state.sh"
+RESUME_MONITOR_FILE="$SCRIPTS_DIR/lid-resume-monitor.sh"
 
 SESSION_CONFIG_BEGIN='-- BEGIN arch-lidswitch managed session integration'
 SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
@@ -41,6 +43,7 @@ SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
 laptop_monitor=""
 HYPRCTL_BIN=""
 JQ_BIN=""
+TIMEOUT_BIN=""
 HYPRLAND_MONITORS_JSON=""
 session_config_state=""
 legacy_default_target_service=false
@@ -191,6 +194,43 @@ check_hyprland_capabilities() {
     fi
 
     log_success "Hyprland $version_string capability profile is compatible (configProvider=lua instances=1)"
+}
+
+check_resume_runtime_dependencies() {
+    local version_output version_line version_major
+    local busctl_bin stdbuf_bin
+
+    if ! command_exists stdbuf; then
+        log_error "This installer requires stdbuf from GNU coreutils for the resume event stream"
+        return 1
+    fi
+    if ! command_exists timeout; then
+        log_error "This installer requires timeout from GNU coreutils for bounded Hyprland commands"
+        return 1
+    fi
+    if ! command_exists busctl; then
+        log_error "This installer requires busctl from systemd 257 or newer"
+        return 1
+    fi
+    stdbuf_bin=$(command -v stdbuf)
+    busctl_bin=$(command -v busctl)
+    TIMEOUT_BIN=$(command -v timeout)
+
+    if ! version_output=$("$stdbuf_bin" -oL "$busctl_bin" --version); then
+        log_error "Could not query systemd/busctl version"
+        return 1
+    fi
+    version_line=${version_output%%$'\n'*}
+    if [[ ! "$version_line" =~ ^systemd[[:space:]]+([0-9]{1,9})([[:space:]]|$) ]]; then
+        log_error "Could not parse systemd/busctl version: $version_line"
+        return 1
+    fi
+    version_major=$((10#${BASH_REMATCH[1]}))
+    if (( version_major < 257 )); then
+        log_error "systemd/busctl 257 or newer is required; found $version_major"
+        return 1
+    fi
+    log_success "systemd/busctl $version_major supports the resume event stream"
 }
 
 run_lid_switch_doctor() {
@@ -747,6 +787,7 @@ MONITOR_STATE_DIR=""
 MONITOR_STATE_FILE=""
 MONITOR_STATE_TOPOLOGY=""
 MONITOR_STATE_SNAPSHOT=""
+HYPRCTL_TIMEOUT_SECONDS=2
 
 monitor_state_fail() {
     MONITOR_STATE_ERROR=$1
@@ -759,7 +800,8 @@ monitor_state_observe_topology() {
 
     MONITOR_STATE_ERROR=""
     MONITOR_STATE_TOPOLOGY=""
-    if ! monitors_json=$(hyprctl -j monitors all); then
+    if ! monitors_json=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
+        hyprctl -j monitors all); then
         monitor_state_fail monitor_query_failed
         return
     fi
@@ -796,6 +838,8 @@ monitor_state_observe_topology() {
         | select(length == 1)
         | .[0] as $internal
         | select($internal.disabled or ($internal | valid_layout))
+        | select(all($monitors[] | select(.name != $output);
+            .disabled or (. | valid_layout)))
         | {
             internal: {
                 output: $internal.name,
@@ -821,7 +865,19 @@ monitor_state_observe_topology() {
                     output: .name,
                     enabled: (.disabled == false),
                     disabled: .disabled,
-                    dpms: dpms
+                    dpms: dpms,
+                    layout: (if .disabled then null else {
+                            output: .name,
+                            mode: ((.width | tostring) + "x" +
+                                (.height | tostring) + "@" +
+                                (.refreshRate | tostring)),
+                            position: ((.x | tostring) + "x" +
+                                (.y | tostring)),
+                            scale: .scale,
+                            transform: .transform,
+                            mirror: (if .mirrorOf == "none" then ""
+                                else .mirrorOf end)
+                        } end)
                 }
             ] | sort_by(.output))
         }
@@ -852,6 +908,35 @@ monitor_state_topology_fingerprint() {
             output: .internal.output,
             enabled: .internal.enabled
         },
+        externals: [.externals[] | {
+            output: .output,
+            enabled: .enabled
+        }]
+    }' <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_full_topology_fingerprint() {
+    jq -cer '{
+        internal: {
+            output: .internal.output,
+            enabled: .internal.enabled,
+            disabled: .internal.disabled,
+            dpms: .internal.dpms,
+            layout: .internal.layout
+        },
+        externals: [.externals[] | {
+            output: .output,
+            enabled: .enabled,
+            disabled: .disabled,
+            dpms: .dpms,
+            layout: .layout
+        }]
+    }' <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_policy_environment_token() {
+    jq -cer '{
+        internal: .internal.output,
         externals: [.externals[] | {
             output: .output,
             enabled: .enabled
@@ -999,7 +1084,7 @@ monitor_state_disable_internal_output() {
         monitor_state_fail internal_output_invalid
         return
     fi
-    if ! apply_output=$(hyprctl eval \
+    if ! apply_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" hyprctl eval \
         "hl.monitor({ output = \"$output\", disabled = true })"); then
         MONITOR_STATE_ERROR=disable_apply_failed
         return 3
@@ -1033,7 +1118,8 @@ monitor_state_restore_internal_layout() {
         return
     fi
 
-    if ! apply_output=$(hyprctl eval "$restore_expression"); then
+    if ! apply_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
+        hyprctl eval "$restore_expression"); then
         MONITOR_STATE_ERROR=restore_apply_failed
         return 3
     fi
@@ -1052,7 +1138,7 @@ monitor_state_enable_internal_dpms() {
         monitor_state_fail internal_output_invalid
         return
     fi
-    if ! apply_output=$(hyprctl eval \
+    if ! apply_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" hyprctl eval \
         "hl.dispatch(hl.dsp.dpms({ action = \"enable\", monitor = \"$output\" }))"); then
         MONITOR_STATE_ERROR=dpms_apply_failed
         return 3
@@ -1129,6 +1215,8 @@ if ! . "$SCRIPT_DIR/monitor-state.sh"; then
 fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
+EXPECTED_LID=${ARCH_LIDSWITCH_EXPECTED_LID:-}
+EXPECTED_POLICY_TOKEN=${ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN:-}
 
 refresh_waybar_layout() {
     if pgrep -x waybar >/dev/null 2>&1; then
@@ -1138,6 +1226,67 @@ refresh_waybar_layout() {
         }
         sleep 0.1
         pkill -x -SIGUSR1 waybar || log_error waybar_refresh_failed phase=show
+    fi
+}
+
+validate_expected_generation_contract() {
+    local action=$1
+
+    if [[ -z "$EXPECTED_LID" && -z "$EXPECTED_POLICY_TOKEN" ]]; then
+        return 0
+    fi
+    if [[ -z "$EXPECTED_LID" || -z "$EXPECTED_POLICY_TOKEN" ]] || \
+        [[ "$EXPECTED_LID" != open && "$EXPECTED_LID" != closed ]] || \
+        [[ "$action" == open && "$EXPECTED_LID" != open ]] || \
+        [[ "$action" == close && "$EXPECTED_LID" != closed ]]; then
+        log_error invalid_generation_contract action="$action" status=1
+        return 1
+    fi
+    if ! jq -e '
+        type == "object" and
+        (keys | sort) == ["externals", "internal"] and
+        (.internal | type == "string") and
+        (.externals | type == "array") and
+        all(.externals[];
+            type == "object" and
+            (keys | sort) == ["enabled", "output"] and
+            (.output | type == "string") and
+            (.enabled | type == "boolean"))
+    ' <<< "$EXPECTED_POLICY_TOKEN" >/dev/null; then
+        log_error invalid_generation_contract action="$action" status=1
+        return 1
+    fi
+}
+
+verify_expected_generation() {
+    local action=$1
+    local phase=$2
+    local observed_lid observed_policy_token
+
+    if [[ -z "$EXPECTED_LID" ]]; then
+        return 0
+    fi
+    if ! observed_lid=$(read_lid_state); then
+        log_error reconciliation_failed action="$action" phase="$phase" \
+            status=2 reason=lid_state_unavailable \
+            expected_lid="$EXPECTED_LID"
+        return 2
+    fi
+    if ! observed_policy_token=$(monitor_state_policy_environment_token); then
+        log_error reconciliation_failed action="$action" phase="$phase" \
+            status=2 reason=policy_token_unavailable \
+            expected_lid="$EXPECTED_LID"
+        return 2
+    fi
+    if [[ "$observed_lid" != "$EXPECTED_LID" || \
+        "$observed_policy_token" != "$EXPECTED_POLICY_TOKEN" ]]; then
+        log_error reconciliation_failed action="$action" phase="$phase" \
+            status=5 reason=generation_mismatch \
+            expected_lid="$EXPECTED_LID" observed_lid="$observed_lid" \
+            expected_policy_token="$EXPECTED_POLICY_TOKEN" \
+            observed_policy_token="$observed_policy_token" \
+            topology="$MONITOR_STATE_TOPOLOGY"
+        return 5
     fi
 }
 
@@ -1157,6 +1306,11 @@ reconcile_lid_state() {
         log_error reconciliation_failed action="$action" phase=observe \
             desired_internal=unknown status=2 reason="$MONITOR_STATE_ERROR"
         return 2
+    fi
+    if verify_expected_generation "$action" pre_apply; then
+        :
+    else
+        return $?
     fi
 
     topology_snapshot=$MONITOR_STATE_TOPOLOGY
@@ -1259,6 +1413,11 @@ reconcile_lid_state() {
     fi
 
     topology_snapshot=$MONITOR_STATE_TOPOLOGY
+    if verify_expected_generation "$action" post_apply; then
+        :
+    else
+        return $?
+    fi
     verified_internal=$(monitor_state_internal_enabled)
     if verified_dpms=$(monitor_state_internal_dpms); then
         :
@@ -1384,9 +1543,11 @@ case "${1:-}" in
             log_error invalid_arguments status=1 reason=preserve_dpms_requires_open
             exit 1
         fi
+        validate_expected_generation_contract close || exit $?
         reconcile_lid_state close false
         ;;
     open)
+        validate_expected_generation_contract open || exit $?
         reconcile_lid_state open "$preserve_dpms"
         ;;
     "")
@@ -1400,8 +1561,10 @@ case "${1:-}" in
         fi
         log_info lid_state_detected state="$lid_state"
         if [[ "$lid_state" == closed ]]; then
+            validate_expected_generation_contract close || exit $?
             reconcile_lid_state close false
         else
+            validate_expected_generation_contract open || exit $?
             reconcile_lid_state open false
         fi
         ;;
@@ -1617,6 +1780,9 @@ LID_SWITCH_SCRIPT="$SCRIPT_DIR/lid-switch.sh"
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 MAX_RECONCILIATION_ATTEMPTS=3
 RECONCILIATION_COOLDOWN_TICKS=5
+MAX_STABILITY_SAMPLES=40
+REQUIRED_STABLE_SAMPLES=3
+STABILITY_SAMPLE_INTERVAL=0.25
 
 log_record() {
     local level=$1
@@ -1637,6 +1803,14 @@ log_info() {
 log_error() {
     log_record error "$@" >&2
 }
+
+mark_resume_pending() {
+    resume_pending=true
+    log_info resume_requested coalesced=true
+}
+
+resume_pending=false
+trap mark_resume_pending USR1
 
 observe_lid_state() {
     local observation_status
@@ -1663,32 +1837,41 @@ observe_topology() {
     local observation_status
 
     if monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
-        if observed_topology=$(monitor_state_topology_fingerprint); then
-            observed_topology_error=""
-            return 0
-        fi
-        observation_status=$?
-        observed_topology_error=topology_fingerprint_failed
+        :
     else
         observation_status=$?
+        observed_topology=""
+        observed_full_topology=""
+        observed_policy_token=""
         observed_topology_error=$MONITOR_STATE_ERROR
+        return "$observation_status"
     fi
-
-    observed_topology=""
-    return "$observation_status"
+    if ! observed_topology=$(monitor_state_topology_fingerprint); then
+        observed_topology_error=topology_fingerprint_failed
+        return 2
+    fi
+    if ! observed_full_topology=$(monitor_state_full_topology_fingerprint); then
+        observed_topology_error=full_topology_fingerprint_failed
+        return 2
+    fi
+    if ! observed_policy_token=$(monitor_state_policy_environment_token); then
+        observed_topology_error=policy_token_failed
+        return 2
+    fi
+    observed_topology_error=""
 }
 
 observe_joint_state() {
     local trigger=$1
-    local observation_status
 
     current_state=""
     current_topology=""
+    current_full_topology=""
+    current_policy_token=""
     if observe_lid_state; then
         current_state=$observed_state
         previous_lid_error=""
     else
-        observation_status=$?
         previous_lid_error=$observed_error
         log_error lid_state_observation_failed reason="$observed_error" \
             trigger="$trigger"
@@ -1697,14 +1880,92 @@ observe_joint_state() {
 
     if observe_topology; then
         current_topology=$observed_topology
+        current_full_topology=$observed_full_topology
+        current_policy_token=$observed_policy_token
         previous_topology_error=""
     else
-        observation_status=$?
         previous_topology_error=$observed_topology_error
         log_error topology_observation_failed reason="$observed_topology_error" \
             trigger="$trigger"
         return 2
     fi
+}
+
+stabilize_joint_state() {
+    local trigger=$1
+    local candidate="" sample_key final_key
+    local consecutive=0 samples=0
+    local last_valid_state="" last_valid_topology=""
+    local last_valid_full_topology="" last_valid_policy_token=""
+
+    while (( samples < MAX_STABILITY_SAMPLES )); do
+        samples=$((samples + 1))
+        if observe_joint_state "stability_$trigger"; then
+            last_valid_state=$current_state
+            last_valid_topology=$current_topology
+            last_valid_full_topology=$current_full_topology
+            last_valid_policy_token=$current_policy_token
+            sample_key="$current_state|$current_full_topology"
+            if [[ "$sample_key" == "$candidate" ]]; then
+                consecutive=$((consecutive + 1))
+            else
+                if [[ -n "$candidate" ]]; then
+                    log_info stability_reset trigger="$trigger" samples="$samples" \
+                        reason=sample_changed
+                fi
+                candidate=$sample_key
+                consecutive=1
+            fi
+        else
+            candidate=""
+            consecutive=0
+            log_info stability_reset trigger="$trigger" samples="$samples" \
+                reason=observation_failed
+        fi
+
+        if (( consecutive >= REQUIRED_STABLE_SAMPLES )); then
+            if (( samples >= MAX_STABILITY_SAMPLES )); then
+                break
+            fi
+            samples=$((samples + 1))
+            if observe_joint_state "stability_${trigger}_precommit"; then
+                last_valid_state=$current_state
+                last_valid_topology=$current_topology
+                last_valid_full_topology=$current_full_topology
+                last_valid_policy_token=$current_policy_token
+                final_key="$current_state|$current_full_topology"
+                if [[ "$final_key" == "$candidate" ]]; then
+                    log_info stability_verified trigger="$trigger" samples="$samples" \
+                        state="$current_state" topology="$current_full_topology" \
+                        policy_token="$current_policy_token"
+                    return 0
+                fi
+                candidate=$final_key
+                consecutive=1
+                log_info stability_reset trigger="$trigger" samples="$samples" \
+                    reason=final_precommit_changed
+            else
+                candidate=""
+                consecutive=0
+                log_info stability_reset trigger="$trigger" samples="$samples" \
+                    reason=final_precommit_failed
+            fi
+        fi
+
+        if (( samples < MAX_STABILITY_SAMPLES )); then
+            sleep "$STABILITY_SAMPLE_INTERVAL"
+        fi
+    done
+
+    if [[ -n "$last_valid_state" ]]; then
+        current_state=$last_valid_state
+        current_topology=$last_valid_topology
+        current_full_topology=$last_valid_full_topology
+        current_policy_token=$last_valid_policy_token
+    fi
+    log_error stability_exhausted trigger="$trigger" \
+        samples="$MAX_STABILITY_SAMPLES" status=2
+    return 2
 }
 
 observed_joint_state_matches_policy() {
@@ -1729,26 +1990,48 @@ observed_joint_state_matches_policy() {
     fi
 }
 
+invoke_lid_switch() {
+    local state=$1
+    local preserve_dpms=$2
+    local commit_generation=$3
+    local expected_lid=$4
+    local expected_policy_token=$5
+
+    if [[ "$commit_generation" == true ]]; then
+        if [[ "$state" == open && "$preserve_dpms" == true ]]; then
+            ARCH_LIDSWITCH_EXPECTED_LID="$expected_lid" \
+            ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN="$expected_policy_token" \
+                "$LID_SWITCH_SCRIPT" --preserve-dpms open
+        else
+            ARCH_LIDSWITCH_EXPECTED_LID="$expected_lid" \
+            ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN="$expected_policy_token" \
+                "$LID_SWITCH_SCRIPT" "$state"
+        fi
+    elif [[ "$state" == open && "$preserve_dpms" == true ]]; then
+        "$LID_SWITCH_SCRIPT" --preserve-dpms open
+    else
+        "$LID_SWITCH_SCRIPT" "$state"
+    fi
+}
+
 apply_observed_joint_state() {
     local trigger=$1
     local attempt=$2
     local preserve_dpms=$3
+    local commit_generation=$4
     local attempted_state=$current_state
     local attempted_topology=$current_topology
+    local attempted_policy_token=$current_policy_token
     local attempted_internal wake_required=false
     local reconciliation_status
 
     log_info reconciliation_started trigger="$trigger" attempt="$attempt" \
         state="$attempted_state" preserve_dpms="$preserve_dpms" \
-        topology="$attempted_topology"
-    if [[ "$attempted_state" == open && "$preserve_dpms" == true ]]; then
-        "$LID_SWITCH_SCRIPT" --preserve-dpms open
-        reconciliation_status=$?
-    else
-        "$LID_SWITCH_SCRIPT" "$attempted_state"
-        reconciliation_status=$?
-    fi
-
+        commit_generation="$commit_generation" topology="$attempted_topology" \
+        policy_token="$attempted_policy_token"
+    invoke_lid_switch "$attempted_state" "$preserve_dpms" \
+        "$commit_generation" "$attempted_state" "$attempted_policy_token"
+    reconciliation_status=$?
     if (( reconciliation_status != 0 )); then
         log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
             state="$attempted_state" status="$reconciliation_status" \
@@ -1765,13 +2048,25 @@ apply_observed_joint_state() {
             reason=post_action_observation_failed applied_ready="$applied_ready"
         return "$reconciliation_status"
     fi
-    if [[ "$current_state" != "$attempted_state" ]]; then
+    if [[ "$commit_generation" == true ]] && \
+        { [[ "$current_state" != "$attempted_state" ]] || \
+            [[ "$current_policy_token" != "$attempted_policy_token" ]]; }; then
+        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+            state="$attempted_state" status=5 \
+            reason=post_action_generation_mismatch \
+            observed_state="$current_state" \
+            expected_policy_token="$attempted_policy_token" \
+            observed_policy_token="$current_policy_token" \
+            applied_ready="$applied_ready"
+        return 5
+    elif [[ "$current_state" != "$attempted_state" ]]; then
         log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
             state="$attempted_state" status=4 \
             reason=lid_state_changed_during_reconciliation \
             observed_state="$current_state" applied_ready="$applied_ready"
         return 4
     fi
+
     attempted_internal=$(jq -er '.internal.enabled | tostring' \
         <<< "$attempted_topology")
     if [[ "$attempted_state" == open ]] && \
@@ -1790,12 +2085,14 @@ apply_observed_joint_state() {
 
     applied_state=$current_state
     applied_topology=$current_topology
+    applied_policy_token=$current_policy_token
     applied_ready=true
     log_info reconciliation_succeeded trigger="$trigger" attempt="$attempt" \
-        state="$applied_state" topology="$applied_topology"
+        state="$applied_state" topology="$applied_topology" \
+        policy_token="$applied_policy_token"
 }
 
-run_reconciliation_attempt() {
+run_immediate_reconciliation_attempt() {
     local trigger=$1
     local attempt=$2
     local preserve_dpms=$3
@@ -1809,7 +2106,7 @@ run_reconciliation_attempt() {
             state=unknown status="$reconciliation_status" applied_ready="$applied_ready"
         return "$reconciliation_status"
     fi
-    apply_observed_joint_state "$trigger" "$attempt" "$preserve_dpms"
+    apply_observed_joint_state "$trigger" "$attempt" "$preserve_dpms" false
 }
 
 record_last_observed_state() {
@@ -1838,6 +2135,7 @@ fi
 applied_ready=false
 applied_state=unknown
 applied_topology=""
+applied_policy_token=""
 last_observed_ready=false
 last_observed_state=unknown
 last_observed_topology=""
@@ -1845,11 +2143,13 @@ previous_lid_error=""
 previous_topology_error=""
 current_state=""
 current_topology=""
+current_full_topology=""
+current_policy_token=""
 
 if [[ "${1:-}" == --once ]]; then
     reconciliation_status=2
     for ((attempt = 1; attempt <= MAX_RECONCILIATION_ATTEMPTS; attempt++)); do
-        if run_reconciliation_attempt once "$attempt" true; then
+        if run_immediate_reconciliation_attempt once "$attempt" true; then
             exit 0
         else
             reconciliation_status=$?
@@ -1868,93 +2168,193 @@ if [[ "${1:-}" == --once ]]; then
     exit "$reconciliation_status"
 fi
 
+if [[ "${1:-}" == --resume-once ]]; then
+    reconciliation_status=2
+    requires_stability=true
+    for ((attempt = 1; attempt <= MAX_RECONCILIATION_ATTEMPTS; attempt++)); do
+        if [[ "$requires_stability" == true ]]; then
+            if ! stabilize_joint_state resume; then
+                exit 2
+            fi
+            requires_stability=false
+        fi
+        if apply_observed_joint_state resume "$attempt" false true; then
+            exit 0
+        else
+            reconciliation_status=$?
+        fi
+        case "$reconciliation_status" in
+            1)
+                exit 1
+                ;;
+            3)
+                ;;
+            2|4|5)
+                requires_stability=true
+                ;;
+            *)
+                requires_stability=true
+                ;;
+        esac
+        if (( attempt < MAX_RECONCILIATION_ATTEMPTS )); then
+            sleep 0.05
+        fi
+    done
+    log_error reconciliation_exhausted trigger=resume \
+        attempt="$MAX_RECONCILIATION_ATTEMPTS" status="$reconciliation_status"
+    exit "$reconciliation_status"
+fi
+
 pending_reconciliation=true
+pending_requires_stability=true
 pending_preserve_dpms=true
+pending_trigger=startup
 burst_attempts=0
 cooldown_ticks=0
 
-burst_attempts=1
-if run_reconciliation_attempt startup "$burst_attempts" "$pending_preserve_dpms"; then
-    pending_reconciliation=false
-    burst_attempts=0
+process_pending_reconciliation() {
+    local reconciliation_status
+
+    if (( cooldown_ticks > 0 )); then
+        cooldown_ticks=$((cooldown_ticks - 1))
+        log_info reconciliation_cooldown_tick ticks_remaining="$cooldown_ticks"
+        if (( cooldown_ticks == 0 )); then
+            burst_attempts=0
+            log_info reconciliation_rearmed reason=cooldown_elapsed
+        fi
+        return 0
+    fi
+
+    if [[ "$pending_requires_stability" == true ]]; then
+        if stabilize_joint_state "$pending_trigger"; then
+            pending_requires_stability=false
+            burst_attempts=0
+            record_last_observed_state
+        else
+            record_last_observed_state
+            cooldown_ticks=$RECONCILIATION_COOLDOWN_TICKS
+            log_error reconciliation_cooldown_started \
+                ticks="$cooldown_ticks" reason=stability_exhausted \
+                applied_ready="$applied_ready"
+            return 2
+        fi
+    fi
+
+    burst_attempts=$((burst_attempts + 1))
+    if apply_observed_joint_state "$pending_trigger" "$burst_attempts" \
+        "$pending_preserve_dpms" true; then
+        pending_reconciliation=false
+        pending_requires_stability=false
+        pending_preserve_dpms=true
+        pending_trigger=steady
+        burst_attempts=0
+        record_last_observed_state
+        return 0
+    else
+        reconciliation_status=$?
+    fi
+    case "$reconciliation_status" in
+        1)
+            log_error reconciliation_fatal trigger="$pending_trigger" \
+                attempt="$burst_attempts" status=1 \
+                reason=contract_or_initialization_failure
+            return 1
+            ;;
+        3)
+            if (( burst_attempts >= MAX_RECONCILIATION_ATTEMPTS )); then
+                cooldown_ticks=$RECONCILIATION_COOLDOWN_TICKS
+                log_error reconciliation_cooldown_started \
+                    ticks="$cooldown_ticks" reason=mutation_rejected \
+                    applied_ready="$applied_ready"
+            fi
+            ;;
+        2|4|5)
+            pending_requires_stability=true
+            burst_attempts=0
+            log_info reconciliation_requires_stability \
+                trigger="$pending_trigger" status="$reconciliation_status"
+            ;;
+        *)
+            pending_requires_stability=true
+            burst_attempts=0
+            ;;
+    esac
+    return "$reconciliation_status"
+}
+
+if process_pending_reconciliation; then
+    :
 else
     reconciliation_status=$?
     if (( reconciliation_status == 1 )); then
-        log_error reconciliation_fatal trigger=startup attempt=1 status=1 \
-            reason=contract_or_initialization_failure
         exit 1
     fi
 fi
-record_last_observed_state
 log_info monitor_started observed_state="$last_observed_state" \
     observed_topology="${last_observed_topology:-unavailable}" \
     applied_ready="$applied_ready" applied_state="$applied_state" \
     applied_topology="${applied_topology:-unavailable}"
 
 while true; do
-    if ! observe_joint_state poll; then
-        sleep 1
-        continue
-    fi
-
-    if [[ "$last_observed_ready" != true ]]; then
+    if [[ "$resume_pending" == true ]]; then
+        resume_pending=false
         pending_reconciliation=true
-        pending_preserve_dpms=true
+        pending_requires_stability=true
+        pending_preserve_dpms=false
+        pending_trigger=resume
         burst_attempts=0
         cooldown_ticks=0
-        log_info joint_state_baselined state="$current_state" \
-            topology="$current_topology"
-    elif [[ "$current_state" != "$last_observed_state" || \
-        "$current_topology" != "$last_observed_topology" ]]; then
-        log_info joint_state_changed previous_state="$last_observed_state" \
-            current_state="$current_state" \
-            previous_topology="$last_observed_topology" \
-            current_topology="$current_topology"
-        if [[ "$current_state" != "$last_observed_state" ]]; then
-            log_info lid_state_changed previous="$last_observed_state" \
-                current="$current_state"
-            if [[ "$last_observed_state" == closed && "$current_state" == open ]]; then
-                pending_preserve_dpms=false
-            else
+        log_info resume_reconciliation_queued
+    else
+        if ! observe_joint_state poll; then
+            sleep 1
+            continue
+        fi
+
+        if [[ "$last_observed_ready" != true ]]; then
+            pending_reconciliation=true
+            pending_requires_stability=true
+            pending_preserve_dpms=true
+            pending_trigger=generation
+            burst_attempts=0
+            cooldown_ticks=0
+            log_info joint_state_baselined state="$current_state" \
+                topology="$current_topology"
+        elif [[ "$current_state" != "$last_observed_state" || \
+            "$current_topology" != "$last_observed_topology" ]]; then
+            log_info joint_state_changed previous_state="$last_observed_state" \
+                current_state="$current_state" \
+                previous_topology="$last_observed_topology" \
+                current_topology="$current_topology"
+            if [[ "$current_state" != "$last_observed_state" ]]; then
+                log_info lid_state_changed previous="$last_observed_state" \
+                    current="$current_state"
+                if [[ "$last_observed_state" == closed && \
+                    "$current_state" == open ]]; then
+                    pending_preserve_dpms=false
+                else
+                    pending_preserve_dpms=true
+                fi
+            elif [[ "$current_state" == open && \
+                "$pending_reconciliation" != true ]]; then
                 pending_preserve_dpms=true
             fi
-        elif [[ "$current_state" == open && "$pending_reconciliation" != true ]]; then
-            pending_preserve_dpms=true
+            pending_reconciliation=true
+            pending_requires_stability=true
+            pending_trigger=generation
+            burst_attempts=0
+            cooldown_ticks=0
         fi
-        pending_reconciliation=true
-        burst_attempts=0
-        cooldown_ticks=0
+        record_last_observed_state
     fi
-    record_last_observed_state
 
     if [[ "$pending_reconciliation" == true ]]; then
-        if (( cooldown_ticks > 0 )); then
-            cooldown_ticks=$((cooldown_ticks - 1))
-            log_info reconciliation_cooldown_tick ticks_remaining="$cooldown_ticks"
-            if (( cooldown_ticks == 0 )); then
-                burst_attempts=0
-                log_info reconciliation_rearmed reason=cooldown_elapsed
-            fi
+        if process_pending_reconciliation; then
+            :
         else
-            burst_attempts=$((burst_attempts + 1))
-            if apply_observed_joint_state pending "$burst_attempts" \
-                "$pending_preserve_dpms"; then
-                pending_reconciliation=false
-                pending_preserve_dpms=true
-                burst_attempts=0
-                record_last_observed_state
-            else
-                reconciliation_status=$?
-                if (( reconciliation_status == 1 )); then
-                    log_error reconciliation_fatal trigger=pending \
-                        attempt="$burst_attempts" status=1 \
-                        reason=contract_or_initialization_failure
-                    exit 1
-                elif (( burst_attempts >= MAX_RECONCILIATION_ATTEMPTS )); then
-                    cooldown_ticks=$RECONCILIATION_COOLDOWN_TICKS
-                    log_error reconciliation_cooldown_started \
-                        ticks="$cooldown_ticks" applied_ready="$applied_ready"
-                fi
+            reconciliation_status=$?
+            if (( reconciliation_status == 1 )); then
+                exit 1
             fi
         fi
     fi
@@ -1972,13 +2372,165 @@ EOF
     log_success "Lid monitor script installed at $SCRIPTS_DIR/lid-monitor.sh"
 }
 
+install_lid_resume_monitor_script() {
+    log_info "Installing lid resume monitor script..."
+
+    cat > "$RESUME_MONITOR_FILE" << 'EOF'
+#!/bin/bash
+
+MAX_NOTIFY_ATTEMPTS=3
+NOTIFY_RETRY_DELAY=0.1
+RECONNECT_DELAY=1
+LOGIN1_SERVICE=org.freedesktop.login1
+LOGIN1_PATH=/org/freedesktop/login1
+LOGIN1_MANAGER=org.freedesktop.login1.Manager
+LOGIN1_SIGNAL=PrepareForSleep
+
+log_record() {
+    local level=$1
+    local event=$2
+    shift 2
+
+    printf 'level=%s component=lid-resume-monitor event=%s' "$level" "$event"
+    if (( $# > 0 )); then
+        printf ' %s' "$@"
+    fi
+    printf '\n'
+}
+
+log_info() {
+    log_record info "$@"
+}
+
+log_error() {
+    log_record error "$@" >&2
+}
+
+notify_main_monitor() {
+    local attempt
+
+    for ((attempt = 1; attempt <= MAX_NOTIFY_ATTEMPTS; attempt++)); do
+        if systemctl --user kill --kill-whom=main --signal=USR1 \
+            lid-monitor.service; then
+            log_info resume_notification_succeeded attempt="$attempt"
+            return 0
+        fi
+        log_error resume_notification_failed attempt="$attempt" status=3
+        if (( attempt < MAX_NOTIFY_ATTEMPTS )); then
+            sleep "$NOTIFY_RETRY_DELAY"
+        fi
+    done
+    return 3
+}
+
+handle_prepare_for_sleep_event() {
+    local event_json=$1
+
+    case "$event_json" in
+        '{"type":"b","data":[true]}')
+            log_info prepare_for_sleep state=true action=none
+            return 0
+            ;;
+        '{"type":"b","data":[false]}')
+            log_info prepare_for_sleep state=false action=notify
+            notify_main_monitor
+            ;;
+        *)
+            log_error prepare_for_sleep_invalid status=2 payload="$event_json"
+            return 2
+            ;;
+    esac
+}
+
+run_subscription() {
+    local message_limit=$1
+    local once_mode=$2
+    local stream_fd stream_pid event_json
+    local event_status=0 wait_status=0 received_event=false
+    local abort_subscription=false
+
+    coproc RESUME_EVENTS {
+        exec stdbuf -oL busctl --system --json=short \
+            --limit-messages="$message_limit" wait \
+            "$LOGIN1_SERVICE" "$LOGIN1_PATH" "$LOGIN1_MANAGER" \
+            "$LOGIN1_SIGNAL"
+    }
+    exec {stream_fd}<&"${RESUME_EVENTS[0]}"
+    stream_pid=$RESUME_EVENTS_PID
+
+    while IFS= read -r -u "$stream_fd" event_json 2>/dev/null; do
+        received_event=true
+        if handle_prepare_for_sleep_event "$event_json"; then
+            :
+        else
+            event_status=$?
+            if [[ "$once_mode" != true ]]; then
+                abort_subscription=true
+                break
+            fi
+        fi
+        if [[ "$once_mode" == true ]]; then
+            break
+        fi
+    done
+    exec {stream_fd}<&-
+    if [[ "$abort_subscription" == true ]]; then
+        kill "$stream_pid" 2>/dev/null || true
+        sleep 0.1
+        kill -KILL "$stream_pid" 2>/dev/null || true
+        log_error subscription_aborted status="$event_status" \
+            reason=invalid_or_unhandled_event
+    fi
+    wait "$stream_pid" 2>/dev/null || wait_status=$?
+
+    if (( event_status != 0 )); then
+        return "$event_status"
+    fi
+    if (( wait_status != 0 )); then
+        log_error subscription_failed status=2 busctl_status="$wait_status"
+        return 2
+    fi
+    if [[ "$received_event" != true ]]; then
+        log_error subscription_failed status=2 reason=no_event
+        return 2
+    fi
+    if [[ "$once_mode" != true ]]; then
+        log_error subscription_ended status=2 reason=unexpected_eof
+        return 2
+    fi
+}
+
+case "${1:-}" in
+    --once)
+        run_subscription 1 true
+        exit $?
+        ;;
+    "")
+        ;;
+    *)
+        log_error invalid_arguments status=1
+        exit 1
+        ;;
+esac
+
+while true; do
+    run_subscription infinity false || true
+    sleep "$RECONNECT_DELAY"
+done
+EOF
+
+    chmod +x "$RESUME_MONITOR_FILE"
+    log_success "Lid resume monitor installed at $RESUME_MONITOR_FILE"
+}
+
 # Install the systemd service
 install_systemd_service() {
-    log_info "Installing systemd user service..."
+    log_info "Installing systemd user services..."
     
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Hyprland Lid Switch Monitor
+Wants=lid-resume-monitor.service
 PartOf=graphical-session.target
 After=graphical-session.target
 ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
@@ -1986,7 +2538,7 @@ ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=exec
-ExecStartPre=$HYPRCTL_BIN monitors
+ExecStartPre=$TIMEOUT_BIN --kill-after=1s 2s $HYPRCTL_BIN monitors
 ExecStart=$SCRIPTS_DIR/lid-monitor.sh
 StandardOutput=journal
 StandardError=journal
@@ -1998,8 +2550,28 @@ RestartSec=2
 [Install]
 WantedBy=graphical-session.target
 EOF
+
+    cat > "$RESUME_SERVICE_FILE" << EOF
+[Unit]
+Description=Hyprland Lid Resume Signal Monitor
+BindsTo=lid-monitor.service
+PartOf=graphical-session.target
+After=graphical-session.target lid-monitor.service
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=exec
+ExecStart=$SCRIPTS_DIR/lid-resume-monitor.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arch-lidswitch-resume
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=2
+EOF
     
-    log_success "Systemd service installed at $SYSTEMD_USER_DIR/lid-monitor.service"
+    log_success "Systemd services installed at $SYSTEMD_USER_DIR"
 }
 
 detect_legacy_default_target_service() {
@@ -2030,6 +2602,7 @@ enable_service() {
 
     # Ensure the daemon is started even if the session target was already active.
     systemctl --user start lid-monitor.service
+    systemctl --user start lid-resume-monitor.service
     
     # Check if service started successfully
     if systemctl --user is-active --quiet lid-monitor.service; then
@@ -2037,6 +2610,13 @@ enable_service() {
     else
         log_error "Failed to start lid monitor service"
         systemctl --user status lid-monitor.service
+        exit 1
+    fi
+    if systemctl --user is-active --quiet lid-resume-monitor.service; then
+        log_success "Lid resume monitor service is running"
+    else
+        log_error "Failed to start lid resume monitor service"
+        systemctl --user status lid-resume-monitor.service
         exit 1
     fi
 }
@@ -2061,11 +2641,14 @@ backup_existing_files() {
     
     local backup_dir="$HYPR_CONFIG_DIR/scripts/.backup-$(date +%Y%m%d-%H%M%S)"
     
-    if [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] || [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]]; then
+    if [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] || \
+        [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]] || \
+        [[ -f "$RESUME_MONITOR_FILE" ]]; then
         mkdir -p "$backup_dir"
         
         [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] && cp "$SCRIPTS_DIR/lid-switch.sh" "$backup_dir/"
         [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]] && cp "$SCRIPTS_DIR/lid-monitor.sh" "$backup_dir/"
+        [[ -f "$RESUME_MONITOR_FILE" ]] && cp "$RESUME_MONITOR_FILE" "$backup_dir/"
         
         log_success "Existing files backed up to $backup_dir"
     fi
@@ -2082,16 +2665,19 @@ print_final_instructions() {
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
     echo "  • Lid switch doctor: $DOCTOR_FILE"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
+    echo "  • Resume event listener: $RESUME_MONITOR_FILE"
     echo "  • Hyprland session bridge: $SESSION_BRIDGE"
     echo "  • Hyprland session module: $SESSION_MODULE"
     echo "  • Hyprland session target: hyprland-session.target"
     echo "  • Systemd user service: lid-monitor.service"
+    echo "  • Systemd resume service: lid-resume-monitor.service"
     echo
     echo -e "${BLUE}How it works:${NC}"
     echo "  • When lid closes + an enabled external output: laptop screen turns off"
     echo "  • When lid closes without an enabled external output: systemd-logind owns the power action"
     echo "  • When lid opens: laptop screen turns back on (dual monitor setup)"
     echo "  • Awake output activation and hotplug changes are reconciled automatically"
+    echo "  • Resume events wait for stable lid and output topology before reconciliation"
     echo "  • Service starts automatically on login without changing the initial layout"
     echo
     echo -e "${BLUE}Useful commands:${NC}"
@@ -2119,6 +2705,7 @@ main() {
     log_info "Performing pre-installation checks..."
     check_hyprland
     inspect_session_config
+    check_resume_runtime_dependencies
     check_lid_power_policy
     check_hyprland_capabilities
     
@@ -2141,6 +2728,7 @@ main() {
     install_lid_switch_script "$laptop_monitor"
     install_lid_switch_doctor
     install_lid_monitor_script
+    install_lid_resume_monitor_script
     install_session_bridge
     install_session_module
     install_session_target

@@ -5,6 +5,7 @@ MONITOR_STATE_DIR=""
 MONITOR_STATE_FILE=""
 MONITOR_STATE_TOPOLOGY=""
 MONITOR_STATE_SNAPSHOT=""
+HYPRCTL_TIMEOUT_SECONDS=2
 
 monitor_state_fail() {
     MONITOR_STATE_ERROR=$1
@@ -17,7 +18,8 @@ monitor_state_observe_topology() {
 
     MONITOR_STATE_ERROR=""
     MONITOR_STATE_TOPOLOGY=""
-    if ! monitors_json=$(hyprctl -j monitors all); then
+    if ! monitors_json=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
+        hyprctl -j monitors all); then
         monitor_state_fail monitor_query_failed
         return
     fi
@@ -54,6 +56,8 @@ monitor_state_observe_topology() {
         | select(length == 1)
         | .[0] as $internal
         | select($internal.disabled or ($internal | valid_layout))
+        | select(all($monitors[] | select(.name != $output);
+            .disabled or (. | valid_layout)))
         | {
             internal: {
                 output: $internal.name,
@@ -79,7 +83,19 @@ monitor_state_observe_topology() {
                     output: .name,
                     enabled: (.disabled == false),
                     disabled: .disabled,
-                    dpms: dpms
+                    dpms: dpms,
+                    layout: (if .disabled then null else {
+                            output: .name,
+                            mode: ((.width | tostring) + "x" +
+                                (.height | tostring) + "@" +
+                                (.refreshRate | tostring)),
+                            position: ((.x | tostring) + "x" +
+                                (.y | tostring)),
+                            scale: .scale,
+                            transform: .transform,
+                            mirror: (if .mirrorOf == "none" then ""
+                                else .mirrorOf end)
+                        } end)
                 }
             ] | sort_by(.output))
         }
@@ -110,6 +126,35 @@ monitor_state_topology_fingerprint() {
             output: .internal.output,
             enabled: .internal.enabled
         },
+        externals: [.externals[] | {
+            output: .output,
+            enabled: .enabled
+        }]
+    }' <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_full_topology_fingerprint() {
+    jq -cer '{
+        internal: {
+            output: .internal.output,
+            enabled: .internal.enabled,
+            disabled: .internal.disabled,
+            dpms: .internal.dpms,
+            layout: .internal.layout
+        },
+        externals: [.externals[] | {
+            output: .output,
+            enabled: .enabled,
+            disabled: .disabled,
+            dpms: .dpms,
+            layout: .layout
+        }]
+    }' <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_policy_environment_token() {
+    jq -cer '{
+        internal: .internal.output,
         externals: [.externals[] | {
             output: .output,
             enabled: .enabled
@@ -257,7 +302,7 @@ monitor_state_disable_internal_output() {
         monitor_state_fail internal_output_invalid
         return
     fi
-    if ! apply_output=$(hyprctl eval \
+    if ! apply_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" hyprctl eval \
         "hl.monitor({ output = \"$output\", disabled = true })"); then
         MONITOR_STATE_ERROR=disable_apply_failed
         return 3
@@ -291,7 +336,8 @@ monitor_state_restore_internal_layout() {
         return
     fi
 
-    if ! apply_output=$(hyprctl eval "$restore_expression"); then
+    if ! apply_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
+        hyprctl eval "$restore_expression"); then
         MONITOR_STATE_ERROR=restore_apply_failed
         return 3
     fi
@@ -310,7 +356,7 @@ monitor_state_enable_internal_dpms() {
         monitor_state_fail internal_output_invalid
         return
     fi
-    if ! apply_output=$(hyprctl eval \
+    if ! apply_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" hyprctl eval \
         "hl.dispatch(hl.dsp.dpms({ action = \"enable\", monitor = \"$output\" }))"); then
         MONITOR_STATE_ERROR=dpms_apply_failed
         return 3

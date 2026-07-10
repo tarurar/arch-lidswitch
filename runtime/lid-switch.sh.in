@@ -32,6 +32,8 @@ if ! . "$SCRIPT_DIR/monitor-state.sh"; then
 fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
+EXPECTED_LID=${ARCH_LIDSWITCH_EXPECTED_LID:-}
+EXPECTED_POLICY_TOKEN=${ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN:-}
 
 refresh_waybar_layout() {
     if pgrep -x waybar >/dev/null 2>&1; then
@@ -41,6 +43,67 @@ refresh_waybar_layout() {
         }
         sleep 0.1
         pkill -x -SIGUSR1 waybar || log_error waybar_refresh_failed phase=show
+    fi
+}
+
+validate_expected_generation_contract() {
+    local action=$1
+
+    if [[ -z "$EXPECTED_LID" && -z "$EXPECTED_POLICY_TOKEN" ]]; then
+        return 0
+    fi
+    if [[ -z "$EXPECTED_LID" || -z "$EXPECTED_POLICY_TOKEN" ]] || \
+        [[ "$EXPECTED_LID" != open && "$EXPECTED_LID" != closed ]] || \
+        [[ "$action" == open && "$EXPECTED_LID" != open ]] || \
+        [[ "$action" == close && "$EXPECTED_LID" != closed ]]; then
+        log_error invalid_generation_contract action="$action" status=1
+        return 1
+    fi
+    if ! jq -e '
+        type == "object" and
+        (keys | sort) == ["externals", "internal"] and
+        (.internal | type == "string") and
+        (.externals | type == "array") and
+        all(.externals[];
+            type == "object" and
+            (keys | sort) == ["enabled", "output"] and
+            (.output | type == "string") and
+            (.enabled | type == "boolean"))
+    ' <<< "$EXPECTED_POLICY_TOKEN" >/dev/null; then
+        log_error invalid_generation_contract action="$action" status=1
+        return 1
+    fi
+}
+
+verify_expected_generation() {
+    local action=$1
+    local phase=$2
+    local observed_lid observed_policy_token
+
+    if [[ -z "$EXPECTED_LID" ]]; then
+        return 0
+    fi
+    if ! observed_lid=$(read_lid_state); then
+        log_error reconciliation_failed action="$action" phase="$phase" \
+            status=2 reason=lid_state_unavailable \
+            expected_lid="$EXPECTED_LID"
+        return 2
+    fi
+    if ! observed_policy_token=$(monitor_state_policy_environment_token); then
+        log_error reconciliation_failed action="$action" phase="$phase" \
+            status=2 reason=policy_token_unavailable \
+            expected_lid="$EXPECTED_LID"
+        return 2
+    fi
+    if [[ "$observed_lid" != "$EXPECTED_LID" || \
+        "$observed_policy_token" != "$EXPECTED_POLICY_TOKEN" ]]; then
+        log_error reconciliation_failed action="$action" phase="$phase" \
+            status=5 reason=generation_mismatch \
+            expected_lid="$EXPECTED_LID" observed_lid="$observed_lid" \
+            expected_policy_token="$EXPECTED_POLICY_TOKEN" \
+            observed_policy_token="$observed_policy_token" \
+            topology="$MONITOR_STATE_TOPOLOGY"
+        return 5
     fi
 }
 
@@ -60,6 +123,11 @@ reconcile_lid_state() {
         log_error reconciliation_failed action="$action" phase=observe \
             desired_internal=unknown status=2 reason="$MONITOR_STATE_ERROR"
         return 2
+    fi
+    if verify_expected_generation "$action" pre_apply; then
+        :
+    else
+        return $?
     fi
 
     topology_snapshot=$MONITOR_STATE_TOPOLOGY
@@ -162,6 +230,11 @@ reconcile_lid_state() {
     fi
 
     topology_snapshot=$MONITOR_STATE_TOPOLOGY
+    if verify_expected_generation "$action" post_apply; then
+        :
+    else
+        return $?
+    fi
     verified_internal=$(monitor_state_internal_enabled)
     if verified_dpms=$(monitor_state_internal_dpms); then
         :
@@ -287,9 +360,11 @@ case "${1:-}" in
             log_error invalid_arguments status=1 reason=preserve_dpms_requires_open
             exit 1
         fi
+        validate_expected_generation_contract close || exit $?
         reconcile_lid_state close false
         ;;
     open)
+        validate_expected_generation_contract open || exit $?
         reconcile_lid_state open "$preserve_dpms"
         ;;
     "")
@@ -303,8 +378,10 @@ case "${1:-}" in
         fi
         log_info lid_state_detected state="$lid_state"
         if [[ "$lid_state" == closed ]]; then
+            validate_expected_generation_contract close || exit $?
             reconcile_lid_state close false
         else
+            validate_expected_generation_contract open || exit $?
             reconcile_lid_state open false
         fi
         ;;

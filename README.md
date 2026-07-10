@@ -47,7 +47,11 @@ observation as the baseline for later changes. While the session remains awake,
 later dock, undock, or output activation changes are reconciled even when the
 lid state itself has not changed. Multiple external outputs and inactive outputs
 remain explicit records in the structured snapshot; DPMS state is observed
-separately and never changes whether an output is classified as enabled.
+separately and never changes whether an output is classified as enabled. Before
+startup, changed topology, or resume reconciliation can mutate a display, the
+daemon requires three identical full lid/topology samples plus an immediate
+matching precommit sample. A dedicated login1 listener keeps one subscription
+across the sleep cycle and coalesces resume requests into the main daemon.
 
 ## Requirements
 
@@ -55,7 +59,8 @@ separately and never changes whether an output is classified as enabled.
 - **Desktop**: Hyprland 0.55.0 or newer, using the Lua configuration provider
 - **Hardware**: Laptop with ACPI lid switch support
 - **Session**: Wayland session
-- **Tools**: `hyprctl` from the active Hyprland session and `jq` for installer checks and runtime layout validation
+- **Tools**: `hyprctl`, `jq`, and GNU coreutils `stdbuf` and `timeout`
+- **System manager**: systemd 257 or newer; the resume listener uses typed `busctl wait` output
 - **Lua APIs**: `hl.monitor`, `hl.dispatch`, and `hl.dsp.dpms`; the installer probes all three without changing display state
 - **Instances**: Exactly one running Hyprland instance matching `HYPRLAND_INSTANCE_SIGNATURE` and the active Wayland socket; automatic instance selection is not supported
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
@@ -110,6 +115,7 @@ The installer creates the following files:
 ├── lid-switch.sh      # Core lid switch logic
 ├── lid-switch-doctor.sh # Read-only logind policy diagnostics
 ├── lid-monitor.sh     # Background monitor daemon
+├── lid-resume-monitor.sh # Lifetime login1 resume-event listener
 └── lid-session-bridge.sh # Ordered Hyprland/systemd session startup
 
 ~/.config/hypr/arch_lidswitch/
@@ -117,7 +123,8 @@ The installer creates the following files:
 
 ~/.config/systemd/user/
 ├── hyprland-session.target # Graphical-session lifecycle target
-└── lid-monitor.service     # Session-bound daemon configuration
+├── lid-monitor.service     # Session-bound reconciliation daemon
+└── lid-resume-monitor.service # Session-bound login1 listener
 ```
 
 The installer also appends one clearly marked, idempotent `pcall(require, ...)`
@@ -134,7 +141,7 @@ systemctl --user status lid-monitor.service
 # Start service
 systemctl --user start lid-monitor.service
 
-# Stop service  
+# Stop service
 systemctl --user stop lid-monitor.service
 
 # Restart service
@@ -146,6 +153,10 @@ systemctl --user disable lid-monitor.service
 # Re-enable auto-start
 systemctl --user enable lid-monitor.service
 ```
+
+The main service owns the auxiliary resume listener: starting or stopping
+`lid-monitor.service` starts or stops the listener with it. The listener is a
+static unit and is not enabled independently.
 
 ### Manual Testing
 
@@ -164,6 +175,9 @@ systemctl --user enable lid-monitor.service
 
 # Reconcile the current lid and topology once, then exit
 ~/.config/hypr/scripts/lid-monitor.sh --once
+
+# Exercise the bounded stable resume reconciliation path once
+~/.config/hypr/scripts/lid-monitor.sh --resume-once
 
 # Inspect an alternate ACPI lid root
 HYPR_LID_STATE_ROOT=/path/to/button/lid \
@@ -210,6 +224,9 @@ journalctl --user -u lid-monitor.service -b -o cat
 
 # View the previous boot when persistent journal storage is enabled
 journalctl --user -u lid-monitor.service -b -1 -o cat
+
+# Follow the lifetime login1 resume listener
+journalctl --user -u lid-resume-monitor.service -f -o cat
 ```
 
 Runtime records use stable fields such as `component=lid-switch`,
@@ -392,7 +409,7 @@ systemd-journald rather than by these scripts.
 ## Uninstallation
 
 ```bash
-# Stop and disable service
+# Stop and disable the main service (which owns the static resume listener)
 systemctl --user stop lid-monitor.service
 systemctl --user disable lid-monitor.service
 
@@ -402,10 +419,12 @@ rm -f ~/.config/hypr/scripts/monitor-state.sh
 rm -f ~/.config/hypr/scripts/lid-switch.sh
 rm -f ~/.config/hypr/scripts/lid-switch-doctor.sh
 rm -f ~/.config/hypr/scripts/lid-monitor.sh
+rm -f ~/.config/hypr/scripts/lid-resume-monitor.sh
 rm -f ~/.config/hypr/scripts/lid-session-bridge.sh
 rm -f ~/.config/hypr/arch_lidswitch/session.lua
 rm -f ~/.config/systemd/user/hyprland-session.target
 rm -f ~/.config/systemd/user/lid-monitor.service
+rm -f ~/.config/systemd/user/lid-resume-monitor.service
 
 # Reload systemd
 systemctl --user daemon-reload
