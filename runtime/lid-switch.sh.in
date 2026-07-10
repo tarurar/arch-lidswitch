@@ -33,21 +33,6 @@ fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 
-get_external_display() {
-    local monitor_output external_display
-
-    if ! monitor_output=$(hyprctl monitors); then
-        return 2
-    fi
-
-    external_display=$(grep -E "^Monitor (DP|HDMI|USB-C)" <<< "$monitor_output" | grep -v "$LAPTOP_DISPLAY" | head -1 | cut -d' ' -f2)
-    if [[ -z "$external_display" ]]; then
-        return 1
-    fi
-
-    printf '%s\n' "$external_display"
-}
-
 configure_clamshell_layout() {
     monitor_state_capture_internal_layout "$LAPTOP_DISPLAY" || return
     monitor_state_disable_internal_output "$LAPTOP_DISPLAY"
@@ -69,21 +54,29 @@ refresh_waybar_layout() {
 }
 
 handle_lid_close() {
-    local discovery_status=0 layout_status
+    local internal_enabled enabled_external_count layout_status
 
     log_info transition_started action=close
 
-    if CURRENT_EXTERNAL=$(get_external_display); then
-        discovery_status=0
-    else
-        discovery_status=$?
+    if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+        log_error monitor_query_failed action=close reason="$MONITOR_STATE_ERROR"
+        return 2
     fi
+    internal_enabled=$(monitor_state_internal_enabled)
+    enabled_external_count=$(monitor_state_enabled_external_count)
 
-    if (( discovery_status == 0 )); then
-        log_info external_monitor_detected action=close output="$CURRENT_EXTERNAL"
+    if (( enabled_external_count > 0 )); then
+        if [[ "$internal_enabled" == false ]]; then
+            log_info layout_noop action=close reason=internal_already_disabled \
+                enabled_external_count="$enabled_external_count"
+            return 0
+        fi
+
         if configure_clamshell_layout; then
             refresh_waybar_layout
-            log_info layout_applied action=close laptop=disabled external="$CURRENT_EXTERNAL"
+            log_info layout_applied action=close laptop=disabled \
+                enabled_external_count="$enabled_external_count"
+            return 0
         else
             layout_status=$?
             if (( layout_status == 2 )); then
@@ -93,56 +86,62 @@ handle_lid_close() {
             fi
             return "$layout_status"
         fi
-    elif (( discovery_status == 1 )); then
-        log_info power_delegated owner=systemd-logind action=close reason=no_external_monitor
-    else
-        log_error monitor_query_failed action=close
-        return 2
     fi
+
+    if [[ "$internal_enabled" == false ]]; then
+        if configure_dual_layout; then
+            refresh_waybar_layout
+            log_info layout_applied action=close layout=internal_restored \
+                enabled_external_count=0
+        else
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=close layout=internal_restored \
+                    reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
+        fi
+    else
+        log_info layout_noop action=close reason=internal_already_enabled \
+            enabled_external_count=0
+    fi
+
+    log_info power_delegated owner=systemd-logind action=close \
+        reason=no_enabled_external
 }
 
 handle_lid_open() {
-    local discovery_status=0 layout_status
+    local internal_enabled enabled_external_count layout_status
 
     log_info transition_started action=open
 
-    if CURRENT_EXTERNAL=$(get_external_display); then
-        discovery_status=0
-    else
-        discovery_status=$?
+    if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+        log_error monitor_query_failed action=open reason="$MONITOR_STATE_ERROR"
+        return 2
+    fi
+    internal_enabled=$(monitor_state_internal_enabled)
+    enabled_external_count=$(monitor_state_enabled_external_count)
+
+    if [[ "$internal_enabled" == true ]]; then
+        log_info layout_noop action=open reason=internal_already_enabled \
+            enabled_external_count="$enabled_external_count"
+        return 0
     fi
 
-    if (( discovery_status == 0 )); then
-        log_info external_monitor_detected action=open output="$CURRENT_EXTERNAL"
-        if configure_dual_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=open layout=dual external="$CURRENT_EXTERNAL"
-        else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
-            else
-                log_error layout_apply_failed action=open layout=dual reason="$MONITOR_STATE_ERROR"
-            fi
-            return "$layout_status"
-        fi
-    elif (( discovery_status == 1 )); then
-        log_info external_monitor_absent action=open
-        if configure_dual_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=open layout=laptop_only
-        else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
-            else
-                log_error layout_apply_failed action=open layout=laptop_only reason="$MONITOR_STATE_ERROR"
-            fi
-            return "$layout_status"
-        fi
+    if configure_dual_layout; then
+        refresh_waybar_layout
+        log_info layout_applied action=open layout=restored \
+            enabled_external_count="$enabled_external_count"
     else
-        log_error monitor_query_failed action=open
-        return 2
+        layout_status=$?
+        if (( layout_status == 2 )); then
+            log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
+        else
+            log_error layout_apply_failed action=open layout=restored reason="$MONITOR_STATE_ERROR"
+        fi
+        return "$layout_status"
     fi
 }
 

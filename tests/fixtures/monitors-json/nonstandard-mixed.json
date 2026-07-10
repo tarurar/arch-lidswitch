@@ -1,0 +1,28 @@
+[
+  {
+    "id": 7,
+    "name": "Virtual-2",
+    "disabled": true,
+    "dpmsStatus": false
+  },
+  {
+    "id": 3,
+    "name": "DSI-1",
+    "disabled": true,
+    "dpmsStatus": false
+  },
+  {
+    "id": 5,
+    "name": "WL-1",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60,
+    "x": 0,
+    "y": 0,
+    "scale": 1,
+    "transform": 0,
+    "disabled": false,
+    "dpmsStatus": false,
+    "mirrorOf": "none"
+  }
+]

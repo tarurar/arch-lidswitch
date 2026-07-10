@@ -3,10 +3,111 @@
 MONITOR_STATE_ERROR=""
 MONITOR_STATE_DIR=""
 MONITOR_STATE_FILE=""
+MONITOR_STATE_TOPOLOGY=""
 
 monitor_state_fail() {
     MONITOR_STATE_ERROR=$1
     return 2
+}
+
+monitor_state_observe_topology() {
+    local output=$1
+    local monitors_json
+
+    MONITOR_STATE_ERROR=""
+    MONITOR_STATE_TOPOLOGY=""
+    if ! monitors_json=$(hyprctl -j monitors all); then
+        monitor_state_fail monitor_query_failed
+        return
+    fi
+
+    if ! MONITOR_STATE_TOPOLOGY=$(jq -ce --arg output "$output" '
+        def integer:
+            type == "number" and . == floor;
+        def positive_integer:
+            integer and . > 0;
+        def output_name:
+            type == "string" and test("^[A-Za-z0-9_.:-]+$");
+        def valid_layout:
+            (.width | positive_integer) and
+            (.height | positive_integer) and
+            (.refreshRate | type == "number" and . > 0) and
+            (.x | integer) and
+            (.y | integer) and
+            (.scale | type == "number" and . > 0 and . <= 10) and
+            (.transform | integer and . >= 0 and . <= 7) and
+            ((.mirrorOf == "none") or (.mirrorOf | output_name));
+        def dpms:
+            if has("dpmsStatus") then .dpmsStatus else null end;
+
+        select(type == "array" and length > 0)
+        | select(all(.[];
+            type == "object" and
+            (.name | output_name) and
+            (.disabled | type == "boolean")))
+        | select((map(.name) | length) == (map(.name) | unique | length))
+        | . as $monitors
+        | [$monitors[] | select(.name == $output)]
+        | select(length == 1)
+        | .[0] as $internal
+        | select($internal.disabled or ($internal | valid_layout))
+        | {
+            internal: {
+                output: $internal.name,
+                enabled: ($internal.disabled == false),
+                disabled: $internal.disabled,
+                dpms: ($internal | dpms),
+                layout: (if $internal.disabled then null else {
+                    output: $internal.name,
+                    mode: (($internal.width | tostring) + "x" +
+                        ($internal.height | tostring) + "@" +
+                        ($internal.refreshRate | tostring)),
+                    position: (($internal.x | tostring) + "x" +
+                        ($internal.y | tostring)),
+                    scale: $internal.scale,
+                    transform: $internal.transform,
+                    mirror: (if $internal.mirrorOf == "none" then ""
+                        else $internal.mirrorOf end)
+                } end)
+            },
+            externals: ([$monitors[]
+                | select(.name != $output)
+                | {
+                    output: .name,
+                    enabled: (.disabled == false),
+                    disabled: .disabled,
+                    dpms: dpms
+                }
+            ] | sort_by(.output))
+        }
+    ' <<< "$monitors_json"); then
+        monitor_state_fail monitor_topology_invalid
+        return
+    fi
+}
+
+monitor_state_internal_enabled() {
+    jq -er '.internal.enabled' <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_enabled_external_count() {
+    jq -er '[.externals[] | select(.enabled)] | length' \
+        <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_topology_fingerprint() {
+    jq -cer '{
+        internal: {
+            output: .internal.output,
+            enabled: .internal.enabled,
+            dpms: .internal.dpms
+        },
+        externals: [.externals[] | {
+            output: .output,
+            enabled: .enabled,
+            dpms: .dpms
+        }]
+    }' <<< "$MONITOR_STATE_TOPOLOGY"
 }
 
 monitor_state_prepare_directory() {
@@ -41,7 +142,7 @@ monitor_state_prepare_directory() {
 
 monitor_state_capture_internal_layout() {
     local output=$1
-    local monitors_json temporary_snapshot
+    local temporary_snapshot
 
     MONITOR_STATE_ERROR=""
     if ! monitor_state_prepare_directory; then
@@ -58,48 +159,11 @@ monitor_state_capture_internal_layout() {
         return
     fi
 
-    if ! monitors_json=$(hyprctl -j monitors all); then
-        rm -f -- "$temporary_snapshot"
-        monitor_state_fail monitor_query_failed
-        return
-    fi
-
     if ! jq -ce --arg output "$output" '
-        def integer:
-            type == "number" and . == floor;
-        def positive_integer:
-            integer and . > 0;
-        def output_name:
-            type == "string" and test("^[A-Za-z0-9_.:-]+$");
-
-        select(type == "array")
-        | [.[] | select(.name == $output)]
-        | select(length == 1)
-        | .[0] as $monitor
-        | select(
-            ($monitor.name | output_name) and
-            ($monitor.width | positive_integer) and
-            ($monitor.height | positive_integer) and
-            ($monitor.refreshRate | type == "number" and . > 0) and
-            ($monitor.x | integer) and
-            ($monitor.y | integer) and
-            ($monitor.scale | type == "number" and . > 0 and . <= 10) and
-            ($monitor.transform | integer and . >= 0 and . <= 7) and
-            ($monitor.disabled == false) and
-            (($monitor.mirrorOf == "none") or ($monitor.mirrorOf | output_name))
-        )
-        | {
-            output: $monitor.name,
-            mode: (($monitor.width | tostring) + "x" +
-                ($monitor.height | tostring) + "@" +
-                ($monitor.refreshRate | tostring)),
-            position: (($monitor.x | tostring) + "x" +
-                ($monitor.y | tostring)),
-            scale: $monitor.scale,
-            transform: $monitor.transform,
-            mirror: (if $monitor.mirrorOf == "none" then "" else $monitor.mirrorOf end)
-        }
-    ' <<< "$monitors_json" > "$temporary_snapshot"; then
+        select(.internal.output == $output and .internal.enabled)
+        | .internal.layout
+        | select(type == "object")
+    ' <<< "$MONITOR_STATE_TOPOLOGY" > "$temporary_snapshot"; then
         rm -f -- "$temporary_snapshot"
         monitor_state_fail monitor_snapshot_invalid
         return

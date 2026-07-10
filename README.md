@@ -4,9 +4,9 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 
 ## Features
 
-- 🔄 **Automatic Monitor Management**: Seamlessly switches between laptop and external monitors based on lid state
-- 🖥️ **Smart Detection**: Automatically detects laptop screen (eDP-*) and external monitors (DP-*/HDMI-*/USB-C-*)
-- ⚡ **Instant Response**: Real-time lid state monitoring with ~1 second response time  
+- 🔄 **Automatic Monitor Management**: Reconciles the internal display when either lid state or represented output topology changes
+- 🖥️ **Structured Detection**: Reads `hyprctl -j monitors all`; uses one unique `eDP*` output as the default internal display and treats every other represented output as external, regardless of connector name
+- ⚡ **Instant Response**: Real-time lid and output-topology monitoring with ~1 second response time
 - 🛡️ **Hyprland Lua Compatible**: Uses `hyprctl eval`/`hl.monitor()` for modern Hyprland Lua configs
 - 🔧 **Zero Configuration**: Works out of the box after installation
 - 📝 **Journal Logging**: Structured service and transition records for troubleshooting
@@ -17,7 +17,9 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 
 ## How It Works
 
-### Lid Closed + External Monitor Connected
+### Lid Closed + Enabled External Output
+
+- Counts every represented output other than the configured internal display; only records with `disabled=false` are enabled
 - Captures the active internal panel layout in the private runtime directory
 - Disables laptop internal display
 - Leaves every external monitor's mode, position, scale, transform, and mirror untouched
@@ -25,16 +27,27 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Waybar is briefly hidden/shown with `SIGUSR1` so its layer geometry follows the new layout
 
 ### Lid Opened
-- Re-enables the laptop internal display from its captured layout
+- Re-enables the laptop internal display from its captured layout if it is disabled
+- Makes no display change if the internal display is already enabled
 - Restores its exact mode, position, scale, transform, and mirror settings
 - Leaves the external monitor arrangement untouched
 - Maintains your workspace layout
 - Refreshes Waybar layer geometry without restarting Waybar
 
-### Lid Closed + No External Monitor
-- Makes no display or power change
+### Lid Closed + No Enabled External Output
+
+- Treats absent and inactive (`disabled=true`) external outputs the same for clamshell policy
+- Restores the internal display first if it was disabled by an earlier docked close
 - Delegates the lid event to systemd-logind
 - With the supported default policy, logind suspends when undocked and ignores a docked lid close
+
+The daemon observes a joint lid-and-topology fingerprint. Its first complete
+observation is only a baseline, so service startup does not mutate the layout.
+While the session remains awake, later dock, undock, or output activation
+changes are reconciled even when the lid state itself has not changed. Multiple
+external outputs and inactive outputs remain explicit records in the structured
+snapshot; DPMS state is observed separately and never changes whether an output
+is classified as enabled.
 
 ## Requirements
 
@@ -70,6 +83,20 @@ curl -fsSL https://raw.githubusercontent.com/tarurar/arch-lidswitch/main/install
 
 3. **Test the installation**:
    Close your laptop lid to verify it works!
+
+By default, installation requires exactly one represented output whose name
+starts with `eDP`. Hardware that uses another internal connector name, or a
+topology with more than one `eDP*` candidate, must select the internal output
+explicitly:
+
+```bash
+HYPR_LID_INTERNAL_OUTPUT=DSI-1 ./install-hyprland-lid-switch.sh
+```
+
+The selected output may be inactive during installation, but it must appear in
+`hyprctl -j monitors all`. The installer records that identity in both runtime
+scripts. Every other represented output is external; connector prefixes are
+not used to classify external displays.
 
 ## What Gets Installed
 
@@ -276,21 +303,20 @@ informational because arch-lidswitch never requests hibernation.
 
 ### Wrong Monitor Detection
 
-1. **List current monitors**:
+1. **List every represented output, including inactive outputs**:
    ```bash
-   hyprctl monitors
+   hyprctl -j monitors all | jq \
+     '.[] | {name, enabled: (.disabled == false), disabled, dpmsStatus}'
    ```
 
-2. **Edit the configuration** in `~/.config/hypr/scripts/lid-switch.sh`:
+2. **Rerun the installer with the internal identity selected explicitly**:
    ```bash
-   # Update LAPTOP_DISPLAY variable if needed
-   LAPTOP_DISPLAY="your-laptop-monitor-name"
+   HYPR_LID_INTERNAL_OUTPUT=your-internal-output \
+     ./install-hyprland-lid-switch.sh
    ```
 
-3. **Restart the service**:
-   ```bash
-   systemctl --user restart lid-monitor.service
-   ```
+Do not edit only the installed `lid-switch.sh`: the CLI and daemon must share
+the same internal identity, and rerunning the installer updates both.
 
 ### Hyprland Reports "Use eval"
 

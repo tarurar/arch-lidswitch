@@ -152,7 +152,34 @@ case "$command_name" in
         elif [[ "${1:-}" == "-j" && "${2:-}" == "monitors" && \
             "${3:-}" == "all" ]]; then
             log_command "$@"
-            if [[ "${TEST_HYPRCTL_MONITORS_JSON_FAIL:-0}" == 1 ]]; then
+            if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" ]]; then
+                sequence_counter=${TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER:?}
+                sequence_index=0
+                if [[ -r "$sequence_counter" ]]; then
+                    read -r sequence_index < "$sequence_counter"
+                fi
+                if [[ ! "$sequence_index" =~ ^[0-9]+$ ]]; then
+                    printf 'Invalid structured monitor sequence counter: %s\n' \
+                        "$sequence_index" >&2
+                    exit 99
+                fi
+                sequence_file="$TEST_HYPRCTL_MONITORS_SEQUENCE_DIR/$sequence_index.json"
+                if [[ ! -r "$sequence_file" ]]; then
+                    sequence_file="$TEST_HYPRCTL_MONITORS_SEQUENCE_DIR/final.json"
+                fi
+                if [[ ! -r "$sequence_file" ]]; then
+                    printf 'Structured monitor sequence fixture is not readable: %s\n' \
+                        "$sequence_file" >&2
+                    exit 99
+                fi
+                printf '%s\n' "$((sequence_index + 1))" > "$sequence_counter"
+                sequence_value=$(<"$sequence_file")
+                if [[ "$sequence_value" == __FAIL__ ]]; then
+                    printf 'Configured structured monitor query failure\n' >&2
+                    exit 94
+                fi
+                printf '%s\n' "$sequence_value"
+            elif [[ "${TEST_HYPRCTL_MONITORS_JSON_FAIL:-0}" == 1 ]]; then
                 printf 'Configured structured monitor query failure\n' >&2
                 exit 94
             elif [[ -n "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then

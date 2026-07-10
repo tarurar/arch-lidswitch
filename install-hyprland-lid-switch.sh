@@ -4,7 +4,7 @@
 # Hyprland Lid Switch Installer
 # 
 # This script installs an automatic lid switch handler for Hyprland that:
-# - Disables laptop display when lid is closed (with external monitor connected)
+# - Disables laptop display when lid is closed with an enabled external output
 # - Re-enables laptop display when lid is opened
 # - Works safely without crashing Wayland sessions
 #
@@ -39,9 +39,9 @@ SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
 
 # Global variables
 laptop_monitor=""
-external_monitor=""
 HYPRCTL_BIN=""
 JQ_BIN=""
+HYPRLAND_MONITORS_JSON=""
 session_config_state=""
 legacy_default_target_service=false
 
@@ -89,7 +89,6 @@ check_hyprland_capabilities() {
     local version_json version_string version_major version_minor
     local instances_json instance_count instance_signature instance_socket
     local status_json config_provider
-    local monitors_json
     local lua_probe_output
 
     if ! command_exists jq; then
@@ -172,11 +171,11 @@ check_hyprland_capabilities() {
         return 1
     fi
 
-    if ! monitors_json=$("$HYPRCTL_BIN" -j monitors all); then
+    if ! HYPRLAND_MONITORS_JSON=$("$HYPRCTL_BIN" -j monitors all); then
         log_error "Could not query monitor capabilities with 'hyprctl -j monitors all'"
         return 1
     fi
-    if ! "$JQ_BIN" -e 'type == "array"' <<< "$monitors_json" >/dev/null; then
+    if ! "$JQ_BIN" -e 'type == "array"' <<< "$HYPRLAND_MONITORS_JSON" >/dev/null; then
         log_error "Hyprland 'hyprctl -j monitors all' did not return a valid monitor array"
         return 1
     fi
@@ -470,24 +469,71 @@ integrate_session_config() {
 
 # Detect laptop and external monitors
 detect_monitors() {
-    local monitor_list=""
-    
-    # Get monitor information from hyprctl
-    monitor_list=$(hyprctl monitors | awk '/Monitor / {print $2}')
+    local configured_internal=${HYPR_LID_INTERNAL_OUTPUT:-}
+    local internal_count internal_status external_records
 
-    laptop_monitor=$(grep -m1 "^eDP" <<<"${monitor_list}" || true)
-    external_monitor=$(grep -m1 -E "^(DP|HDMI|USB-C)" <<<"${monitor_list}" || true)
-    
-    if [[ -z "$laptop_monitor" ]]; then
-        log_error "Could not detect laptop monitor (eDP-*)"
+    if ! "$JQ_BIN" -e '
+        type == "array" and
+        all(.[]; type == "object" and
+            (.name | type == "string" and test("^[A-Za-z0-9_.:-]+$")) and
+            (.disabled | type == "boolean")) and
+        ((map(.name) | length) == (map(.name) | unique | length))
+    ' <<< "$HYPRLAND_MONITORS_JSON" >/dev/null; then
+        log_error "Hyprland returned malformed monitor identity or activation records"
         exit 1
     fi
-    
-    log_info "Detected laptop monitor: $laptop_monitor"
-    if [[ -n "$external_monitor" ]]; then
-        log_info "Detected external monitor: $external_monitor"
+
+    if [[ -n "$configured_internal" ]]; then
+        if [[ ! "$configured_internal" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+            log_error "HYPR_LID_INTERNAL_OUTPUT contains an invalid output name"
+            exit 1
+        fi
+        internal_count=$("$JQ_BIN" -r --arg output "$configured_internal" \
+            '[.[] | select(.name == $output)] | length' \
+            <<< "$HYPRLAND_MONITORS_JSON")
+        if (( internal_count == 0 )); then
+            log_error "Configured internal output not found: $configured_internal"
+            exit 1
+        elif (( internal_count > 1 )); then
+            log_error "Configured internal output is ambiguous: $configured_internal"
+            exit 1
+        fi
+        laptop_monitor=$configured_internal
     else
-        log_info "No external monitor currently connected"
+        internal_count=$("$JQ_BIN" -r \
+            '[.[] | select(.name | startswith("eDP"))] | length' \
+            <<< "$HYPRLAND_MONITORS_JSON")
+        if (( internal_count == 0 )); then
+            log_error "Could not detect an internal output; set HYPR_LID_INTERNAL_OUTPUT"
+            exit 1
+        elif (( internal_count > 1 )); then
+            log_error "Multiple internal output candidates detected; set HYPR_LID_INTERNAL_OUTPUT"
+            exit 1
+        fi
+        laptop_monitor=$("$JQ_BIN" -r \
+            '.[] | select(.name | startswith("eDP")) | .name' \
+            <<< "$HYPRLAND_MONITORS_JSON")
+    fi
+
+    internal_status=$("$JQ_BIN" -r --arg output "$laptop_monitor" \
+        '.[] | select(.name == $output) |
+            if .disabled then "inactive" else "enabled" end' \
+        <<< "$HYPRLAND_MONITORS_JSON")
+    log_info "Detected internal output: $laptop_monitor ($internal_status)"
+
+    external_records=$("$JQ_BIN" -r --arg internal "$laptop_monitor" '
+        [.[] | select(.name != $internal)]
+        | sort_by(.name)
+        | .[]
+        | [.name, (if .disabled then "inactive" else "enabled" end)]
+        | @tsv
+    ' <<< "$HYPRLAND_MONITORS_JSON")
+    if [[ -z "$external_records" ]]; then
+        log_info "No external outputs detected"
+    else
+        while IFS=$'\t' read -r output status; do
+            log_info "Detected external output: $output ($status)"
+        done <<< "$external_records"
     fi
 }
 
@@ -699,10 +745,111 @@ install_monitor_state_script() {
 MONITOR_STATE_ERROR=""
 MONITOR_STATE_DIR=""
 MONITOR_STATE_FILE=""
+MONITOR_STATE_TOPOLOGY=""
 
 monitor_state_fail() {
     MONITOR_STATE_ERROR=$1
     return 2
+}
+
+monitor_state_observe_topology() {
+    local output=$1
+    local monitors_json
+
+    MONITOR_STATE_ERROR=""
+    MONITOR_STATE_TOPOLOGY=""
+    if ! monitors_json=$(hyprctl -j monitors all); then
+        monitor_state_fail monitor_query_failed
+        return
+    fi
+
+    if ! MONITOR_STATE_TOPOLOGY=$(jq -ce --arg output "$output" '
+        def integer:
+            type == "number" and . == floor;
+        def positive_integer:
+            integer and . > 0;
+        def output_name:
+            type == "string" and test("^[A-Za-z0-9_.:-]+$");
+        def valid_layout:
+            (.width | positive_integer) and
+            (.height | positive_integer) and
+            (.refreshRate | type == "number" and . > 0) and
+            (.x | integer) and
+            (.y | integer) and
+            (.scale | type == "number" and . > 0 and . <= 10) and
+            (.transform | integer and . >= 0 and . <= 7) and
+            ((.mirrorOf == "none") or (.mirrorOf | output_name));
+        def dpms:
+            if has("dpmsStatus") then .dpmsStatus else null end;
+
+        select(type == "array" and length > 0)
+        | select(all(.[];
+            type == "object" and
+            (.name | output_name) and
+            (.disabled | type == "boolean")))
+        | select((map(.name) | length) == (map(.name) | unique | length))
+        | . as $monitors
+        | [$monitors[] | select(.name == $output)]
+        | select(length == 1)
+        | .[0] as $internal
+        | select($internal.disabled or ($internal | valid_layout))
+        | {
+            internal: {
+                output: $internal.name,
+                enabled: ($internal.disabled == false),
+                disabled: $internal.disabled,
+                dpms: ($internal | dpms),
+                layout: (if $internal.disabled then null else {
+                    output: $internal.name,
+                    mode: (($internal.width | tostring) + "x" +
+                        ($internal.height | tostring) + "@" +
+                        ($internal.refreshRate | tostring)),
+                    position: (($internal.x | tostring) + "x" +
+                        ($internal.y | tostring)),
+                    scale: $internal.scale,
+                    transform: $internal.transform,
+                    mirror: (if $internal.mirrorOf == "none" then ""
+                        else $internal.mirrorOf end)
+                } end)
+            },
+            externals: ([$monitors[]
+                | select(.name != $output)
+                | {
+                    output: .name,
+                    enabled: (.disabled == false),
+                    disabled: .disabled,
+                    dpms: dpms
+                }
+            ] | sort_by(.output))
+        }
+    ' <<< "$monitors_json"); then
+        monitor_state_fail monitor_topology_invalid
+        return
+    fi
+}
+
+monitor_state_internal_enabled() {
+    jq -er '.internal.enabled' <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_enabled_external_count() {
+    jq -er '[.externals[] | select(.enabled)] | length' \
+        <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
+monitor_state_topology_fingerprint() {
+    jq -cer '{
+        internal: {
+            output: .internal.output,
+            enabled: .internal.enabled,
+            dpms: .internal.dpms
+        },
+        externals: [.externals[] | {
+            output: .output,
+            enabled: .enabled,
+            dpms: .dpms
+        }]
+    }' <<< "$MONITOR_STATE_TOPOLOGY"
 }
 
 monitor_state_prepare_directory() {
@@ -737,7 +884,7 @@ monitor_state_prepare_directory() {
 
 monitor_state_capture_internal_layout() {
     local output=$1
-    local monitors_json temporary_snapshot
+    local temporary_snapshot
 
     MONITOR_STATE_ERROR=""
     if ! monitor_state_prepare_directory; then
@@ -754,48 +901,11 @@ monitor_state_capture_internal_layout() {
         return
     fi
 
-    if ! monitors_json=$(hyprctl -j monitors all); then
-        rm -f -- "$temporary_snapshot"
-        monitor_state_fail monitor_query_failed
-        return
-    fi
-
     if ! jq -ce --arg output "$output" '
-        def integer:
-            type == "number" and . == floor;
-        def positive_integer:
-            integer and . > 0;
-        def output_name:
-            type == "string" and test("^[A-Za-z0-9_.:-]+$");
-
-        select(type == "array")
-        | [.[] | select(.name == $output)]
-        | select(length == 1)
-        | .[0] as $monitor
-        | select(
-            ($monitor.name | output_name) and
-            ($monitor.width | positive_integer) and
-            ($monitor.height | positive_integer) and
-            ($monitor.refreshRate | type == "number" and . > 0) and
-            ($monitor.x | integer) and
-            ($monitor.y | integer) and
-            ($monitor.scale | type == "number" and . > 0 and . <= 10) and
-            ($monitor.transform | integer and . >= 0 and . <= 7) and
-            ($monitor.disabled == false) and
-            (($monitor.mirrorOf == "none") or ($monitor.mirrorOf | output_name))
-        )
-        | {
-            output: $monitor.name,
-            mode: (($monitor.width | tostring) + "x" +
-                ($monitor.height | tostring) + "@" +
-                ($monitor.refreshRate | tostring)),
-            position: (($monitor.x | tostring) + "x" +
-                ($monitor.y | tostring)),
-            scale: $monitor.scale,
-            transform: $monitor.transform,
-            mirror: (if $monitor.mirrorOf == "none" then "" else $monitor.mirrorOf end)
-        }
-    ' <<< "$monitors_json" > "$temporary_snapshot"; then
+        select(.internal.output == $output and .internal.enabled)
+        | .internal.layout
+        | select(type == "object")
+    ' <<< "$MONITOR_STATE_TOPOLOGY" > "$temporary_snapshot"; then
         rm -f -- "$temporary_snapshot"
         monitor_state_fail monitor_snapshot_invalid
         return
@@ -921,21 +1031,6 @@ fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 
-get_external_display() {
-    local monitor_output external_display
-
-    if ! monitor_output=$(hyprctl monitors); then
-        return 2
-    fi
-
-    external_display=$(grep -E "^Monitor (DP|HDMI|USB-C)" <<< "$monitor_output" | grep -v "$LAPTOP_DISPLAY" | head -1 | cut -d' ' -f2)
-    if [[ -z "$external_display" ]]; then
-        return 1
-    fi
-
-    printf '%s\n' "$external_display"
-}
-
 configure_clamshell_layout() {
     monitor_state_capture_internal_layout "$LAPTOP_DISPLAY" || return
     monitor_state_disable_internal_output "$LAPTOP_DISPLAY"
@@ -957,21 +1052,29 @@ refresh_waybar_layout() {
 }
 
 handle_lid_close() {
-    local discovery_status=0 layout_status
+    local internal_enabled enabled_external_count layout_status
 
     log_info transition_started action=close
 
-    if CURRENT_EXTERNAL=$(get_external_display); then
-        discovery_status=0
-    else
-        discovery_status=$?
+    if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+        log_error monitor_query_failed action=close reason="$MONITOR_STATE_ERROR"
+        return 2
     fi
+    internal_enabled=$(monitor_state_internal_enabled)
+    enabled_external_count=$(monitor_state_enabled_external_count)
 
-    if (( discovery_status == 0 )); then
-        log_info external_monitor_detected action=close output="$CURRENT_EXTERNAL"
+    if (( enabled_external_count > 0 )); then
+        if [[ "$internal_enabled" == false ]]; then
+            log_info layout_noop action=close reason=internal_already_disabled \
+                enabled_external_count="$enabled_external_count"
+            return 0
+        fi
+
         if configure_clamshell_layout; then
             refresh_waybar_layout
-            log_info layout_applied action=close laptop=disabled external="$CURRENT_EXTERNAL"
+            log_info layout_applied action=close laptop=disabled \
+                enabled_external_count="$enabled_external_count"
+            return 0
         else
             layout_status=$?
             if (( layout_status == 2 )); then
@@ -981,56 +1084,62 @@ handle_lid_close() {
             fi
             return "$layout_status"
         fi
-    elif (( discovery_status == 1 )); then
-        log_info power_delegated owner=systemd-logind action=close reason=no_external_monitor
-    else
-        log_error monitor_query_failed action=close
-        return 2
     fi
+
+    if [[ "$internal_enabled" == false ]]; then
+        if configure_dual_layout; then
+            refresh_waybar_layout
+            log_info layout_applied action=close layout=internal_restored \
+                enabled_external_count=0
+        else
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=close layout=internal_restored \
+                    reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
+        fi
+    else
+        log_info layout_noop action=close reason=internal_already_enabled \
+            enabled_external_count=0
+    fi
+
+    log_info power_delegated owner=systemd-logind action=close \
+        reason=no_enabled_external
 }
 
 handle_lid_open() {
-    local discovery_status=0 layout_status
+    local internal_enabled enabled_external_count layout_status
 
     log_info transition_started action=open
 
-    if CURRENT_EXTERNAL=$(get_external_display); then
-        discovery_status=0
-    else
-        discovery_status=$?
+    if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+        log_error monitor_query_failed action=open reason="$MONITOR_STATE_ERROR"
+        return 2
+    fi
+    internal_enabled=$(monitor_state_internal_enabled)
+    enabled_external_count=$(monitor_state_enabled_external_count)
+
+    if [[ "$internal_enabled" == true ]]; then
+        log_info layout_noop action=open reason=internal_already_enabled \
+            enabled_external_count="$enabled_external_count"
+        return 0
     fi
 
-    if (( discovery_status == 0 )); then
-        log_info external_monitor_detected action=open output="$CURRENT_EXTERNAL"
-        if configure_dual_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=open layout=dual external="$CURRENT_EXTERNAL"
-        else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
-            else
-                log_error layout_apply_failed action=open layout=dual reason="$MONITOR_STATE_ERROR"
-            fi
-            return "$layout_status"
-        fi
-    elif (( discovery_status == 1 )); then
-        log_info external_monitor_absent action=open
-        if configure_dual_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=open layout=laptop_only
-        else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
-            else
-                log_error layout_apply_failed action=open layout=laptop_only reason="$MONITOR_STATE_ERROR"
-            fi
-            return "$layout_status"
-        fi
+    if configure_dual_layout; then
+        refresh_waybar_layout
+        log_info layout_applied action=open layout=restored \
+            enabled_external_count="$enabled_external_count"
     else
-        log_error monitor_query_failed action=open
-        return 2
+        layout_status=$?
+        if (( layout_status == 2 )); then
+            log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
+        else
+            log_error layout_apply_failed action=open layout=restored reason="$MONITOR_STATE_ERROR"
+        fi
+        return "$layout_status"
     fi
 }
 
@@ -1262,6 +1371,7 @@ install_lid_monitor_script() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LID_SWITCH_SCRIPT="$SCRIPT_DIR/lid-switch.sh"
+LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 
 log_record() {
     local level=$1
@@ -1314,6 +1424,25 @@ observe_lid_state() {
     return "$observation_status"
 }
 
+observe_topology() {
+    local observation_status
+
+    if monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+        if observed_topology=$(monitor_state_topology_fingerprint); then
+            observed_topology_error=""
+            return 0
+        fi
+        observation_status=$?
+        observed_topology_error="topology_fingerprint_failed"
+    else
+        observation_status=$?
+        observed_topology_error="$MONITOR_STATE_ERROR"
+    fi
+
+    observed_topology=""
+    return "$observation_status"
+}
+
 if ! . "$SCRIPT_DIR/lid-state.sh"; then
     log_error lid_state_observer_load_failed
     exit 1
@@ -1324,47 +1453,106 @@ if [[ "${1:-}" == "--print-state" ]]; then
     exit $?
 fi
 
-# Initial state
-previous_error=""
+if ! . "$SCRIPT_DIR/monitor-state.sh"; then
+    log_error monitor_state_observer_load_failed
+    exit 1
+fi
+
+# Treat the first complete joint observation as a baseline. Reconciliation only
+# begins after a later lid or topology change, so daemon startup remains inert.
+baseline_ready=false
+previous_state="unknown"
+previous_topology=""
+previous_lid_error=""
+previous_topology_error=""
+initial_lid_valid=false
+initial_topology_valid=false
+
 if observe_lid_state; then
+    initial_lid_valid=true
     previous_state="$observed_state"
 else
-    previous_state="unknown"
-    previous_error="$observed_error"
+    previous_lid_error="$observed_error"
     log_error lid_state_observation_failed reason="$observed_error"
 fi
-log_info monitor_started state="$previous_state"
+
+if observe_topology; then
+    initial_topology_valid=true
+    previous_topology="$observed_topology"
+else
+    previous_topology_error="$observed_topology_error"
+    log_error topology_observation_failed reason="$observed_topology_error"
+fi
+
+if [[ "$initial_lid_valid" == true && "$initial_topology_valid" == true ]]; then
+    baseline_ready=true
+fi
+log_info monitor_started state="$previous_state" \
+    topology="${previous_topology:-unavailable}" baseline_ready="$baseline_ready"
 
 while true; do
     if observe_lid_state; then
         current_state="$observed_state"
-        previous_error=""
+        previous_lid_error=""
     else
-        current_state="unknown"
-        if [[ "$observed_error" != "$previous_error" ]]; then
+        if [[ "$observed_error" != "$previous_lid_error" ]]; then
             log_error lid_state_observation_failed reason="$observed_error"
         fi
-        previous_error="$observed_error"
+        previous_lid_error="$observed_error"
         sleep 1
         continue
     fi
-    
-    if [[ "$current_state" != "$previous_state" && "$current_state" != "unknown" ]]; then
-        log_info lid_state_changed previous="$previous_state" current="$current_state"
-        
+
+    if observe_topology; then
+        current_topology="$observed_topology"
+        previous_topology_error=""
+    else
+        if [[ "$observed_topology_error" != "$previous_topology_error" ]]; then
+            log_error topology_observation_failed reason="$observed_topology_error"
+        fi
+        previous_topology_error="$observed_topology_error"
+        sleep 1
+        continue
+    fi
+
+    if [[ "$baseline_ready" != true ]]; then
+        previous_state="$current_state"
+        previous_topology="$current_topology"
+        baseline_ready=true
+        log_info joint_state_baselined state="$current_state" \
+            topology="$current_topology"
+        sleep 1
+        continue
+    fi
+
+    if [[ "$current_state" != "$previous_state" || \
+        "$current_topology" != "$previous_topology" ]]; then
+        log_info joint_state_changed previous_state="$previous_state" \
+            current_state="$current_state" \
+            previous_topology="$previous_topology" \
+            current_topology="$current_topology"
+
+        if [[ "$current_state" != "$previous_state" ]]; then
+            log_info lid_state_changed previous="$previous_state" current="$current_state"
+        fi
+
         # Call the lid switch script with the appropriate argument
         if [[ "$current_state" == "closed" ]]; then
             "$LID_SWITCH_SCRIPT" close
         elif [[ "$current_state" == "open" ]]; then
             "$LID_SWITCH_SCRIPT" open
         fi
-        
+
         previous_state="$current_state"
+        previous_topology="$current_topology"
     fi
-    
+
     sleep 1
 done
 EOF
+
+    sed -i "s/LAPTOP_MONITOR_PLACEHOLDER/$laptop_monitor/g" \
+        "$SCRIPTS_DIR/lid-monitor.sh"
     
     # Make script executable
     chmod +x "$SCRIPTS_DIR/lid-monitor.sh"
@@ -1487,10 +1675,11 @@ print_final_instructions() {
     echo "  • Systemd user service: lid-monitor.service"
     echo
     echo -e "${BLUE}How it works:${NC}"
-    echo "  • When lid closes + external monitor connected: laptop screen turns off"
-    echo "  • When lid closes without an external monitor: systemd-logind owns the power action"
+    echo "  • When lid closes + an enabled external output: laptop screen turns off"
+    echo "  • When lid closes without an enabled external output: systemd-logind owns the power action"
     echo "  • When lid opens: laptop screen turns back on (dual monitor setup)"
-    echo "  • Service starts automatically on login"
+    echo "  • Awake output activation and hotplug changes are reconciled automatically"
+    echo "  • Service starts automatically on login without changing the initial layout"
     echo
     echo -e "${BLUE}Useful commands:${NC}"
     echo "  • Check service status: systemctl --user status lid-monitor.service"

@@ -4,7 +4,7 @@
 # Hyprland Lid Switch Installer
 # 
 # This script installs an automatic lid switch handler for Hyprland that:
-# - Disables laptop display when lid is closed (with external monitor connected)
+# - Disables laptop display when lid is closed with an enabled external output
 # - Re-enables laptop display when lid is opened
 # - Works safely without crashing Wayland sessions
 #
@@ -39,9 +39,9 @@ SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
 
 # Global variables
 laptop_monitor=""
-external_monitor=""
 HYPRCTL_BIN=""
 JQ_BIN=""
+HYPRLAND_MONITORS_JSON=""
 session_config_state=""
 legacy_default_target_service=false
 
@@ -89,7 +89,6 @@ check_hyprland_capabilities() {
     local version_json version_string version_major version_minor
     local instances_json instance_count instance_signature instance_socket
     local status_json config_provider
-    local monitors_json
     local lua_probe_output
 
     if ! command_exists jq; then
@@ -172,11 +171,11 @@ check_hyprland_capabilities() {
         return 1
     fi
 
-    if ! monitors_json=$("$HYPRCTL_BIN" -j monitors all); then
+    if ! HYPRLAND_MONITORS_JSON=$("$HYPRCTL_BIN" -j monitors all); then
         log_error "Could not query monitor capabilities with 'hyprctl -j monitors all'"
         return 1
     fi
-    if ! "$JQ_BIN" -e 'type == "array"' <<< "$monitors_json" >/dev/null; then
+    if ! "$JQ_BIN" -e 'type == "array"' <<< "$HYPRLAND_MONITORS_JSON" >/dev/null; then
         log_error "Hyprland 'hyprctl -j monitors all' did not return a valid monitor array"
         return 1
     fi
@@ -297,24 +296,71 @@ integrate_session_config() {
 
 # Detect laptop and external monitors
 detect_monitors() {
-    local monitor_list=""
-    
-    # Get monitor information from hyprctl
-    monitor_list=$(hyprctl monitors | awk '/Monitor / {print $2}')
+    local configured_internal=${HYPR_LID_INTERNAL_OUTPUT:-}
+    local internal_count internal_status external_records
 
-    laptop_monitor=$(grep -m1 "^eDP" <<<"${monitor_list}" || true)
-    external_monitor=$(grep -m1 -E "^(DP|HDMI|USB-C)" <<<"${monitor_list}" || true)
-    
-    if [[ -z "$laptop_monitor" ]]; then
-        log_error "Could not detect laptop monitor (eDP-*)"
+    if ! "$JQ_BIN" -e '
+        type == "array" and
+        all(.[]; type == "object" and
+            (.name | type == "string" and test("^[A-Za-z0-9_.:-]+$")) and
+            (.disabled | type == "boolean")) and
+        ((map(.name) | length) == (map(.name) | unique | length))
+    ' <<< "$HYPRLAND_MONITORS_JSON" >/dev/null; then
+        log_error "Hyprland returned malformed monitor identity or activation records"
         exit 1
     fi
-    
-    log_info "Detected laptop monitor: $laptop_monitor"
-    if [[ -n "$external_monitor" ]]; then
-        log_info "Detected external monitor: $external_monitor"
+
+    if [[ -n "$configured_internal" ]]; then
+        if [[ ! "$configured_internal" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+            log_error "HYPR_LID_INTERNAL_OUTPUT contains an invalid output name"
+            exit 1
+        fi
+        internal_count=$("$JQ_BIN" -r --arg output "$configured_internal" \
+            '[.[] | select(.name == $output)] | length' \
+            <<< "$HYPRLAND_MONITORS_JSON")
+        if (( internal_count == 0 )); then
+            log_error "Configured internal output not found: $configured_internal"
+            exit 1
+        elif (( internal_count > 1 )); then
+            log_error "Configured internal output is ambiguous: $configured_internal"
+            exit 1
+        fi
+        laptop_monitor=$configured_internal
     else
-        log_info "No external monitor currently connected"
+        internal_count=$("$JQ_BIN" -r \
+            '[.[] | select(.name | startswith("eDP"))] | length' \
+            <<< "$HYPRLAND_MONITORS_JSON")
+        if (( internal_count == 0 )); then
+            log_error "Could not detect an internal output; set HYPR_LID_INTERNAL_OUTPUT"
+            exit 1
+        elif (( internal_count > 1 )); then
+            log_error "Multiple internal output candidates detected; set HYPR_LID_INTERNAL_OUTPUT"
+            exit 1
+        fi
+        laptop_monitor=$("$JQ_BIN" -r \
+            '.[] | select(.name | startswith("eDP")) | .name' \
+            <<< "$HYPRLAND_MONITORS_JSON")
+    fi
+
+    internal_status=$("$JQ_BIN" -r --arg output "$laptop_monitor" \
+        '.[] | select(.name == $output) |
+            if .disabled then "inactive" else "enabled" end' \
+        <<< "$HYPRLAND_MONITORS_JSON")
+    log_info "Detected internal output: $laptop_monitor ($internal_status)"
+
+    external_records=$("$JQ_BIN" -r --arg internal "$laptop_monitor" '
+        [.[] | select(.name != $internal)]
+        | sort_by(.name)
+        | .[]
+        | [.name, (if .disabled then "inactive" else "enabled" end)]
+        | @tsv
+    ' <<< "$HYPRLAND_MONITORS_JSON")
+    if [[ -z "$external_records" ]]; then
+        log_info "No external outputs detected"
+    else
+        while IFS=$'\t' read -r output status; do
+            log_info "Detected external output: $output ($status)"
+        done <<< "$external_records"
     fi
 }
 
@@ -424,6 +470,9 @@ install_lid_monitor_script() {
     cat > "$SCRIPTS_DIR/lid-monitor.sh" << 'EOF'
 @@LID_MONITOR_SCRIPT@@
 EOF
+
+    sed -i "s/LAPTOP_MONITOR_PLACEHOLDER/$laptop_monitor/g" \
+        "$SCRIPTS_DIR/lid-monitor.sh"
     
     # Make script executable
     chmod +x "$SCRIPTS_DIR/lid-monitor.sh"
@@ -528,10 +577,11 @@ print_final_instructions() {
     echo "  • Systemd user service: lid-monitor.service"
     echo
     echo -e "${BLUE}How it works:${NC}"
-    echo "  • When lid closes + external monitor connected: laptop screen turns off"
-    echo "  • When lid closes without an external monitor: systemd-logind owns the power action"
+    echo "  • When lid closes + an enabled external output: laptop screen turns off"
+    echo "  • When lid closes without an enabled external output: systemd-logind owns the power action"
     echo "  • When lid opens: laptop screen turns back on (dual monitor setup)"
-    echo "  • Service starts automatically on login"
+    echo "  • Awake output activation and hotplug changes are reconciled automatically"
+    echo "  • Service starts automatically on login without changing the initial layout"
     echo
     echo -e "${BLUE}Useful commands:${NC}"
     echo "  • Check service status: systemctl --user status lid-monitor.service"

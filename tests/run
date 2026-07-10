@@ -102,7 +102,7 @@ installed_cli_round_trips_internal_layout_profile() (
     local expected_transform=$5
     local expected_mirror=$6
     local test_root home fake_bin safe_bin effect_log monitor_fixture
-    local runtime_dir monitor_json installed_cli installed_state snapshot_file
+    local runtime_dir monitor_json disabled_monitor_json installed_cli installed_state snapshot_file
     local close_effects open_effects close_output open_output
     local close_status=0 open_status=0 failures=0
 
@@ -116,6 +116,9 @@ installed_cli_round_trips_internal_layout_profile() (
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     runtime_dir="$test_root/runtime"
     monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/$profile.json")
+    disabled_monitor_json=$(jq -c \
+        'map(if .name == "eDP-1" then .disabled = true else . end)' \
+        <<< "$monitor_json")
     mkdir -m 0700 -p "$home" "$runtime_dir"
     prepare_hyprland_config "$home"
     : > "$effect_log"
@@ -207,7 +210,7 @@ installed_cli_round_trips_internal_layout_profile() (
         XDG_RUNTIME_DIR="$runtime_dir" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        TEST_HYPRCTL_MONITORS_JSON="$disabled_monitor_json" \
         "$installed_cli" open \
         > "$test_root/open.out" 2>&1 || open_status=$?
 
@@ -243,14 +246,338 @@ installed_cli_round_trips_rotated_fractional_layout() {
         rotated-fractional '2256x1504@59.998' '-1504x120' 1.25 1 'DP-2'
 }
 
+installed_cli_noops_open_when_internal_is_enabled() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir monitor_fixture
+    local monitor_json installed_cli runtime_output effects runtime_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/multiple-external.txt"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$installed_cli" open \
+        > "$test_root/runtime.out" 2>&1 || runtime_status=$?
+
+    runtime_output=$(<"$test_root/runtime.out")
+    effects=$(<"$effect_log")
+    if (( runtime_status != 0 )); then
+        printf 'expected enabled-internal open status 0, got %d\n%s\n' \
+            "$runtime_status" "$runtime_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" $'hyprctl\t-j\tmonitors\tall' \
+        'open should inspect one structured all-output topology' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'hyprctl\tmonitors' \
+        'open must not use the human-readable active-output query' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'open hotplug must not rewrite an already-enabled internal or any external' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'pkill\t' \
+        'an open no-op must not refresh Waybar' \
+        || failures=$((failures + 1))
+    assert_contains "$runtime_output" \
+        'event=layout_noop action=open reason=internal_already_enabled' \
+        'open should explain why topology changes require no mutation' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_cli_reconciles_closed_topology_without_external_mutation() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir monitor_fixture
+    local framework docked_disabled undocked_disabled inactive_external mixed_external
+    local installed_cli runtime_status runtime_output effects query_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/multiple-external.txt"
+    framework=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    docked_disabled=$(jq -c \
+        'map(if .name == "eDP-1" then .disabled = true else . end)' \
+        <<< "$framework")
+    undocked_disabled=$(jq -c \
+        '[.[] | select(.name == "eDP-1") | .disabled = true]' \
+        <<< "$framework")
+    inactive_external=$(jq -cn --argjson monitors "$framework" '
+        [($monitors[] | select(.name == "eDP-1")),
+         {name:"WL-1", disabled:true, dpmsStatus:true}]
+    ')
+    mixed_external=$(jq -cn --argjson monitors "$framework" '
+        [($monitors[] | select(.name == "eDP-1")),
+         {name:"Virtual-2", disabled:true, dpmsStatus:true},
+         {name:"WL-1", disabled:false, dpmsStatus:false},
+         {name:"USB-Custom", disabled:false, dpmsStatus:true}]
+    ')
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+
+    run_closed_profile() {
+        local label=$1
+        local topology=$2
+
+        runtime_status=0
+        : > "$effect_log"
+        "$ENV_BIN" -i \
+            HOME="$home" \
+            PATH="$fake_bin:$safe_bin" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            TEST_HYPRCTL_MONITORS_JSON="$topology" \
+            "$installed_cli" close \
+            > "$test_root/$label.out" 2>&1 || runtime_status=$?
+        runtime_output=$(<"$test_root/$label.out")
+        effects=$(<"$effect_log")
+        query_count=$(grep -Fxc \
+            $'hyprctl\t-j\tmonitors\tall' "$effect_log" || true)
+        if (( runtime_status != 0 )); then
+            printf 'expected %s closed status 0, got %d\n%s\n' \
+                "$label" "$runtime_status" "$runtime_output" >&2
+            return 1
+        fi
+        if (( query_count != 1 )); then
+            printf 'expected %s to use one topology query, got %d\n%s\n' \
+                "$label" "$query_count" "$effects" >&2
+            return 1
+        fi
+        assert_not_contains "$effects" $'hyprctl\tmonitors' \
+            "$label must not use human-readable monitor discovery" || return 1
+        assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+            "$label must not mutate DP-2" || return 1
+        assert_not_contains "$effects" $'monitor\toutput=WL-1' \
+            "$label must not mutate WL-1" || return 1
+        assert_not_contains "$effects" $'monitor\toutput=USB-Custom' \
+            "$label must not mutate USB-Custom" || return 1
+    }
+
+    run_closed_profile docked-enabled "$framework" \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'monitor\toutput=eDP-1\tdisabled=true' \
+        'closed with an enabled external should capture then disable the internal' \
+        || failures=$((failures + 1))
+
+    run_closed_profile docked-already-disabled "$docked_disabled" \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'closed with internal already disabled and an enabled external should no-op' \
+        || failures=$((failures + 1))
+    assert_contains "$runtime_output" \
+        'event=layout_noop action=close reason=internal_already_disabled' \
+        'repeated closed topology should report its no-op' \
+        || failures=$((failures + 1))
+
+    run_closed_profile undocked-disabled "$undocked_disabled" \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'monitor\toutput=eDP-1\tdisabled=false' \
+        'undock while closed should restore a disabled internal before delegation' \
+        || failures=$((failures + 1))
+    assert_contains "$runtime_output" \
+        'event=power_delegated owner=systemd-logind action=close reason=no_enabled_external' \
+        'undocked closed state should delegate power after restoring the internal' \
+        || failures=$((failures + 1))
+
+    run_closed_profile external-inactive "$inactive_external" \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'an inactive external must not count as enabled' \
+        || failures=$((failures + 1))
+    assert_contains "$runtime_output" \
+        'event=power_delegated owner=systemd-logind action=close reason=no_enabled_external' \
+        'closed with only inactive externals should delegate power' \
+        || failures=$((failures + 1))
+
+    run_closed_profile external-activated "$mixed_external" \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'monitor\toutput=eDP-1\tdisabled=true' \
+        'activating any external while closed should disable an enabled internal' \
+        || failures=$((failures + 1))
+    assert_contains "$runtime_output" 'enabled_external_count=2' \
+        'mixed multiple externals should count only enabled records' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_daemon_observes_joint_lid_and_topology_changes() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture installed_daemon sequence_dir sequence_counter
+    local framework internal external_enabled external_inactive docked inactive
+    local undocked_enabled undocked_disabled daemon_output effects
+    local disable_count restore_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    sequence_dir="$test_root/topology-sequence"
+    sequence_counter="$test_root/topology-counter"
+    framework=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    internal=$(jq -c '.[] | select(.name == "eDP-1")' <<< "$framework")
+    external_enabled='{"name":"WL-1","disabled":false,"dpmsStatus":false}'
+    external_inactive='{"name":"WL-1","disabled":true,"dpmsStatus":true}'
+    docked=$(jq -cn --argjson internal "$internal" \
+        --argjson external "$external_enabled" '[$internal, $external]')
+    inactive=$(jq -cn --argjson internal "$internal" \
+        --argjson external "$external_inactive" '[$internal, $external]')
+    undocked_enabled=$(jq -cn --argjson internal "$internal" '[$internal]')
+    undocked_disabled=$(jq -cn --argjson internal "$internal" \
+        '[($internal | .disabled = true)]')
+
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$docked" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    printf '%s\n' "$docked" > "$sequence_dir/0.json"
+    printf '%s\n' '__FAIL__' > "$sequence_dir/1.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/2.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/3.json"
+    printf '%s\n' "$inactive" > "$sequence_dir/4.json"
+    printf '%s\n' "$inactive" > "$sequence_dir/5.json"
+    printf '%s\n' "$docked" > "$sequence_dir/6.json"
+    printf '%s\n' "$docked" > "$sequence_dir/7.json"
+    printf '%s\n' "$undocked_disabled" > "$sequence_dir/8.json"
+    printf '%s\n' "$undocked_disabled" > "$sequence_dir/9.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/10.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/final.json"
+    printf '%s\n' 0 > "$sequence_counter"
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$TIMEOUT_BIN" 0.5 "$installed_daemon" \
+        > "$test_root/daemon.out" 2>&1 || true
+
+    daemon_output=$(<"$test_root/daemon.out")
+    effects=$(<"$effect_log")
+    disable_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
+    restore_count=$(grep -Fc \
+        $'monitor\toutput=eDP-1\tdisabled=false' "$effect_log" || true)
+
+    if (( disable_count != 1 || restore_count != 1 )); then
+        printf 'expected one internal disable and restore, got disable=%d restore=%d\n%s\n' \
+            "$disable_count" "$restore_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$daemon_output" \
+        'event=topology_observation_failed reason=monitor_query_failed' \
+        'daemon should expose and retain a failed topology observation' \
+        || failures=$((failures + 1))
+    assert_contains "$daemon_output" 'event=joint_state_changed' \
+        'daemon should react while the lid remains closed and topology changes' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=WL-1' \
+        'daemon-triggered transitions must never mutate the external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'daemon topology reconciliation must not request repository-owned power actions' \
+        || failures=$((failures + 1))
+    if [[ -e "$runtime_dir/arch-lidswitch/internal-layout.json" ]]; then
+        printf 'daemon round trip left a stale internal layout snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
 installed_cli_snapshot_failure_is_safe() (
     set -euo pipefail
 
     local scenario=$1
     local transition=$2
-    local expected_reason=$3
+    local expected_event=$3
+    local expected_reason=$4
     local test_root home fake_bin safe_bin effect_log monitor_fixture runtime_dir
-    local installed_cli runtime_output effects runtime_status=0
+    local installed_cli runtime_output effects runtime_status=0 disabled_topology
     local -a scenario_environment=()
 
     test_root=$(mktemp -d)
@@ -266,6 +593,9 @@ installed_cli_snapshot_failure_is_safe() (
     prepare_hyprland_config "$home"
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
+    disabled_topology=$(jq -c \
+        'map(if .name == "eDP-1" then .disabled = true else . end)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
 
     "$ENV_BIN" -i \
         HOME="$home" \
@@ -293,8 +623,10 @@ installed_cli_snapshot_failure_is_safe() (
             chmod 0500 "$runtime_dir"
             ;;
         restore-missing)
+            scenario_environment=("TEST_HYPRCTL_MONITORS_JSON=$disabled_topology")
             ;;
         restore-malformed)
+            scenario_environment=("TEST_HYPRCTL_MONITORS_JSON=$disabled_topology")
             mkdir -m 0700 "$runtime_dir/arch-lidswitch"
             printf '%s\n' '{"output":"DP-2","mode":"unsafe"}' \
                 > "$runtime_dir/arch-lidswitch/internal-layout.json"
@@ -325,7 +657,7 @@ installed_cli_snapshot_failure_is_safe() (
         return 1
     fi
     assert_contains "$runtime_output" \
-        "event=layout_snapshot_failed action=$transition reason=$expected_reason" \
+        "event=$expected_event action=$transition reason=$expected_reason" \
         'snapshot failure should be visible at the installed CLI boundary'
     assert_not_contains "$effects" $'monitor\t' \
         'snapshot failure must not mutate any monitor'
@@ -336,16 +668,17 @@ installed_cli_snapshot_failure_is_safe() (
 installed_cli_refuses_close_without_a_valid_snapshot() (
     set -euo pipefail
 
-    local scenario reason failures=0
-    while IFS='|' read -r scenario reason; do
-        if ! installed_cli_snapshot_failure_is_safe "$scenario" close "$reason"; then
+    local scenario event reason failures=0
+    while IFS='|' read -r scenario event reason; do
+        if ! installed_cli_snapshot_failure_is_safe \
+            "$scenario" close "$event" "$reason"; then
             failures=$((failures + 1))
         fi
     done <<'EOF'
-capture-missing|monitor_snapshot_invalid
-capture-malformed|monitor_snapshot_invalid
-capture-query-failure|monitor_query_failed
-capture-unwritable|snapshot_directory_unwritable
+capture-missing|monitor_query_failed|monitor_topology_invalid
+capture-malformed|monitor_query_failed|monitor_topology_invalid
+capture-query-failure|monitor_query_failed|monitor_query_failed
+capture-unwritable|layout_snapshot_failed|snapshot_directory_unwritable
 EOF
 
     (( failures == 0 ))
@@ -354,14 +687,15 @@ EOF
 installed_cli_refuses_open_without_a_valid_snapshot() (
     set -euo pipefail
 
-    local scenario reason failures=0
-    while IFS='|' read -r scenario reason; do
-        if ! installed_cli_snapshot_failure_is_safe "$scenario" open "$reason"; then
+    local scenario event reason failures=0
+    while IFS='|' read -r scenario event reason; do
+        if ! installed_cli_snapshot_failure_is_safe \
+            "$scenario" open "$event" "$reason"; then
             failures=$((failures + 1))
         fi
     done <<'EOF'
-restore-missing|snapshot_missing
-restore-malformed|snapshot_invalid
+restore-missing|layout_snapshot_failed|snapshot_missing
+restore-malformed|layout_snapshot_failed|snapshot_invalid
 EOF
 
     (( failures == 0 ))
@@ -370,7 +704,7 @@ EOF
 installed_cli_delegates_laptop_only_close_to_logind() (
     set -euo pipefail
 
-    local test_root home fake_bin safe_bin effect_log monitor_fixture installed_cli
+    local test_root home fake_bin safe_bin effect_log monitor_fixture monitor_json installed_cli
     local runtime_effects runtime_output runtime_status=0 failures=0
 
     test_root=$(mktemp -d)
@@ -381,6 +715,8 @@ installed_cli_delegates_laptop_only_close_to_logind() (
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/laptop-only.txt"
+    monitor_json=$(jq -c '[.[] | select(.name == "eDP-1")]' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
     mkdir -p "$home"
     prepare_hyprland_config "$home"
     : > "$effect_log"
@@ -394,6 +730,7 @@ installed_cli_delegates_laptop_only_close_to_logind() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1
 
@@ -405,6 +742,7 @@ installed_cli_delegates_laptop_only_close_to_logind() (
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
         "$installed_cli" close \
         > "$test_root/runtime.out" 2>&1 || runtime_status=$?
 
@@ -416,7 +754,7 @@ installed_cli_delegates_laptop_only_close_to_logind() (
             "$runtime_status" "$runtime_output" >&2
         failures=$((failures + 1))
     fi
-    assert_contains "$runtime_effects" $'hyprctl\tmonitors' \
+    assert_contains "$runtime_effects" $'hyprctl\t-j\tmonitors\tall' \
         'the installed CLI should inspect the current monitor state' \
         || failures=$((failures + 1))
     assert_not_contains "$runtime_effects" $'systemctl\t' \
@@ -426,7 +764,7 @@ installed_cli_delegates_laptop_only_close_to_logind() (
         'a laptop-only close should not mutate display state' \
         || failures=$((failures + 1))
     assert_contains "$runtime_output" \
-        'level=info component=lid-switch event=power_delegated owner=systemd-logind action=close reason=no_external_monitor' \
+        'level=info component=lid-switch event=power_delegated owner=systemd-logind action=close reason=no_enabled_external' \
         'the installed CLI should record the single lid-power owner' \
         || failures=$((failures + 1))
     assert_not_contains "$runtime_output" 'event=power_action_requested' \
@@ -636,7 +974,7 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
 
     local transition=$1
     local test_root home fake_bin safe_bin effect_log installed_cli
-    local install_fixture missing_runtime_fixture runtime_effects runtime_output
+    local install_fixture runtime_effects runtime_output
     local runtime_output_file runtime_status=0
 
     test_root=$(mktemp -d)
@@ -648,7 +986,6 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
     effect_log="$test_root/effects.log"
     runtime_output_file="$test_root/runtime.out"
     install_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
-    missing_runtime_fixture="$test_root/missing-monitors.txt"
     mkdir -p "$home"
     prepare_hyprland_config "$home"
     : > "$effect_log"
@@ -672,14 +1009,15 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
-        TEST_MONITORS_FIXTURE="$missing_runtime_fixture" \
+        TEST_MONITORS_FIXTURE="$install_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON_FAIL=1 \
         "$installed_cli" "$transition" \
         > "$runtime_output_file" 2>&1 || runtime_status=$?
 
     runtime_effects=$(<"$effect_log")
     runtime_output=$(<"$runtime_output_file")
 
-    assert_contains "$runtime_effects" $'hyprctl\tmonitors' \
+    assert_contains "$runtime_effects" $'hyprctl\t-j\tmonitors\tall' \
         'the installed CLI should reach the failing monitor-query boundary'
     assert_not_contains "$runtime_effects" $'systemctl\t' \
         'a monitor-query failure must not request a power action'
@@ -789,7 +1127,8 @@ installed_runtime_reports_through_the_journal_boundary() (
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
-        TEST_MONITORS_FIXTURE="$test_root/missing-monitors.txt" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON_FAIL=1 \
         HYPR_LID_STATE_ROOT="$lid_root" \
         "$installed_cli" close \
         > "$test_root/runtime.out" 2>&1 || runtime_status=$?
@@ -849,6 +1188,7 @@ installed_lid_state_matches_expected_behavior() (
     local expected_state=$2
     local expected_error=${3:-}
     local test_root home fake_bin safe_bin effect_log monitor_fixture lid_root runtime_dir
+    local monitor_json disabled_monitor_json runtime_monitor_json
     local installed_cli installed_daemon cli_effects daemon_output installer_output
     local cli_status=0 daemon_status=0
 
@@ -860,6 +1200,14 @@ installed_lid_state_matches_expected_behavior() (
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    disabled_monitor_json=$(jq -c \
+        'map(if .name == "eDP-1" then .disabled = true else . end)' \
+        <<< "$monitor_json")
+    runtime_monitor_json=$monitor_json
+    if [[ "$expected_state" == open ]]; then
+        runtime_monitor_json=$disabled_monitor_json
+    fi
     lid_root="$test_root/button/lid"
     runtime_dir="$test_root/runtime"
     mkdir -m 0700 -p "$home" "$runtime_dir"
@@ -876,6 +1224,7 @@ installed_lid_state_matches_expected_behavior() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
         HYPR_LID_STATE_ROOT="$lid_root" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1; then
@@ -902,6 +1251,7 @@ installed_lid_state_matches_expected_behavior() (
         XDG_RUNTIME_DIR="$runtime_dir" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
         "$installed_cli" close \
         > "$test_root/seed-close.out" 2>&1; then
         printf 'could not seed the installed CLI monitor snapshot:\n%s\n' \
@@ -916,6 +1266,7 @@ installed_lid_state_matches_expected_behavior() (
         XDG_RUNTIME_DIR="$runtime_dir" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$runtime_monitor_json" \
         HYPR_LID_STATE_ROOT="$lid_root" \
         "$installed_cli" \
         > "$test_root/cli.out" 2> "$test_root/cli.err" || cli_status=$?
@@ -1048,7 +1399,8 @@ installer_matches_fixture_expectation() (
     local expected_message=$3
     local assertion_message=$4
     shift 4
-    local test_root home fake_bin safe_bin effect_log fixture installer_output effects
+    local test_root home fake_bin safe_bin effect_log fixture monitor_json
+    local installer_output effects
     local installer_status=0
 
     test_root=$(mktemp -d)
@@ -1059,6 +1411,25 @@ installer_matches_fixture_expectation() (
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
     fixture="$ROOT_DIR/tests/fixtures/monitors/$fixture_name"
+    case "$fixture_name" in
+        laptop-only.txt)
+            monitor_json='[{"name":"eDP-1","disabled":false}]'
+            ;;
+        one-external.txt)
+            monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+            ;;
+        multiple-external.txt)
+            monitor_json='[{"name":"eDP-1","disabled":false},{"name":"DP-2","disabled":false},{"name":"HDMI-A-1","disabled":false}]'
+            ;;
+        no-laptop.txt)
+            monitor_json='[{"name":"DP-2","disabled":false}]'
+            ;;
+        *)
+            printf 'no structured monitor fixture mapping for: %s\n' \
+                "$fixture_name" >&2
+            return 2
+            ;;
+    esac
     mkdir -p "$home"
     prepare_hyprland_config "$home"
     : > "$effect_log"
@@ -1072,6 +1443,7 @@ installer_matches_fixture_expectation() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
         "$@" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1 || installer_status=$?
@@ -1117,7 +1489,7 @@ installer_succeeds_without_an_external_monitor() {
     installer_matches_fixture_expectation \
         'laptop-only.txt' \
         success \
-        'No external monitor currently connected' \
+        'No external outputs detected' \
         'an absent external monitor should be reported as an informational state'
 }
 
@@ -1125,7 +1497,7 @@ installer_succeeds_with_one_external_monitor() {
     installer_matches_fixture_expectation \
         'one-external.txt' \
         success \
-        'Detected external monitor: DP-2' \
+        'Detected external output: DP-2 (enabled)' \
         'the active external monitor should be reported during installation'
 }
 
@@ -1133,15 +1505,107 @@ installer_succeeds_with_multiple_external_monitors() {
     installer_matches_fixture_expectation \
         'multiple-external.txt' \
         success \
-        'Detected external monitor:' \
+        'Detected external output:' \
         'multiple external monitors should not abort installation'
+}
+
+installer_detects_explicit_internal_and_nonstandard_externals() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture monitor_json
+    local installer_output effects installed_cli installed_daemon installer_status=0
+    local failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/no-laptop.txt"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/nonstandard-mixed.json")
+    mkdir -p "$home"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        HYPR_LID_INTERNAL_OUTPUT=DSI-1 \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    installer_output=$(<"$test_root/installer.out")
+    effects=$(<"$effect_log")
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    if (( installer_status != 0 )); then
+        printf 'expected explicit structured monitor installation status 0, got %d\n%s\n' \
+            "$installer_status" "$installer_output" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -r "$installed_cli" || ! -r "$installed_daemon" ]]; then
+        printf 'installer did not create both configured runtime scripts\n' >&2
+        failures=$((failures + 1))
+    else
+        assert_contains "$(<"$installed_cli")" 'LAPTOP_DISPLAY="DSI-1"' \
+            'installed CLI should use the explicit internal identity' \
+            || failures=$((failures + 1))
+        assert_contains "$(<"$installed_daemon")" 'LAPTOP_DISPLAY="DSI-1"' \
+            'installed daemon should observe topology for the same internal identity' \
+            || failures=$((failures + 1))
+    fi
+    assert_contains "$installer_output" 'Detected internal output: DSI-1 (inactive)' \
+        'installer should see an inactive explicit internal output' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" 'Detected external output: Virtual-2 (inactive)' \
+        'installer should classify an inactive nonstandard external by identity difference' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" 'Detected external output: WL-1 (enabled)' \
+        'installer should classify an enabled nonstandard external by identity difference' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'hyprctl\tmonitors\n' \
+        'installer detection must not fall back to human-readable active monitors' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_rejects_ambiguous_or_missing_internal_identity() {
+    local failures=0
+
+    installer_matches_fixture_expectation \
+        'one-external.txt' \
+        failure \
+        'Multiple internal output candidates detected; set HYPR_LID_INTERNAL_OUTPUT' \
+        'ambiguous structured internal identities should require an explicit choice' \
+        'TEST_HYPRCTL_MONITORS_JSON=[{"name":"eDP-1","disabled":false},{"name":"eDP-2","disabled":true}]' \
+        || failures=$((failures + 1))
+    installer_matches_fixture_expectation \
+        'one-external.txt' \
+        failure \
+        'Configured internal output not found: DSI-9' \
+        'an explicit internal identity must exist in the all-output snapshot' \
+        HYPR_LID_INTERNAL_OUTPUT=DSI-9 \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
 }
 
 installer_rejects_a_missing_laptop_monitor() {
     installer_matches_fixture_expectation \
         'no-laptop.txt' \
         failure \
-        'Could not detect laptop monitor (eDP-*)' \
+        'Could not detect an internal output; set HYPR_LID_INTERNAL_OUTPUT' \
         'a missing laptop output should produce the intended explicit error'
 }
 
@@ -1310,14 +1774,14 @@ installer_accepts_a_future_hyprland_version() {
     installer_matches_fixture_expectation \
         'one-external.txt' \
         success \
-        'Detected laptop monitor: eDP-1' \
+        'Detected internal output: eDP-1 (enabled)' \
         'a future Hyprland minor version should satisfy the minimum-version contract' \
         'TEST_HYPRCTL_VERSION_JSON={"version":"0.100.0","tag":"unknown"}' \
         || failures=$((failures + 1))
     installer_matches_fixture_expectation \
         'one-external.txt' \
         success \
-        'Detected laptop monitor: eDP-1' \
+        'Detected internal output: eDP-1 (enabled)' \
         'a future Hyprland major version should satisfy the minimum-version contract' \
         'TEST_HYPRCTL_VERSION_JSON={"version":"1.2.3","tag":"unknown"}'
 
@@ -2144,6 +2608,31 @@ run_test \
     'BUG-007-no-laptop' \
     'installer explains why installation cannot continue without a laptop output' \
     installer_rejects_a_missing_laptop_monitor
+
+run_test \
+    'BUG-008-installer-structured-topology' \
+    'installer detects inactive explicit internal and nonstandard external outputs' \
+    installer_detects_explicit_internal_and_nonstandard_externals
+
+run_test \
+    'BUG-008-installer-internal-identity-errors' \
+    'installer rejects ambiguous and absent configured internal outputs' \
+    installer_rejects_ambiguous_or_missing_internal_identity
+
+run_test \
+    'BUG-008-open-hotplug-noop' \
+    'installed CLI leaves an already-enabled internal and all externals untouched on open' \
+    installed_cli_noops_open_when_internal_is_enabled
+
+run_test \
+    'BUG-008-closed-topology-policy' \
+    'installed CLI reconciles closed hotplug and activation without external mutation' \
+    installed_cli_reconciles_closed_topology_without_external_mutation
+
+run_test \
+    'BUG-008-daemon-joint-state' \
+    'installed daemon reacts to closed topology changes while retaining query failures' \
+    installed_daemon_observes_joint_lid_and_topology_changes
 
 run_test \
     'BUG-016-jq-dependency' \
