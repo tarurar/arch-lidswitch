@@ -52,6 +52,48 @@ emit_monitor_effect() {
 }
 
 case "$command_name" in
+    busctl)
+        log_command "$@"
+        if [[ "${1:-}" != "get-property" ]]; then
+            printf 'Unsupported fake busctl operation: %s\n' "${1:-}" >&2
+            exit 98
+        fi
+        property=${5:-}
+        if [[ -n "${TEST_BUSCTL_FAIL_PROPERTY:-}" && \
+            "$property" == "$TEST_BUSCTL_FAIL_PROPERTY" ]]; then
+            printf 'Configured busctl failure for property: %s\n' "$property" >&2
+            exit 94
+        fi
+        case "$property" in
+            HandleLidSwitch)
+                printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH:-suspend}"
+                ;;
+            HandleLidSwitchDocked)
+                printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH_DOCKED:-ignore}"
+                ;;
+            HandleLidSwitchExternalPower)
+                printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH_EXTERNAL_POWER:-}"
+                ;;
+            *)
+                printf 'Unsupported fake logind property: %s\n' "$property" >&2
+                exit 98
+                ;;
+        esac
+        ;;
+    systemd-inhibit)
+        log_command "$@"
+        if [[ "${TEST_SYSTEMD_INHIBIT_FAIL:-0}" == 1 ]]; then
+            printf 'Configured systemd-inhibit failure\n' >&2
+            exit 93
+        fi
+        if [[ "${1:-}" != "--list" ]]; then
+            printf 'Unsupported fake systemd-inhibit operation: %s\n' "${1:-}" >&2
+            exit 98
+        fi
+        if [[ -n "${TEST_LID_SWITCH_INHIBITOR:-}" ]]; then
+            printf '%s\n' "$TEST_LID_SWITCH_INHIBITOR"
+        fi
+        ;;
     hyprctl)
         if [[ "${1:-}" == "monitors" ]]; then
             log_command "$@"

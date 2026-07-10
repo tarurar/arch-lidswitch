@@ -46,7 +46,7 @@ install_safe_path() {
 
     mkdir -p "$fake_bin" "$safe_bin"
 
-    for command_name in hyprctl systemctl pgrep pkill sleep; do
+    for command_name in busctl hyprctl systemctl systemd-inhibit pgrep pkill sleep; do
         ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/$command_name"
     done
 
@@ -174,6 +174,175 @@ installed_cli_handles_documented_open_and_close() (
     assert_contains "$open_output" \
         'level=info component=lid-switch event=layout_applied action=open layout=dual external=DP-2' \
         'open transition should report a structured success record'
+)
+
+installed_cli_delegates_laptop_only_close_to_logind() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture installed_cli
+    local runtime_effects runtime_output runtime_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/laptop-only.txt"
+    mkdir -p "$home"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    : > "$effect_log"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$installed_cli" close \
+        > "$test_root/runtime.out" 2>&1 || runtime_status=$?
+
+    runtime_effects=$(<"$effect_log")
+    runtime_output=$(<"$test_root/runtime.out")
+
+    if (( runtime_status != 0 )); then
+        printf 'expected delegated close status 0, got %d\nruntime output:\n%s\n' \
+            "$runtime_status" "$runtime_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$runtime_effects" $'hyprctl\tmonitors' \
+        'the installed CLI should inspect the current monitor state' \
+        || failures=$((failures + 1))
+    assert_not_contains "$runtime_effects" $'systemctl\t' \
+        'the display helper must not request a lid power action' \
+        || failures=$((failures + 1))
+    assert_not_contains "$runtime_effects" $'monitor\t' \
+        'a laptop-only close should not mutate display state' \
+        || failures=$((failures + 1))
+    assert_contains "$runtime_output" \
+        'level=info component=lid-switch event=power_delegated owner=systemd-logind action=close reason=no_external_monitor' \
+        'the installed CLI should record the single lid-power owner' \
+        || failures=$((failures + 1))
+    assert_not_contains "$runtime_output" 'event=power_action_requested' \
+        'the display helper must not report a repository-owned power request' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_doctor_accepts_chosen_logind_policy() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture doctor
+    local doctor_output effects doctor_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    mkdir -p "$home"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    doctor="$home/.config/hypr/scripts/lid-switch-doctor.sh"
+    if [[ ! -x "$doctor" ]]; then
+        printf 'installer did not create an executable lid-switch doctor\n' >&2
+        return 1
+    fi
+    if ! cmp -s "$ROOT_DIR/runtime/lid-switch-doctor.sh" "$doctor"; then
+        printf 'installed doctor differs from the canonical runtime source\n' >&2
+        return 1
+    fi
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        "$doctor" \
+        > "$test_root/doctor.out" 2>&1 || doctor_status=$?
+
+    doctor_output=$(<"$test_root/doctor.out")
+    effects=$(<"$effect_log")
+
+    if (( doctor_status != 0 )); then
+        printf 'expected healthy doctor status 0, got %d\ndoctor output:\n%s\n' \
+            "$doctor_status" "$doctor_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$doctor_output" 'PASS HandleLidSwitch=suspend' \
+        'doctor should report the chosen undocked action' \
+        || failures=$((failures + 1))
+    assert_contains "$doctor_output" 'PASS HandleLidSwitchDocked=ignore' \
+        'doctor should report the chosen docked action' \
+        || failures=$((failures + 1))
+    assert_contains "$doctor_output" \
+        'PASS HandleLidSwitchExternalPower=<unset> fallback=HandleLidSwitch' \
+        'doctor should report the default external-power fallback' \
+        || failures=$((failures + 1))
+    assert_contains "$doctor_output" 'PASS handle-lid-switch inhibitors=none' \
+        'doctor should prove that no other process owns the lid switch' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'busctl\tget-property\torg.freedesktop.login1\t/org/freedesktop/login1\torg.freedesktop.login1.Manager\tHandleLidSwitchDocked' \
+        'doctor should read the effective docked action' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'busctl\tget-property\torg.freedesktop.login1\t/org/freedesktop/login1\torg.freedesktop.login1.Manager\tHandleLidSwitchExternalPower' \
+        'doctor should read the effective external-power action' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'systemd-inhibit\t--list\t--what=handle-lid-switch\t--no-pager\t--no-legend' \
+        'doctor should inspect low-level lid ownership without taking an inhibitor' \
+        || failures=$((failures + 1))
+
+    doctor_status=0
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_LOGIND_HANDLE_LID_SWITCH_EXTERNAL_POWER=suspend \
+        "$doctor" --policy-only \
+        > "$test_root/external-power-doctor.out" 2>&1 || doctor_status=$?
+    if (( doctor_status != 0 )); then
+        printf 'expected explicit suspend policy status 0, got %d\n%s\n' \
+            "$doctor_status" "$(<"$test_root/external-power-doctor.out")" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$(<"$test_root/external-power-doctor.out")" \
+        'PASS HandleLidSwitchExternalPower=suspend' \
+        'doctor should accept an explicit external-power suspend action' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
 )
 
 installed_cli_refuses_actions_when_monitor_query_fails() (
@@ -665,6 +834,124 @@ installer_rejects_a_missing_laptop_monitor() {
         'a missing laptop output should produce the intended explicit error'
 }
 
+installer_policy_profile_is_rejected() (
+    set -euo pipefail
+
+    local expected_status=$1
+    local expected_message=$2
+    shift 2
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config original
+    local installer_output effects installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    original='-- user-owned config must remain unchanged on policy conflict'
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$original" > "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$@" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    installer_output=$(<"$test_root/installer.out")
+    effects=$(<"$effect_log")
+
+    if (( installer_status != expected_status )); then
+        printf 'expected policy-check status %d, got %d\ninstaller output:\n%s\n' \
+            "$expected_status" "$installer_status" "$installer_output" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$(<"$config")" != "$original" ]]; then
+        printf 'policy conflict changed user configuration:\n%s\n' \
+            "$(<"$config")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$home/.config/hypr/scripts/lid-switch.sh" ]] || \
+        [[ -e "$home/.config/systemd/user/lid-monitor.service" ]]; then
+        printf 'policy conflict wrote installation artifacts\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'hyprctl\t' \
+        'policy validation should run before monitor detection' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'policy conflict must not change user-systemd state' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" "$expected_message" \
+        'the failed policy profile should explain its exact cause' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" \
+        'systemd-analyze cat-config systemd/logind.conf' \
+        'the conflict should provide a read-only configuration inspection command' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" \
+        'This installer does not modify /etc or systemd-logind policy.' \
+        'the conflict should make system-policy ownership explicit' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_rejects_conflicting_undocked_lid_policy() {
+    installer_policy_profile_is_rejected \
+        1 \
+        'FAIL HandleLidSwitch=ignore expected=suspend' \
+        TEST_LOGIND_HANDLE_LID_SWITCH=ignore
+}
+
+installer_rejects_conflicting_docked_lid_policy() {
+    installer_policy_profile_is_rejected \
+        1 \
+        'FAIL HandleLidSwitchDocked=suspend expected=ignore' \
+        TEST_LOGIND_HANDLE_LID_SWITCH_DOCKED=suspend
+}
+
+installer_rejects_conflicting_external_power_lid_policy() {
+    installer_policy_profile_is_rejected \
+        1 \
+        'FAIL HandleLidSwitchExternalPower=hibernate expected=<unset-or-suspend>' \
+        TEST_LOGIND_HANDLE_LID_SWITCH_EXTERNAL_POWER=hibernate
+}
+
+installer_rejects_a_low_level_lid_inhibitor() {
+    installer_policy_profile_is_rejected \
+        1 \
+        'FAIL handle-lid-switch inhibitor present: desktop-shell 1000 user 42 shell handle-lid-switch custom handling block' \
+        'TEST_LID_SWITCH_INHIBITOR=desktop-shell 1000 user 42 shell handle-lid-switch custom handling block'
+}
+
+installer_reports_a_logind_property_diagnostic_failure() {
+    installer_policy_profile_is_rejected \
+        2 \
+        'ERROR Could not read effective logind property HandleLidSwitchDocked.' \
+        TEST_BUSCTL_FAIL_PROPERTY=HandleLidSwitchDocked
+}
+
+installer_reports_a_lid_inhibitor_diagnostic_failure() {
+    installer_policy_profile_is_rejected \
+        2 \
+        'ERROR Could not inspect handle-lid-switch inhibitors.' \
+        TEST_SYSTEMD_INHIBIT_FAIL=1
+}
+
 installed_session_lifecycle_is_bound_to_hyprland() (
     set -euo pipefail
 
@@ -1063,7 +1350,7 @@ installer_migrates_only_the_legacy_default_target_service() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        TEST_REQUIRED_PATHS_BEFORE_DISABLE="$home/.config/hypr/scripts/lid-state.sh:$home/.config/hypr/scripts/lid-switch.sh:$home/.config/hypr/scripts/lid-monitor.sh:$home/.config/hypr/scripts/lid-session-bridge.sh:$home/.config/hypr/arch_lidswitch/session.lua:$home/.config/systemd/user/hyprland-session.target" \
+        TEST_REQUIRED_PATHS_BEFORE_DISABLE="$home/.config/hypr/scripts/lid-state.sh:$home/.config/hypr/scripts/lid-switch.sh:$home/.config/hypr/scripts/lid-switch-doctor.sh:$home/.config/hypr/scripts/lid-monitor.sh:$home/.config/hypr/scripts/lid-session-bridge.sh:$home/.config/hypr/arch_lidswitch/session.lua:$home/.config/systemd/user/hyprland-session.target" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1
 
@@ -1109,6 +1396,16 @@ run_test \
     'installed-cli-transitions' \
     'installed CLI handles documented docked close and open transitions' \
     installed_cli_handles_documented_open_and_close
+
+run_test \
+    'BUG-005-runtime-power-owner' \
+    'installed CLI delegates laptop-only lid power to systemd-logind' \
+    installed_cli_delegates_laptop_only_close_to_logind
+
+run_test \
+    'BUG-005-doctor-healthy-policy' \
+    'installed doctor accepts the chosen effective logind policy' \
+    installed_doctor_accepts_chosen_logind_policy
 
 run_test \
     'BUG-004-close-query-failure' \
@@ -1179,6 +1476,36 @@ run_test \
     'BUG-007-no-laptop' \
     'installer explains why installation cannot continue without a laptop output' \
     installer_rejects_a_missing_laptop_monitor
+
+run_test \
+    'BUG-005-undocked-policy-conflict' \
+    'installer rejects a conflicting effective undocked lid policy before writes' \
+    installer_rejects_conflicting_undocked_lid_policy
+
+run_test \
+    'BUG-005-docked-policy-conflict' \
+    'installer rejects a conflicting effective docked lid policy before writes' \
+    installer_rejects_conflicting_docked_lid_policy
+
+run_test \
+    'BUG-005-external-power-policy-conflict' \
+    'installer rejects a conflicting effective external-power lid policy before writes' \
+    installer_rejects_conflicting_external_power_lid_policy
+
+run_test \
+    'BUG-005-lid-inhibitor-conflict' \
+    'installer rejects a low-level lid inhibitor before writes' \
+    installer_rejects_a_low_level_lid_inhibitor
+
+run_test \
+    'BUG-005-property-diagnostic-failure' \
+    'installer distinguishes a logind property diagnostic failure' \
+    installer_reports_a_logind_property_diagnostic_failure
+
+run_test \
+    'BUG-005-inhibitor-diagnostic-failure' \
+    'installer distinguishes a lid-inhibitor diagnostic failure' \
+    installer_reports_a_lid_inhibitor_diagnostic_failure
 
 run_test \
     'BUG-003-session-lifecycle' \

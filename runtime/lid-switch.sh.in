@@ -94,8 +94,7 @@ handle_lid_close() {
             log_error layout_apply_failed action=close
         fi
     elif (( discovery_status == 1 )); then
-        log_info power_action_requested action=hibernate reason=no_external_monitor
-        systemctl hibernate
+        log_info power_delegated owner=systemd-logind action=close reason=no_external_monitor
     else
         log_error monitor_query_failed action=close
         return 2

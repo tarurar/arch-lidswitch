@@ -39,6 +39,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         '@@LID_SWITCH_SCRIPT@@')
             sed -n 'p' "$ROOT_DIR/runtime/lid-switch.sh.in"
             ;;
+        '@@LID_SWITCH_DOCTOR@@')
+            sed -n 'p' "$ROOT_DIR/runtime/lid-switch-doctor.sh"
+            ;;
         '@@LID_MONITOR_SCRIPT@@')
             sed -n 'p' "$ROOT_DIR/runtime/lid-monitor.sh"
             ;;

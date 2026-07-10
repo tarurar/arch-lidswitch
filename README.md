@@ -11,7 +11,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 🔧 **Zero Configuration**: Works out of the box after installation
 - 📝 **Journal Logging**: Structured service and transition records for troubleshooting
 - 🔁 **Session-Bound Startup**: Systemd user service starts after Hyprland is reachable and stops with the graphical session
-- 💤 **Smart Power Management**: Hibernates when lid closes without external monitor
+- 💤 **Single Power-Policy Owner**: Leaves every lid-triggered power decision to systemd-logind
 - 📊 **Waybar Layout Refresh**: Refreshes Waybar layer geometry without restarting the Waybar process
 
 ## How It Works
@@ -30,7 +30,9 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Refreshes Waybar layer geometry without restarting Waybar
 
 ### Lid Closed + No External Monitor
-- Hibernates the system automatically
+- Makes no display or power change
+- Delegates the lid event to systemd-logind
+- With the supported default policy, logind suspends when undocked and ignores a docked lid close
 
 ## Requirements
 
@@ -38,6 +40,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - **Desktop**: Hyprland window manager
 - **Hardware**: Laptop with ACPI lid switch support
 - **Session**: Wayland session
+- **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
 
 ## Installation
 
@@ -71,6 +74,7 @@ The installer creates the following files:
 ~/.config/hypr/scripts/
 ├── lid-state.sh       # Shared ACPI lid state observer
 ├── lid-switch.sh      # Core lid switch logic
+├── lid-switch-doctor.sh # Read-only logind policy diagnostics
 ├── lid-monitor.sh     # Background monitor daemon
 └── lid-session-bridge.sh # Ordered Hyprland/systemd session startup
 
@@ -128,6 +132,25 @@ systemctl --user enable lid-monitor.service
 HYPR_LID_STATE_ROOT=/path/to/button/lid \
   ~/.config/hypr/scripts/lid-monitor.sh --print-state
 ```
+
+### Power-Policy Doctor
+
+```bash
+~/.config/hypr/scripts/lid-switch-doctor.sh
+```
+
+The doctor reads effective systemd-logind properties and active low-level lid
+inhibitors. It succeeds only when logind is the sole lid-power owner:
+
+- `HandleLidSwitch=suspend`
+- `HandleLidSwitchDocked=ignore`
+- `HandleLidSwitchExternalPower` is unset or `suspend`
+- no process holds a `handle-lid-switch` inhibitor
+
+Exit status `1` means the effective policy conflicts with this supported
+contract. Exit status `2` means the doctor could not collect reliable
+diagnostics. The doctor and installer are read-only with respect to system
+policy: they never modify `/etc` or systemd-logind configuration.
 
 ### Monitoring Logs
 
@@ -191,6 +214,25 @@ systemd-journald configuration.
    ~/.config/hypr/scripts/lid-monitor.sh --print-state
    journalctl --user -u lid-monitor.service -f -o cat
    ```
+
+### Conflicting Lid Power Policy
+
+Run the installed doctor first:
+
+```bash
+~/.config/hypr/scripts/lid-switch-doctor.sh
+```
+
+Use these read-only commands to locate an override or competing owner:
+
+```bash
+systemd-analyze cat-config systemd/logind.conf
+systemd-inhibit --list --what=handle-lid-switch --no-pager
+```
+
+Resolve a conflict through the host administrator's normal system policy
+workflow. The installer reports conflicts before writing user files; it does
+not create or edit logind configuration under `/etc`.
 
 ### Wrong Monitor Detection
 
@@ -287,6 +329,7 @@ systemctl --user disable lid-monitor.service
 # Remove files
 rm -f ~/.config/hypr/scripts/lid-state.sh
 rm -f ~/.config/hypr/scripts/lid-switch.sh
+rm -f ~/.config/hypr/scripts/lid-switch-doctor.sh
 rm -f ~/.config/hypr/scripts/lid-monitor.sh
 rm -f ~/.config/hypr/scripts/lid-session-bridge.sh
 rm -f ~/.config/hypr/arch_lidswitch/session.lua

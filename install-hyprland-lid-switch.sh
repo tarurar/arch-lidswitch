@@ -31,6 +31,7 @@ SESSION_BRIDGE="$SCRIPTS_DIR/lid-session-bridge.sh"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SESSION_TARGET_FILE="$SYSTEMD_USER_DIR/hyprland-session.target"
 SERVICE_FILE="$SYSTEMD_USER_DIR/lid-monitor.service"
+DOCTOR_FILE="$SCRIPTS_DIR/lid-switch-doctor.sh"
 
 SESSION_CONFIG_BEGIN='-- BEGIN arch-lidswitch managed session integration'
 SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
@@ -80,6 +81,149 @@ check_hyprland() {
         log_error "This script requires WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE from the active Hyprland session"
         exit 1
     fi
+}
+
+run_lid_switch_doctor() {
+    /bin/bash -s -- --policy-only <<'EOF'
+#!/bin/bash
+
+set -u
+
+LOGIN1_SERVICE="org.freedesktop.login1"
+LOGIN1_PATH="/org/freedesktop/login1"
+LOGIN1_MANAGER="org.freedesktop.login1.Manager"
+
+usage() {
+    printf 'usage: %s [--policy-only]\n' "${0##*/}" >&2
+}
+
+print_remediation() {
+    printf '%s\n' \
+        'INFO Inspect effective policy with: systemd-analyze cat-config systemd/logind.conf' \
+        'INFO Inspect lid inhibitors with: systemd-inhibit --list --what=handle-lid-switch --no-pager' \
+        'INFO This installer does not modify /etc or systemd-logind policy.'
+}
+
+read_manager_string_property() {
+    local property=$1
+    local raw_value
+
+    if ! raw_value=$(busctl get-property \
+        "$LOGIN1_SERVICE" \
+        "$LOGIN1_PATH" \
+        "$LOGIN1_MANAGER" \
+        "$property"); then
+        printf 'ERROR Could not read effective logind property %s.\n' "$property" >&2
+        return 2
+    fi
+
+    if [[ "$raw_value" =~ ^s[[:space:]]+\"([^\"]*)\"$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    printf 'ERROR Unexpected value for logind property %s: %s\n' \
+        "$property" "$raw_value" >&2
+    return 2
+}
+
+check_lid_power_policy() {
+    local handle_lid_switch handle_lid_switch_docked
+    local handle_lid_switch_external_power inhibitor_output
+    local policy_status=0
+
+    if ! handle_lid_switch=$(read_manager_string_property HandleLidSwitch); then
+        print_remediation
+        return 2
+    fi
+    if ! handle_lid_switch_docked=$(read_manager_string_property HandleLidSwitchDocked); then
+        print_remediation
+        return 2
+    fi
+    if ! handle_lid_switch_external_power=$(read_manager_string_property HandleLidSwitchExternalPower); then
+        print_remediation
+        return 2
+    fi
+    if ! inhibitor_output=$(systemd-inhibit \
+        --list \
+        --what=handle-lid-switch \
+        --no-pager \
+        --no-legend); then
+        printf 'ERROR Could not inspect handle-lid-switch inhibitors.\n' >&2
+        print_remediation
+        return 2
+    fi
+
+    if [[ "$handle_lid_switch" != "suspend" ]]; then
+        printf 'FAIL HandleLidSwitch=%s expected=suspend\n' "$handle_lid_switch"
+        policy_status=1
+    else
+        printf 'PASS HandleLidSwitch=suspend\n'
+    fi
+
+    if [[ "$handle_lid_switch_docked" != "ignore" ]]; then
+        printf 'FAIL HandleLidSwitchDocked=%s expected=ignore\n' \
+            "$handle_lid_switch_docked"
+        policy_status=1
+    else
+        printf 'PASS HandleLidSwitchDocked=ignore\n'
+    fi
+
+    case "$handle_lid_switch_external_power" in
+        "")
+            printf 'PASS HandleLidSwitchExternalPower=<unset> fallback=HandleLidSwitch\n'
+            ;;
+        suspend)
+            printf 'PASS HandleLidSwitchExternalPower=suspend\n'
+            ;;
+        *)
+            printf 'FAIL HandleLidSwitchExternalPower=%s expected=<unset-or-suspend>\n' \
+                "$handle_lid_switch_external_power"
+            policy_status=1
+            ;;
+    esac
+
+    if [[ -n "$inhibitor_output" && "$inhibitor_output" != "No inhibitors listed." ]]; then
+        printf 'FAIL handle-lid-switch inhibitor present: %s\n' "$inhibitor_output"
+        policy_status=1
+    else
+        printf 'PASS handle-lid-switch inhibitors=none\n'
+    fi
+
+    if (( policy_status != 0 )); then
+        print_remediation
+    fi
+
+    return "$policy_status"
+}
+
+case "${1:-}" in
+    ""|--policy-only)
+        if (( $# > 1 )); then
+            usage
+            exit 2
+        fi
+        check_lid_power_policy
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
+EOF
+}
+
+check_lid_power_policy() {
+    local doctor_status=0
+
+    log_info "Checking effective systemd-logind lid policy..."
+    run_lid_switch_doctor || doctor_status=$?
+    if (( doctor_status != 0 )); then
+        log_error "systemd-logind lid policy check failed"
+        return "$doctor_status"
+    fi
+
+    log_success "systemd-logind is the configured lid-power owner"
 }
 
 write_session_config_block() {
@@ -489,8 +633,7 @@ handle_lid_close() {
             log_error layout_apply_failed action=close
         fi
     elif (( discovery_status == 1 )); then
-        log_info power_action_requested action=hibernate reason=no_external_monitor
-        systemctl hibernate
+        log_info power_delegated owner=systemd-logind action=close reason=no_external_monitor
     else
         log_error monitor_query_failed action=close
         return 2
@@ -560,6 +703,141 @@ EOF
     chmod +x "$SCRIPTS_DIR/lid-switch.sh"
     
     log_success "Lid switch script installed at $SCRIPTS_DIR/lid-switch.sh"
+}
+
+install_lid_switch_doctor() {
+    log_info "Installing lid switch doctor..."
+
+    cat > "$DOCTOR_FILE" << 'EOF'
+#!/bin/bash
+
+set -u
+
+LOGIN1_SERVICE="org.freedesktop.login1"
+LOGIN1_PATH="/org/freedesktop/login1"
+LOGIN1_MANAGER="org.freedesktop.login1.Manager"
+
+usage() {
+    printf 'usage: %s [--policy-only]\n' "${0##*/}" >&2
+}
+
+print_remediation() {
+    printf '%s\n' \
+        'INFO Inspect effective policy with: systemd-analyze cat-config systemd/logind.conf' \
+        'INFO Inspect lid inhibitors with: systemd-inhibit --list --what=handle-lid-switch --no-pager' \
+        'INFO This installer does not modify /etc or systemd-logind policy.'
+}
+
+read_manager_string_property() {
+    local property=$1
+    local raw_value
+
+    if ! raw_value=$(busctl get-property \
+        "$LOGIN1_SERVICE" \
+        "$LOGIN1_PATH" \
+        "$LOGIN1_MANAGER" \
+        "$property"); then
+        printf 'ERROR Could not read effective logind property %s.\n' "$property" >&2
+        return 2
+    fi
+
+    if [[ "$raw_value" =~ ^s[[:space:]]+\"([^\"]*)\"$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    printf 'ERROR Unexpected value for logind property %s: %s\n' \
+        "$property" "$raw_value" >&2
+    return 2
+}
+
+check_lid_power_policy() {
+    local handle_lid_switch handle_lid_switch_docked
+    local handle_lid_switch_external_power inhibitor_output
+    local policy_status=0
+
+    if ! handle_lid_switch=$(read_manager_string_property HandleLidSwitch); then
+        print_remediation
+        return 2
+    fi
+    if ! handle_lid_switch_docked=$(read_manager_string_property HandleLidSwitchDocked); then
+        print_remediation
+        return 2
+    fi
+    if ! handle_lid_switch_external_power=$(read_manager_string_property HandleLidSwitchExternalPower); then
+        print_remediation
+        return 2
+    fi
+    if ! inhibitor_output=$(systemd-inhibit \
+        --list \
+        --what=handle-lid-switch \
+        --no-pager \
+        --no-legend); then
+        printf 'ERROR Could not inspect handle-lid-switch inhibitors.\n' >&2
+        print_remediation
+        return 2
+    fi
+
+    if [[ "$handle_lid_switch" != "suspend" ]]; then
+        printf 'FAIL HandleLidSwitch=%s expected=suspend\n' "$handle_lid_switch"
+        policy_status=1
+    else
+        printf 'PASS HandleLidSwitch=suspend\n'
+    fi
+
+    if [[ "$handle_lid_switch_docked" != "ignore" ]]; then
+        printf 'FAIL HandleLidSwitchDocked=%s expected=ignore\n' \
+            "$handle_lid_switch_docked"
+        policy_status=1
+    else
+        printf 'PASS HandleLidSwitchDocked=ignore\n'
+    fi
+
+    case "$handle_lid_switch_external_power" in
+        "")
+            printf 'PASS HandleLidSwitchExternalPower=<unset> fallback=HandleLidSwitch\n'
+            ;;
+        suspend)
+            printf 'PASS HandleLidSwitchExternalPower=suspend\n'
+            ;;
+        *)
+            printf 'FAIL HandleLidSwitchExternalPower=%s expected=<unset-or-suspend>\n' \
+                "$handle_lid_switch_external_power"
+            policy_status=1
+            ;;
+    esac
+
+    if [[ -n "$inhibitor_output" && "$inhibitor_output" != "No inhibitors listed." ]]; then
+        printf 'FAIL handle-lid-switch inhibitor present: %s\n' "$inhibitor_output"
+        policy_status=1
+    else
+        printf 'PASS handle-lid-switch inhibitors=none\n'
+    fi
+
+    if (( policy_status != 0 )); then
+        print_remediation
+    fi
+
+    return "$policy_status"
+}
+
+case "${1:-}" in
+    ""|--policy-only)
+        if (( $# > 1 )); then
+            usage
+            exit 2
+        fi
+        check_lid_power_policy
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
+EOF
+
+    chmod +x "$DOCTOR_FILE"
+    log_success "Lid switch doctor installed at $DOCTOR_FILE"
 }
 
 # Install the lid monitor script
@@ -790,6 +1068,7 @@ print_final_instructions() {
     echo -e "${BLUE}What was installed:${NC}"
     echo "  • Lid state observer: $SCRIPTS_DIR/lid-state.sh"
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
+    echo "  • Lid switch doctor: $DOCTOR_FILE"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
     echo "  • Hyprland session bridge: $SESSION_BRIDGE"
     echo "  • Hyprland session module: $SESSION_MODULE"
@@ -798,17 +1077,19 @@ print_final_instructions() {
     echo
     echo -e "${BLUE}How it works:${NC}"
     echo "  • When lid closes + external monitor connected: laptop screen turns off"
+    echo "  • When lid closes without an external monitor: systemd-logind owns the power action"
     echo "  • When lid opens: laptop screen turns back on (dual monitor setup)"
     echo "  • Service starts automatically on login"
     echo
     echo -e "${BLUE}Useful commands:${NC}"
     echo "  • Check service status: systemctl --user status lid-monitor.service"
+    echo "  • Check lid power policy: $DOCTOR_FILE"
     echo "  • Follow service logs: journalctl --user -u lid-monitor.service -f -o cat"
     echo "  • View current-boot logs: journalctl --user -u lid-monitor.service -b -o cat"
     echo "  • Stop service: systemctl --user stop lid-monitor.service"
     echo "  • Restart service: systemctl --user restart lid-monitor.service"
     echo
-    echo -e "${GREEN}Try closing your laptop lid now to test!${NC}"
+    echo -e "${GREEN}Run $DOCTOR_FILE to re-check lid power ownership.${NC}"
 }
 
 ################################################################################
@@ -825,6 +1106,7 @@ main() {
     log_info "Performing pre-installation checks..."
     check_hyprland
     inspect_session_config
+    check_lid_power_policy
     
     # Detect monitors
     log_info "Detecting Monitors..."
@@ -842,6 +1124,7 @@ main() {
     # Prepare every non-service artifact before stopping a legacy service.
     install_lid_state_script
     install_lid_switch_script "$laptop_monitor"
+    install_lid_switch_doctor
     install_lid_monitor_script
     install_session_bridge
     install_session_module
