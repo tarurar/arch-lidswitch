@@ -13,7 +13,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 🔁 **Session-Bound Startup**: Systemd user service starts after Hyprland is reachable and stops with the graphical session
 - 💤 **Single Power-Policy Owner**: Leaves every lid-triggered power decision to systemd-logind
 - 📐 **Layout Preservation**: Restores the internal panel's captured mode, position, scale, transform, and mirror without rewriting external outputs
-- 📊 **Waybar Layout Refresh**: Refreshes Waybar layer geometry without restarting the Waybar process
+- 🧩 **Optional Post-Layout Hook**: Runs one bounded user command after a verified internal-display layout change
 
 ## How It Works
 
@@ -24,7 +24,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Disables laptop internal display
 - Leaves every external monitor's mode, position, scale, transform, and mirror untouched
 - All workspaces remain accessible
-- Waybar is briefly hidden/shown with `SIGUSR1` so its layer geometry follows the new layout
+- Runs the optional post-layout hook once with the verified `disabled` outcome
 
 ### Lid Opened
 - Re-enables the laptop internal display from its captured layout if it is disabled
@@ -32,7 +32,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Restores its exact mode, position, scale, transform, and mirror settings
 - Leaves the external monitor arrangement untouched
 - Maintains your workspace layout
-- Refreshes Waybar layer geometry without restarting Waybar
+- Runs the optional post-layout hook once with the verified `enabled` outcome
 
 ### Lid Closed + No Enabled External Output
 
@@ -355,17 +355,51 @@ hyprctl eval 'hl.monitor({ output = "eDP-1", disabled = true })'
 
 ### Waybar Is Offset After Closing the Lid
 
-Some Waybar/Hyprland combinations keep stale layer geometry after a monitor is disabled. The script works around this by toggling Waybar visibility twice:
-
-```bash
-pkill -x -SIGUSR1 waybar
-sleep 0.1
-pkill -x -SIGUSR1 waybar
-```
-
-This forces Waybar to recalculate its layer position while keeping the same Waybar process alive. `SIGUSR2` is intentionally not used because it can terminate Waybar on some setups.
+arch-lidswitch does not inspect, signal, hide, reload, or restart Waybar. Preserving
+external-output geometry avoids the original destructive layout rewrite. If a
+bar still retains stale layer geometry, configure the optional post-layout hook
+below with a refresh command supported by that bar and its current configuration.
 
 ## Customization
+
+### Optional Post-Layout Hook
+
+The default runtime has no process-specific refresh behavior. To run your own
+integration after a successful internal-display layout change, create this
+user-owned environment file:
+
+```text
+~/.config/arch-lidswitch/environment
+```
+
+Set one absolute executable path in it; environment-file values do not expand
+shell variables:
+
+```text
+ARCH_LIDSWITCH_POST_LAYOUT_HOOK=/home/your-user/.local/bin/refresh-layout
+```
+
+Then restart the main service:
+
+```bash
+systemctl --user restart lid-monitor.service
+```
+
+The installer and uninstaller never create, modify, or remove this environment
+file. The configured path must be absolute, regular, and executable. The hook is
+invoked directly, without shell evaluation, with exactly three arguments:
+
+```text
+ACTION OUTCOME INTERNAL_OUTPUT
+```
+
+For example, a docked close supplies `close disabled eDP-1`; reopening supplies
+`open enabled eDP-1`. Invocation occurs exactly once after the layout mutation
+and its monitor postconditions have succeeded. No hook runs for a no-op, a
+failed transition, or a DPMS-only wake. Runtime is limited to two seconds, with
+a one-second forced-termination grace period. Invalid hooks, failures, and
+timeouts are logged but advisory: they do not fail or retry display
+reconciliation.
 
 ### Monitor Resolution and Positioning
 

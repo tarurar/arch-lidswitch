@@ -4497,6 +4497,391 @@ installer_packages_resume_monitor_and_requires_systemd_257() (
     (( failures == 0 ))
 )
 
+with_installed_post_layout_hook_fixture() (
+    set -euo pipefail
+
+    local test_body=$1
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture sequence_dir sequence_counter framework disabled asleep awake
+    local installed_cli installed_daemon hook hook_name non_executable_hook
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    sequence_dir="$test_root/topology-sequence"
+    sequence_counter="$test_root/topology-counter"
+    hook="$test_root/post hook;false;#"
+    hook_name=${hook##*/}
+    non_executable_hook="$test_root/non-executable-hook"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    disabled=$(jq -c 'map(if .name == "eDP-1" then
+        .disabled = true | .dpmsStatus = false else . end)' <<< "$framework")
+    asleep=$(jq -c 'map(if .name == "eDP-1" then
+        .dpmsStatus = false else . end)' <<< "$framework")
+    awake=$framework
+
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    cp "$ROOT_DIR/tests/fakes/effect" "$hook"
+    chmod 0755 "$hook"
+    cp "$ROOT_DIR/tests/fakes/effect" "$non_executable_hook"
+    chmod 0644 "$non_executable_hook"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    "$test_body"
+)
+
+run_post_layout_hook_cli_scenario() {
+    local scenario=$1
+    local transition=$2
+    shift 2
+
+    scenario_status=0
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 5 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" "$@" \
+        "$installed_cli" "$transition" \
+        > "$test_root/$scenario.out" 2>&1 || scenario_status=$?
+    scenario_output=$(<"$test_root/$scenario.out")
+    scenario_effects=$(<"$effect_log")
+}
+
+run_post_layout_hook_daemon_scenario() {
+    local scenario=$1
+    shift
+
+    scenario_status=0
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 5 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" "$@" \
+        "$installed_daemon" --once \
+        > "$test_root/$scenario.out" 2>&1 || scenario_status=$?
+    scenario_output=$(<"$test_root/$scenario.out")
+    scenario_effects=$(<"$effect_log")
+}
+
+post_layout_hook_runtime_contract() {
+    local scenario_status scenario_output scenario_effects hook_record effects_prefix
+    local hook_count query_before failures=0
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario default-close close
+    if (( scenario_status != 0 )); then
+        printf 'default close failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$scenario_effects" $'pgrep\t' \
+        'default close must not inspect Waybar or another process' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" $'pkill\t' \
+        'default close must not signal Waybar or another process' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$framework"
+    run_post_layout_hook_cli_scenario default-open open
+    if (( scenario_status != 0 )); then
+        printf 'default open failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$scenario_effects" $'pgrep\t' \
+        'default open must not inspect Waybar or another process' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" $'pkill\t' \
+        'default open must not signal Waybar or another process' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario success-close close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+    hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    effects_prefix=${scenario_effects%%"$hook_record"*}
+    query_before=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
+        <<< "$effects_prefix" || true)
+    if (( scenario_status != 0 || hook_count != 1 || query_before != 2 )); then
+        printf 'verified close hook contract failed; status=%d hooks=%d pre-hook-queries=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$query_before" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$disabled"
+    run_post_layout_hook_cli_scenario noop-close close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+    if (( scenario_status != 0 )); then
+        printf 'layout no-op failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
+        'a layout no-op must not run the post-layout hook' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$framework"
+    run_post_layout_hook_cli_scenario success-open open \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+    hook_record="$hook_name"$'\topen\tenabled\teDP-1'
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    effects_prefix=${scenario_effects%%"$hook_record"*}
+    query_before=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
+        <<< "$effects_prefix" || true)
+    if (( scenario_status != 0 || hook_count != 1 || query_before != 2 )); then
+        printf 'verified open hook contract failed; status=%d hooks=%d pre-hook-queries=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$query_before" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" "$asleep" "$awake"
+    run_post_layout_hook_cli_scenario dpms-only open \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+    if (( scenario_status != 0 )); then
+        printf 'DPMS-only transition failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_effects" $'dpms\toutput=eDP-1\tstate=on' \
+        'DPMS-only open should still wake the internal output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
+        'a DPMS-only transition must not run the post-layout hook' \
+        || failures=$((failures + 1))
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework"
+    run_post_layout_hook_cli_scenario apply-failure close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        TEST_HYPRCTL_EVAL_FAILURES=1 \
+        "TEST_HYPRCTL_EVAL_COUNTER=$test_root/eval-counter"
+    if (( scenario_status != 3 )); then
+        printf 'display apply failure should return 3, got %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
+        'a display apply failure must not run the post-layout hook' \
+        || failures=$((failures + 1))
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework"
+    run_post_layout_hook_cli_scenario postcondition-failure close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+    if (( scenario_status != 4 )); then
+        printf 'display postcondition failure should return 4, got %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
+        'a display postcondition failure must not run the post-layout hook' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installed_post_layout_hook_obeys_verified_mutation_contract() {
+    with_installed_post_layout_hook_fixture post_layout_hook_runtime_contract
+}
+
+post_layout_hook_advisory_contract() {
+    local scenario_status scenario_output scenario_effects hook_record
+    local hook_count monitor_count attempt_count failures=0
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario relative-hook close \
+        'ARCH_LIDSWITCH_POST_LAYOUT_HOOK=relative-hook'
+    if (( scenario_status != 0 )); then
+        printf 'relative advisory hook changed transition status to %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=post_layout_hook_invalid reason=not_absolute' \
+        'a relative hook should be rejected explicitly' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$framework"
+    run_post_layout_hook_cli_scenario missing-hook open \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$test_root/missing-hook"
+    if (( scenario_status != 0 )); then
+        printf 'missing advisory hook changed transition status to %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=post_layout_hook_invalid reason=not_regular' \
+        'a missing hook should be rejected as non-regular' \
+        || failures=$((failures + 1))
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario non-executable-hook close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$non_executable_hook"
+    if (( scenario_status != 0 )); then
+        printf 'non-executable advisory hook changed transition status to %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=post_layout_hook_invalid reason=not_executable' \
+        'a non-executable hook should be rejected explicitly' \
+        || failures=$((failures + 1))
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework" "$disabled" "$disabled"
+    run_post_layout_hook_daemon_scenario failed-hook \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        TEST_POST_LAYOUT_HOOK_MODE=fail
+    hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    monitor_count=$(grep -Fxc $'monitor\toutput=eDP-1\tdisabled=true' \
+        "$effect_log" || true)
+    attempt_count=$(grep -Fc 'event=reconciliation_started trigger=once' \
+        "$test_root/failed-hook.out" || true)
+    if (( scenario_status != 0 || hook_count != 1 || monitor_count != 1 || \
+        attempt_count != 1 )); then
+        printf 'failed advisory hook retried or failed reconciliation; status=%d hooks=%d monitors=%d attempts=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$monitor_count" "$attempt_count" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=post_layout_hook_failed action=close outcome=disabled internal_output=eDP-1 status=42' \
+        'hook failure should be logged without failing display reconciliation' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$framework"
+    run_post_layout_hook_cli_scenario timed-out-hook open \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        TEST_POST_LAYOUT_HOOK_MODE=hang \
+        "TEST_POST_LAYOUT_HOOK_SLEEP_BIN=$REAL_SLEEP_BIN"
+    hook_record="$hook_name"$'\topen\tenabled\teDP-1'
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    if (( scenario_status != 0 || hook_count != 1 )); then
+        printf 'timed-out advisory hook changed transition result; status=%d hooks=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$scenario_output" \
+            "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=post_layout_hook_failed action=open outcome=enabled internal_output=eDP-1 status=124' \
+        'hook timeout should be bounded and logged as advisory' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installed_post_layout_hook_failures_are_advisory() {
+    with_installed_post_layout_hook_fixture post_layout_hook_advisory_contract
+}
+
+installer_preserves_post_layout_hook_configuration_and_docs() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture environment_file
+    local environment_copy installed_unit unit_contents readme_contents before_mode failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    environment_file="$home/.config/arch-lidswitch/environment"
+    environment_copy="$test_root/environment.before"
+
+    prepare_hyprland_config "$home"
+    mkdir -p "${environment_file%/*}"
+    printf '%s\n' \
+        'ARCH_LIDSWITCH_POST_LAYOUT_HOOK=/user/owned/hook' \
+        'USER_OWNED_SENTINEL=preserve-byte-for-byte' > "$environment_file"
+    chmod 0640 "$environment_file"
+    cp -p "$environment_file" "$environment_copy"
+    before_mode=$(stat -c %a "$environment_file")
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_unit="$home/.config/systemd/user/lid-monitor.service"
+    unit_contents=$(<"$installed_unit")
+    assert_contains "$unit_contents" \
+        'EnvironmentFile=-%h/.config/arch-lidswitch/environment' \
+        'the service should import the optional user-owned hook environment' \
+        || failures=$((failures + 1))
+    if ! cmp -s "$environment_copy" "$environment_file" || \
+        [[ "$(stat -c %a "$environment_file")" != "$before_mode" ]]; then
+        printf 'installer changed the user-owned hook environment contents or mode\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    readme_contents=$(<"$ROOT_DIR/README.md")
+    assert_contains "$readme_contents" 'ARCH_LIDSWITCH_POST_LAYOUT_HOOK' \
+        'README should document the optional post-layout hook' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" \
+        '~/.config/arch-lidswitch/environment' \
+        'README should document the service environment file' \
+        || failures=$((failures + 1))
+    for stale_waybar_claim in SIGUSR1 SIGUSR2 'pkill -x' 'Waybar Layout Refresh'; do
+        assert_not_contains "$readme_contents" "$stale_waybar_claim" \
+            "README must remove the stale Waybar signal claim: $stale_waybar_claim" \
+            || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+)
+
 tests_run=0
 tests_failed=0
 tests_selected=0
@@ -4583,6 +4968,21 @@ run_test \
     'BUG-017-journal-boundary' \
     'installed runtime reports structured diagnostics through the service journal boundary' \
     installed_runtime_reports_through_the_journal_boundary
+
+run_test \
+    'BUG-015-runtime-contract' \
+    'post-layout hook runs directly only after verified layout mutations' \
+    installed_post_layout_hook_obeys_verified_mutation_contract
+
+run_test \
+    'BUG-015-advisory-failures' \
+    'invalid, failed, and timed-out post-layout hooks remain advisory' \
+    installed_post_layout_hook_failures_are_advisory
+
+run_test \
+    'BUG-015-packaging-docs' \
+    'installer and docs preserve the user-owned post-layout hook contract' \
+    installer_preserves_post_layout_hook_configuration_and_docs
 
 run_test \
     'BUG-012-lid0' \

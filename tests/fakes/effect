@@ -402,8 +402,26 @@ case "$command_name" in
         ;;
     pgrep)
         log_command "$@"
-        # Model a running Waybar so its refresh path is exercised safely.
+        # Keep any forbidden legacy Waybar probe observable and harmless.
         exit 0
+        ;;
+    post-layout-hook|'post hook;false;#')
+        log_command "$@"
+        case "${TEST_POST_LAYOUT_HOOK_MODE:-success}" in
+            success)
+                ;;
+            fail)
+                exit 42
+                ;;
+            hang)
+                exec "${TEST_POST_LAYOUT_HOOK_SLEEP_BIN:?}" 10
+                ;;
+            *)
+                printf 'Unsupported post-layout hook mode: %s\n' \
+                    "$TEST_POST_LAYOUT_HOOK_MODE" >&2
+                exit 98
+                ;;
+        esac
         ;;
     pkill|sleep)
         log_command "$@"

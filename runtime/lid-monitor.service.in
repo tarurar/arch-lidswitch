@@ -8,6 +8,7 @@ ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=exec
+EnvironmentFile=-%h/.config/arch-lidswitch/environment
 ExecStartPre=$TIMEOUT_BIN --kill-after=1s 2s $HYPRCTL_BIN monitors
 ExecStart=$SCRIPTS_DIR/lid-monitor.sh
 StandardOutput=journal

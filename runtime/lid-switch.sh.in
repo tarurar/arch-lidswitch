@@ -34,16 +34,47 @@ fi
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 EXPECTED_LID=${ARCH_LIDSWITCH_EXPECTED_LID:-}
 EXPECTED_POLICY_TOKEN=${ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN:-}
+POST_LAYOUT_HOOK=${ARCH_LIDSWITCH_POST_LAYOUT_HOOK:-}
 
-refresh_waybar_layout() {
-    if pgrep -x waybar >/dev/null 2>&1; then
-        pkill -x -SIGUSR1 waybar || {
-            log_error waybar_refresh_failed phase=hide
-            return 1
-        }
-        sleep 0.1
-        pkill -x -SIGUSR1 waybar || log_error waybar_refresh_failed phase=show
+run_post_layout_hook() {
+    local action=$1
+    local outcome=$2
+    local internal_output=$3
+    local hook_status
+
+    if [[ -z "$POST_LAYOUT_HOOK" ]]; then
+        return 0
     fi
+    if [[ "$POST_LAYOUT_HOOK" != /* ]]; then
+        log_error post_layout_hook_invalid reason=not_absolute \
+            action="$action" outcome="$outcome" \
+            internal_output="$internal_output"
+        return 0
+    fi
+    if [[ ! -f "$POST_LAYOUT_HOOK" ]]; then
+        log_error post_layout_hook_invalid reason=not_regular \
+            action="$action" outcome="$outcome" \
+            internal_output="$internal_output"
+        return 0
+    fi
+    if [[ ! -x "$POST_LAYOUT_HOOK" ]]; then
+        log_error post_layout_hook_invalid reason=not_executable \
+            action="$action" outcome="$outcome" \
+            internal_output="$internal_output"
+        return 0
+    fi
+
+    if timeout --kill-after=1s 2s "$POST_LAYOUT_HOOK" \
+        "$action" "$outcome" "$internal_output"; then
+        log_info post_layout_hook_succeeded action="$action" \
+            outcome="$outcome" internal_output="$internal_output"
+    else
+        hook_status=$?
+        log_error post_layout_hook_failed action="$action" \
+            outcome="$outcome" internal_output="$internal_output" \
+            status="$hook_status"
+    fi
+    return 0
 }
 
 validate_expected_generation_contract() {
@@ -332,7 +363,7 @@ reconcile_lid_state() {
     fi
 
     if [[ "$layout_changed" == true ]]; then
-        refresh_waybar_layout
+        run_post_layout_hook "$action" "$desired_internal" "$LAPTOP_DISPLAY"
     fi
     if [[ "$action" == close && "$enabled_external_count" -eq 0 ]]; then
         log_info power_delegated owner=systemd-logind action=close \
