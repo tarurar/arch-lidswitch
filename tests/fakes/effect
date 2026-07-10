@@ -124,7 +124,48 @@ case "$command_name" in
         fi
         ;;
     hyprctl)
-        if [[ "${1:-}" == "monitors" ]]; then
+        if [[ "${1:-}" == "-j" && "${2:-}" == "version" ]]; then
+            log_command "$@"
+            if [[ "${TEST_HYPRCTL_VERSION_FAIL:-0}" == 1 ]]; then
+                printf 'Configured Hyprland version query failure\n' >&2
+                exit 94
+            fi
+            if [[ -n "${TEST_HYPRCTL_VERSION_JSON+x}" ]]; then
+                printf '%s\n' "$TEST_HYPRCTL_VERSION_JSON"
+            else
+                printf '%s\n' '{"version":"0.55.0","tag":"unknown"}'
+            fi
+        elif [[ "${1:-}" == "-j" && "${2:-}" == "instances" ]]; then
+            log_command "$@"
+            if [[ -n "${TEST_HYPRCTL_INSTANCES_JSON+x}" ]]; then
+                printf '%s\n' "$TEST_HYPRCTL_INSTANCES_JSON"
+            else
+                printf '%s\n' '[{"instance":"test-instance","time":0,"pid":42,"wl_socket":"wayland-test"}]'
+            fi
+        elif [[ "${1:-}" == "-j" && "${2:-}" == "status" ]]; then
+            log_command "$@"
+            if [[ -n "${TEST_HYPRCTL_STATUS_JSON+x}" ]]; then
+                printf '%s\n' "$TEST_HYPRCTL_STATUS_JSON"
+            else
+                printf '%s\n' '{"configProvider":"lua","backend":"drm"}'
+            fi
+        elif [[ "${1:-}" == "-j" && "${2:-}" == "monitors" && \
+            "${3:-}" == "all" ]]; then
+            log_command "$@"
+            if [[ -n "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+                printf '%s\n' "$TEST_HYPRCTL_MONITORS_JSON"
+            else
+                printf '%s\n' '[]'
+            fi
+        elif [[ "${1:-}" == "eval" && \
+            "${2:-}" == 'assert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")' ]]; then
+            log_command "$@"
+            if [[ "${TEST_HYPRCTL_CAPABILITY_EVAL_FAIL:-0}" == 1 ]]; then
+                printf 'Configured Hyprland Lua capability failure\n' >&2
+                exit 94
+            fi
+            printf '%s\n' "${TEST_HYPRCTL_CAPABILITY_EVAL_OUTPUT:-ok}"
+        elif [[ "${1:-}" == "monitors" ]]; then
             log_command "$@"
             if [[ -z "${TEST_MONITORS_FIXTURE:-}" || ! -r "$TEST_MONITORS_FIXTURE" ]]; then
                 printf 'Monitor fixture is not readable: %s\n' \

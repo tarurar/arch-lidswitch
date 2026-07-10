@@ -40,6 +40,7 @@ SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
 laptop_monitor=""
 external_monitor=""
 HYPRCTL_BIN=""
+JQ_BIN=""
 session_config_state=""
 legacy_default_target_service=false
 
@@ -81,6 +82,115 @@ check_hyprland() {
         log_error "This script requires WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE from the active Hyprland session"
         exit 1
     fi
+}
+
+check_hyprland_capabilities() {
+    local version_json version_string version_major version_minor
+    local instances_json instance_count instance_signature instance_socket
+    local status_json config_provider
+    local monitors_json
+    local lua_probe_output
+
+    if ! command_exists jq; then
+        log_error "This installer requires jq to validate Hyprland capabilities"
+        return 1
+    fi
+
+    JQ_BIN=$(command -v jq)
+
+    if ! version_json=$("$HYPRCTL_BIN" -j version); then
+        log_error "Could not query the active Hyprland version with 'hyprctl -j version'"
+        return 1
+    fi
+    if ! version_string=$("$JQ_BIN" -er \
+        'if type == "object" and (.version | type == "string") then .version else empty end' \
+        <<< "$version_json"); then
+        log_error "Hyprland returned malformed version JSON or a missing version string"
+        return 1
+    fi
+    if [[ ! "$version_string" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.[0-9]{1,9}$ ]]; then
+        log_error "Hyprland returned a malformed version string: $version_string"
+        return 1
+    fi
+
+    version_major=$((10#${BASH_REMATCH[1]}))
+    version_minor=$((10#${BASH_REMATCH[2]}))
+    if (( version_major == 0 && version_minor < 55 )); then
+        log_error "Hyprland $version_string is unsupported; version 0.55.0 or newer is required"
+        return 1
+    fi
+
+    if ! instances_json=$("$HYPRCTL_BIN" -j instances); then
+        log_error "Could not query running Hyprland instances with 'hyprctl -j instances'"
+        return 1
+    fi
+    if ! instance_count=$("$JQ_BIN" -er \
+        'if type == "array" then length else empty end' <<< "$instances_json"); then
+        log_error "Hyprland returned a malformed instances array"
+        return 1
+    fi
+    if (( instance_count != 1 )); then
+        log_error "Expected exactly one running Hyprland instance, found $instance_count; instance selection is not supported"
+        return 1
+    fi
+    if ! instance_signature=$("$JQ_BIN" -er \
+        'if type == "array" and length == 1 and (.[0] | type) == "object" and (.[0].instance | type) == "string" then .[0].instance else empty end' \
+        <<< "$instances_json"); then
+        log_error "Hyprland returned a malformed selected instance record"
+        return 1
+    fi
+    if [[ "$instance_signature" != "$HYPRLAND_INSTANCE_SIGNATURE" ]]; then
+        log_error "Running Hyprland instance=$instance_signature does not match HYPRLAND_INSTANCE_SIGNATURE=$HYPRLAND_INSTANCE_SIGNATURE"
+        return 1
+    fi
+    if "$JQ_BIN" -e '.[0] | has("wl_socket")' <<< "$instances_json" >/dev/null; then
+        if ! instance_socket=$("$JQ_BIN" -er \
+            'if (.[0].wl_socket | type) == "string" then .[0].wl_socket else empty end' \
+            <<< "$instances_json"); then
+            log_error "Hyprland returned a malformed wl_socket in the selected instance record"
+            return 1
+        fi
+        if [[ "$instance_socket" != "$WAYLAND_DISPLAY" ]]; then
+            log_error "Running Hyprland wl_socket=$instance_socket does not match WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+            return 1
+        fi
+    fi
+
+    if ! status_json=$("$HYPRCTL_BIN" -j status); then
+        log_error "Could not query the active Hyprland configuration provider with 'hyprctl -j status'"
+        return 1
+    fi
+    if ! config_provider=$("$JQ_BIN" -er \
+        'if type == "object" and (.configProvider | type == "string") then .configProvider else empty end' \
+        <<< "$status_json"); then
+        log_error "Hyprland returned malformed status JSON or a missing configProvider"
+        return 1
+    fi
+    if [[ "$config_provider" != "lua" ]]; then
+        log_error "Hyprland configProvider=$config_provider is unsupported; expected lua"
+        return 1
+    fi
+
+    if ! monitors_json=$("$HYPRCTL_BIN" -j monitors all); then
+        log_error "Could not query monitor capabilities with 'hyprctl -j monitors all'"
+        return 1
+    fi
+    if ! "$JQ_BIN" -e 'type == "array"' <<< "$monitors_json" >/dev/null; then
+        log_error "Hyprland 'hyprctl -j monitors all' did not return a valid monitor array"
+        return 1
+    fi
+
+    if ! lua_probe_output=$("$HYPRCTL_BIN" eval \
+        'assert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")'); then
+        log_error "Hyprland Lua capability probe failed: hl.monitor is unavailable"
+        return 1
+    fi
+    if [[ "$lua_probe_output" != "ok" ]]; then
+        log_error "Hyprland Lua capability probe failed: hl.monitor is unavailable"
+        return 1
+    fi
+
+    log_success "Hyprland $version_string capability profile is compatible (configProvider=lua instances=1)"
 }
 
 run_lid_switch_doctor() {
@@ -1205,6 +1315,7 @@ main() {
     check_hyprland
     inspect_session_config
     check_lid_power_policy
+    check_hyprland_capabilities
     
     # Detect monitors
     log_info "Detecting Monitors..."

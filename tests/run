@@ -52,7 +52,7 @@ install_safe_path() {
 
     # Only ordinary utilities needed inside the isolated HOME are exposed.
     # Power, compositor, process-signal, and timing commands exist solely as fakes.
-    for command_name in awk cat chmod cp cut date dirname grep head mkdir mktemp mv rm sed; do
+    for command_name in awk cat chmod cp cut date dirname grep head jq mkdir mktemp mv rm sed; do
         command_path=$(command -v "$command_name")
         ln -s "$command_path" "$safe_bin/$command_name"
     done
@@ -841,7 +841,8 @@ installer_matches_fixture_expectation() (
     local expected_outcome=$2
     local expected_message=$3
     local assertion_message=$4
-    local test_root home fake_bin safe_bin effect_log fixture installer_output
+    shift 4
+    local test_root home fake_bin safe_bin effect_log fixture installer_output effects
     local installer_status=0
 
     test_root=$(mktemp -d)
@@ -865,10 +866,12 @@ installer_matches_fixture_expectation() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$fixture" \
+        "$@" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1 || installer_status=$?
 
     installer_output=$(<"$test_root/installer.out")
+    effects=$(<"$effect_log")
     case "$expected_outcome" in
         success)
             if (( installer_status != 0 )); then
@@ -880,6 +883,13 @@ installer_matches_fixture_expectation() (
                 printf 'installer did not create an executable lid-switch CLI\n' >&2
                 return 1
             fi
+            assert_contains "$effects" \
+                $'hyprctl\teval\tassert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")' \
+                'successful installation should prove the typed hl.monitor contract' \
+                || return 1
+            assert_not_contains "$effects" $'monitor\t' \
+                'the Hyprland capability probe must not mutate monitor state' \
+                || return 1
             ;;
         failure)
             if (( installer_status == 0 )); then
@@ -927,6 +937,236 @@ installer_rejects_a_missing_laptop_monitor() {
         failure \
         'Could not detect laptop monitor (eDP-*)' \
         'a missing laptop output should produce the intended explicit error'
+}
+
+installer_rejects_missing_jq_before_writes() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config original
+    local installer_output effects installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    original='-- user-owned config must remain unchanged without jq'
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$original" > "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    rm -f "$safe_bin/jq"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    installer_output=$(<"$test_root/installer.out")
+    effects=$(<"$effect_log")
+
+    if (( installer_status == 0 )); then
+        printf 'installer accepted a missing jq dependency\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$(<"$config")" != "$original" ]]; then
+        printf 'missing jq changed user configuration:\n%s\n' "$(<"$config")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$home/.config/hypr/scripts/lid-switch.sh" ]] || \
+        [[ -e "$home/.config/systemd/user/lid-monitor.service" ]]; then
+        printf 'missing jq wrote installation artifacts\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'systemctl\t' \
+        'dependency rejection must not change user-systemd state' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'dependency rejection must not mutate monitor state' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" 'requires jq' \
+        'the missing dependency should have an actionable diagnostic' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_hyprland_profile_is_rejected() (
+    set -euo pipefail
+
+    local expected_message=$1
+    shift
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config original
+    local installer_output effects installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    original='-- user-owned config must remain unchanged on compatibility failure'
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$original" > "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$@" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    installer_output=$(<"$test_root/installer.out")
+    effects=$(<"$effect_log")
+
+    if (( installer_status == 0 )); then
+        printf 'installer accepted an incompatible Hyprland profile\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$(<"$config")" != "$original" ]]; then
+        printf 'compatibility failure changed user configuration:\n%s\n' \
+            "$(<"$config")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$home/.config/hypr/scripts/lid-switch.sh" ]] || \
+        [[ -e "$home/.config/systemd/user/lid-monitor.service" ]]; then
+        printf 'compatibility failure wrote installation artifacts\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'systemctl\t' \
+        'compatibility rejection must not change user-systemd state' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'compatibility rejection must not mutate monitor state' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" "$expected_message" \
+        'the incompatible profile should explain its exact cause' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_rejects_hyprland_before_0_55() {
+    installer_hyprland_profile_is_rejected \
+        'Hyprland 0.54.0 is unsupported; version 0.55.0 or newer is required' \
+        'TEST_HYPRCTL_VERSION_JSON={"version":"0.54.0","tag":"v9.9.9"}'
+}
+
+installer_rejects_unreachable_hyprland_version_query() {
+    installer_hyprland_profile_is_rejected \
+        "Could not query the active Hyprland version with 'hyprctl -j version'" \
+        TEST_HYPRCTL_VERSION_FAIL=1
+}
+
+installer_rejects_malformed_hyprland_versions() {
+    local failures=0
+
+    installer_hyprland_profile_is_rejected \
+        'Hyprland returned malformed version JSON or a missing version string' \
+        TEST_HYPRCTL_VERSION_JSON=not-json \
+        || failures=$((failures + 1))
+    installer_hyprland_profile_is_rejected \
+        'Hyprland returned a malformed version string: release-55' \
+        'TEST_HYPRCTL_VERSION_JSON={"version":"release-55","tag":"v0.55.0"}' \
+        || failures=$((failures + 1))
+    installer_hyprland_profile_is_rejected \
+        'Hyprland returned a malformed version string: 0.55.0-git' \
+        'TEST_HYPRCTL_VERSION_JSON={"version":"0.55.0-git","tag":"unknown"}' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installer_accepts_a_future_hyprland_version() {
+    local failures=0
+
+    installer_matches_fixture_expectation \
+        'one-external.txt' \
+        success \
+        'Detected laptop monitor: eDP-1' \
+        'a future Hyprland minor version should satisfy the minimum-version contract' \
+        'TEST_HYPRCTL_VERSION_JSON={"version":"0.100.0","tag":"unknown"}' \
+        || failures=$((failures + 1))
+    installer_matches_fixture_expectation \
+        'one-external.txt' \
+        success \
+        'Detected laptop monitor: eDP-1' \
+        'a future Hyprland major version should satisfy the minimum-version contract' \
+        'TEST_HYPRCTL_VERSION_JSON={"version":"1.2.3","tag":"unknown"}'
+
+    (( failures == 0 ))
+}
+
+installer_rejects_no_running_hyprland_instance() {
+    installer_hyprland_profile_is_rejected \
+        'Expected exactly one running Hyprland instance, found 0; instance selection is not supported' \
+        'TEST_HYPRCTL_INSTANCES_JSON=[]'
+}
+
+installer_rejects_ambiguous_or_malformed_hyprland_instances() {
+    local failures=0
+
+    installer_hyprland_profile_is_rejected \
+        'Expected exactly one running Hyprland instance, found 2; instance selection is not supported' \
+        'TEST_HYPRCTL_INSTANCES_JSON=[{"instance":"first"},{"instance":"second"}]' \
+        || failures=$((failures + 1))
+    installer_hyprland_profile_is_rejected \
+        'Hyprland returned a malformed instances array' \
+        'TEST_HYPRCTL_INSTANCES_JSON={"instance":"not-an-array"}' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installer_rejects_a_mismatched_selected_hyprland_instance() {
+    installer_hyprland_profile_is_rejected \
+        'Running Hyprland instance=other-instance does not match HYPRLAND_INSTANCE_SIGNATURE=test-instance' \
+        'TEST_HYPRCTL_INSTANCES_JSON=[{"instance":"other-instance","wl_socket":"wayland-test"}]'
+}
+
+installer_rejects_a_mismatched_selected_wayland_socket() {
+    installer_hyprland_profile_is_rejected \
+        'Running Hyprland wl_socket=wayland-other does not match WAYLAND_DISPLAY=wayland-test' \
+        'TEST_HYPRCTL_INSTANCES_JSON=[{"instance":"test-instance","wl_socket":"wayland-other"}]'
+}
+
+installer_rejects_non_lua_hyprland_provider() {
+    installer_hyprland_profile_is_rejected \
+        'Hyprland configProvider=hyprlang is unsupported; expected lua' \
+        'TEST_HYPRCTL_STATUS_JSON={"configProvider":"hyprlang","backend":"drm"}'
+}
+
+installer_rejects_non_array_hyprland_monitors() {
+    installer_hyprland_profile_is_rejected \
+        "Hyprland 'hyprctl -j monitors all' did not return a valid monitor array" \
+        'TEST_HYPRCTL_MONITORS_JSON={"name":"eDP-1"}'
+}
+
+installer_rejects_unavailable_hl_monitor_api() {
+    installer_hyprland_profile_is_rejected \
+        'Hyprland Lua capability probe failed: hl.monitor is unavailable' \
+        'TEST_HYPRCTL_CAPABILITY_EVAL_OUTPUT=error: hl.monitor unavailable'
 }
 
 installer_policy_profile_is_rejected() (
@@ -1678,6 +1918,66 @@ run_test \
     'BUG-007-no-laptop' \
     'installer explains why installation cannot continue without a laptop output' \
     installer_rejects_a_missing_laptop_monitor
+
+run_test \
+    'BUG-016-jq-dependency' \
+    'installer rejects a missing jq dependency before writes' \
+    installer_rejects_missing_jq_before_writes
+
+run_test \
+    'BUG-016-minimum-version' \
+    'installer rejects Hyprland versions before 0.55' \
+    installer_rejects_hyprland_before_0_55
+
+run_test \
+    'BUG-016-version-query' \
+    'installer rejects an unreachable Hyprland version query' \
+    installer_rejects_unreachable_hyprland_version_query
+
+run_test \
+    'BUG-016-version-format' \
+    'installer rejects malformed Hyprland version profiles' \
+    installer_rejects_malformed_hyprland_versions
+
+run_test \
+    'BUG-016-future-version' \
+    'installer accepts future Hyprland major and minor versions' \
+    installer_accepts_a_future_hyprland_version
+
+run_test \
+    'BUG-016-no-instance' \
+    'installer rejects an absent Hyprland instance' \
+    installer_rejects_no_running_hyprland_instance
+
+run_test \
+    'BUG-016-instance-profile' \
+    'installer rejects ambiguous and malformed Hyprland instance profiles' \
+    installer_rejects_ambiguous_or_malformed_hyprland_instances
+
+run_test \
+    'BUG-016-instance-selection' \
+    'installer rejects a Hyprland instance outside the selected session' \
+    installer_rejects_a_mismatched_selected_hyprland_instance
+
+run_test \
+    'BUG-016-wayland-selection' \
+    'installer rejects a Hyprland Wayland socket outside the selected session' \
+    installer_rejects_a_mismatched_selected_wayland_socket
+
+run_test \
+    'BUG-016-config-provider' \
+    'installer rejects a non-Lua Hyprland configuration provider' \
+    installer_rejects_non_lua_hyprland_provider
+
+run_test \
+    'BUG-016-monitor-array' \
+    'installer rejects a non-array structured monitor response' \
+    installer_rejects_non_array_hyprland_monitors
+
+run_test \
+    'BUG-016-lua-capability' \
+    'installer rejects an unavailable hl.monitor Lua API' \
+    installer_rejects_unavailable_hl_monitor_api
 
 run_test \
     'BUG-005-undocked-policy-conflict' \

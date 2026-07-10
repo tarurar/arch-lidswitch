@@ -37,9 +37,11 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 ## Requirements
 
 - **OS**: Arch Linux (or similar)
-- **Desktop**: Hyprland window manager
+- **Desktop**: Hyprland 0.55.0 or newer, using the Lua configuration provider
 - **Hardware**: Laptop with ACPI lid switch support
 - **Session**: Wayland session
+- **Tools**: `hyprctl` from the active Hyprland session and `jq`
+- **Instances**: Exactly one running Hyprland instance matching `HYPRLAND_INSTANCE_SIGNATURE` and the active Wayland socket; automatic instance selection is not supported
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
 - **Power capability**: login1 must report `CanSuspend=yes`; hibernation and swap/resume configuration are not required because this project never requests hibernation
 
@@ -199,11 +201,30 @@ systemd-journald configuration.
 2. **Verify Hyprland is running**:
    ```bash
    echo $XDG_SESSION_TYPE  # Should output 'wayland'
-   hyprctl monitors        # Should list your monitors
+   jq --version
+   hyprctl -j version | jq '.version'
+   hyprctl -j instances | jq \
+     --arg instance "$HYPRLAND_INSTANCE_SIGNATURE" \
+     --arg socket "$WAYLAND_DISPLAY" \
+     'length == 1 and .[0].instance == $instance and (((.[0] | has("wl_socket")) | not) or .[0].wl_socket == $socket)'
+   hyprctl -j status | jq '.configProvider'
+   hyprctl -j monitors all | jq 'type'
    systemctl --user is-active hyprland-session.target graphical-session.target
    ```
 
-3. **Check lid detection**:
+   The supported profile reports Hyprland `0.55.0` or newer, exactly one
+   instance selected by the current session environment, `configProvider`
+   equal to `lua`, and a monitor response whose JSON type is `array`.
+
+3. **Check the required Lua monitor API without changing the layout**:
+   ```bash
+   hyprctl eval 'assert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")'
+   ```
+
+   A compatible compositor prints exactly `ok`. The installer runs this
+   nonmutating probe before it creates files or changes user-systemd state.
+
+4. **Check lid detection**:
    ```bash
    cat /proc/acpi/button/lid/*/state
    ```
