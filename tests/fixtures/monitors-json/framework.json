@@ -1,0 +1,28 @@
+[
+  {
+    "id": 0,
+    "name": "eDP-1",
+    "width": 2880,
+    "height": 1920,
+    "refreshRate": 120,
+    "x": 0,
+    "y": 0,
+    "scale": 2,
+    "transform": 0,
+    "disabled": false,
+    "mirrorOf": "none"
+  },
+  {
+    "id": 1,
+    "name": "DP-2",
+    "width": 3840,
+    "height": 2160,
+    "refreshRate": 59.997,
+    "x": 1440,
+    "y": -180,
+    "scale": 1.25,
+    "transform": 3,
+    "disabled": false,
+    "mirrorOf": "none"
+  }
+]

@@ -32,6 +32,7 @@ SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SESSION_TARGET_FILE="$SYSTEMD_USER_DIR/hyprland-session.target"
 SERVICE_FILE="$SYSTEMD_USER_DIR/lid-monitor.service"
 DOCTOR_FILE="$SCRIPTS_DIR/lid-switch-doctor.sh"
+MONITOR_STATE_FILE="$SCRIPTS_DIR/monitor-state.sh"
 
 SESSION_CONFIG_BEGIN='-- BEGIN arch-lidswitch managed session integration'
 SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
@@ -375,6 +376,17 @@ EOF
     log_success "Lid state observer installed at $SCRIPTS_DIR/lid-state.sh"
 }
 
+install_monitor_state_script() {
+    log_info "Installing monitor state module..."
+
+    cat > "$MONITOR_STATE_FILE" << 'EOF'
+@@MONITOR_STATE_SCRIPT@@
+EOF
+
+    chmod +x "$MONITOR_STATE_FILE"
+    log_success "Monitor state module installed at $MONITOR_STATE_FILE"
+}
+
 # Install the lid switch script
 install_lid_switch_script() {
     local laptop_monitor="$1"
@@ -506,6 +518,7 @@ print_final_instructions() {
     echo
     echo -e "${BLUE}What was installed:${NC}"
     echo "  • Lid state observer: $SCRIPTS_DIR/lid-state.sh"
+    echo "  • Monitor state module: $MONITOR_STATE_FILE"
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
     echo "  • Lid switch doctor: $DOCTOR_FILE"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
@@ -563,6 +576,7 @@ main() {
     
     # Prepare every non-service artifact before stopping a legacy service.
     install_lid_state_script
+    install_monitor_state_script
     install_lid_switch_script "$laptop_monitor"
     install_lid_switch_doctor
     install_lid_monitor_script

@@ -88,11 +88,23 @@ assert_before() {
     fi
 }
 
-installed_cli_handles_documented_open_and_close() (
+installed_cli_handles_documented_open_and_close() {
+    installed_cli_round_trips_framework_layout
+}
+
+installed_cli_round_trips_internal_layout_profile() (
     set -euo pipefail
 
-    local test_root home fake_bin safe_bin effect_log installed_cli monitor_fixture
+    local profile=$1
+    local expected_mode=$2
+    local expected_position=$3
+    local expected_scale=$4
+    local expected_transform=$5
+    local expected_mirror=$6
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local runtime_dir monitor_json installed_cli installed_state snapshot_file
     local close_effects open_effects close_output open_output
+    local close_status=0 open_status=0 failures=0
 
     test_root=$(mktemp -d)
     trap 'rm -rf "$test_root"' EXIT
@@ -102,7 +114,155 @@ installed_cli_handles_documented_open_and_close() (
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
-    mkdir -p "$home"
+    runtime_dir="$test_root/runtime"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/$profile.json")
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    installed_state="$home/.config/hypr/scripts/monitor-state.sh"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+
+    if [[ ! -x "$installed_state" ]]; then
+        printf 'installer did not create an executable monitor-state module\n' >&2
+        failures=$((failures + 1))
+    elif ! cmp -s "$ROOT_DIR/runtime/monitor-state.sh" "$installed_state"; then
+        printf 'installed monitor-state module differs from canonical source\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$installed_cli" close \
+        > "$test_root/close.out" 2>&1 || close_status=$?
+
+    close_effects=$(<"$effect_log")
+    close_output=$(<"$test_root/close.out")
+    if (( close_status != 0 )); then
+        printf 'expected %s close status 0, got %d\n%s\n' \
+            "$profile" "$close_status" "$close_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$close_effects" $'hyprctl\t-j\tmonitors\tall' \
+        'close should capture the structured internal layout before mutation' \
+        || failures=$((failures + 1))
+    assert_contains "$close_effects" $'monitor\toutput=eDP-1\tdisabled=true' \
+        'close should disable only the installed internal output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$close_effects" $'monitor\toutput=DP-2' \
+        'close must preserve every external monitor property' \
+        || failures=$((failures + 1))
+
+    if [[ ! -f "$snapshot_file" ]]; then
+        printf 'close did not create the internal layout snapshot: %s\n' \
+            "$snapshot_file" >&2
+        failures=$((failures + 1))
+    else
+        if [[ "$(stat -c %a "$runtime_dir/arch-lidswitch")" != 700 ]]; then
+            printf 'monitor state directory was not mode 0700\n' >&2
+            failures=$((failures + 1))
+        fi
+        if [[ "$(stat -c %a "$snapshot_file")" != 600 ]]; then
+            printf 'monitor snapshot was not mode 0600\n' >&2
+            failures=$((failures + 1))
+        fi
+        if ! jq -e \
+            --arg mode "$expected_mode" \
+            --arg position "$expected_position" \
+            --argjson scale "$expected_scale" \
+            --argjson transform "$expected_transform" \
+            --arg mirror "$expected_mirror" \
+            '. == {output:"eDP-1", mode:$mode, position:$position, scale:$scale, transform:$transform, mirror:$mirror}' \
+            "$snapshot_file" >/dev/null; then
+            printf 'snapshot did not preserve the %s internal layout:\n%s\n' \
+                "$profile" "$(<"$snapshot_file")" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$installed_cli" open \
+        > "$test_root/open.out" 2>&1 || open_status=$?
+
+    open_effects=$(<"$effect_log")
+    open_output=$(<"$test_root/open.out")
+    if (( open_status != 0 )); then
+        printf 'expected %s open status 0, got %d\n%s\n' \
+            "$profile" "$open_status" "$open_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$open_effects" \
+        "monitor"$'\t'"output=eDP-1"$'\t'"disabled=false"$'\t'"mode=$expected_mode"$'\t'"position=$expected_position"$'\t'"scale=$expected_scale"$'\t'"transform=$expected_transform"$'\t'"mirror=$expected_mirror" \
+        'open should restore every captured internal monitor property' \
+        || failures=$((failures + 1))
+    assert_not_contains "$open_effects" $'monitor\toutput=DP-2' \
+        'open must preserve every external monitor property' \
+        || failures=$((failures + 1))
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+        printf 'successful restore left a stale internal layout snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_cli_round_trips_framework_layout() {
+    installed_cli_round_trips_internal_layout_profile \
+        framework '2880x1920@120' '0x0' 2 0 ''
+}
+
+installed_cli_round_trips_rotated_fractional_layout() {
+    installed_cli_round_trips_internal_layout_profile \
+        rotated-fractional '2256x1504@59.998' '-1504x120' 1.25 1 'DP-2'
+}
+
+installed_cli_snapshot_failure_is_safe() (
+    set -euo pipefail
+
+    local scenario=$1
+    local transition=$2
+    local expected_reason=$3
+    local test_root home fake_bin safe_bin effect_log monitor_fixture runtime_dir
+    local installed_cli runtime_output effects runtime_status=0
+    local -a scenario_environment=()
+
+    test_root=$(mktemp -d)
+    trap 'chmod 0700 "$test_root/runtime" 2>/dev/null || true; rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    runtime_dir="$test_root/runtime"
+    mkdir -m 0700 -p "$home" "$runtime_dir"
     prepare_hyprland_config "$home"
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
@@ -119,61 +279,92 @@ installed_cli_handles_documented_open_and_close() (
         > "$test_root/installer.out" 2>&1
 
     installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
-    if [[ ! -x "$installed_cli" ]]; then
-        printf 'installer did not create an executable lid-switch CLI\n' >&2
+    case "$scenario" in
+        capture-missing)
+            scenario_environment=('TEST_HYPRCTL_MONITORS_JSON=[]')
+            ;;
+        capture-malformed)
+            scenario_environment=('TEST_HYPRCTL_MONITORS_JSON={not-json')
+            ;;
+        capture-query-failure)
+            scenario_environment=('TEST_HYPRCTL_MONITORS_JSON_FAIL=1')
+            ;;
+        capture-unwritable)
+            chmod 0500 "$runtime_dir"
+            ;;
+        restore-missing)
+            ;;
+        restore-malformed)
+            mkdir -m 0700 "$runtime_dir/arch-lidswitch"
+            printf '%s\n' '{"output":"DP-2","mode":"unsafe"}' \
+                > "$runtime_dir/arch-lidswitch/internal-layout.json"
+            chmod 0600 "$runtime_dir/arch-lidswitch/internal-layout.json"
+            ;;
+        *)
+            printf 'unknown snapshot failure scenario: %s\n' "$scenario" >&2
+            return 2
+            ;;
+    esac
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "${scenario_environment[@]}" \
+        "$installed_cli" "$transition" \
+        > "$test_root/runtime.out" 2>&1 || runtime_status=$?
+
+    runtime_output=$(<"$test_root/runtime.out")
+    effects=$(<"$effect_log")
+    if (( runtime_status != 2 )); then
+        printf 'expected %s status 2, got %d\n%s\n' \
+            "$scenario" "$runtime_status" "$runtime_output" >&2
         return 1
     fi
+    assert_contains "$runtime_output" \
+        "event=layout_snapshot_failed action=$transition reason=$expected_reason" \
+        'snapshot failure should be visible at the installed CLI boundary'
+    assert_not_contains "$effects" $'monitor\t' \
+        'snapshot failure must not mutate any monitor'
+    assert_not_contains "$effects" $'pkill\t' \
+        'snapshot failure must not run the post-layout Waybar workaround'
+)
 
-    : > "$effect_log"
-    "$ENV_BIN" -i \
-        HOME="$home" \
-        PATH="$fake_bin:$safe_bin" \
-        TEST_EFFECT_LOG="$effect_log" \
-        TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        "$installed_cli" close \
-        > "$test_root/close.out" 2>&1
-    close_effects=$(<"$effect_log")
-    close_output=$(<"$test_root/close.out")
+installed_cli_refuses_close_without_a_valid_snapshot() (
+    set -euo pipefail
 
-    assert_contains "$close_effects" $'monitor\toutput=eDP-1\tdisabled=true' \
-        'closing the lid should disable the installed laptop output'
-    assert_contains "$close_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=0x0\tscale=1' \
-        'closing the lid should keep the external output at the origin'
-    assert_contains "$close_effects" $'pkill\t-x\t-SIGUSR1\twaybar' \
-        'closing the lid should safely request the documented Waybar refresh'
-    assert_contains "$close_effects" $'sleep\t0.1' \
-        'the Waybar refresh delay must use the fake clock boundary'
-    assert_not_contains "$close_effects" $'systemctl\t' \
-        'a successful docked close must not request a power action'
+    local scenario reason failures=0
+    while IFS='|' read -r scenario reason; do
+        if ! installed_cli_snapshot_failure_is_safe "$scenario" close "$reason"; then
+            failures=$((failures + 1))
+        fi
+    done <<'EOF'
+capture-missing|monitor_snapshot_invalid
+capture-malformed|monitor_snapshot_invalid
+capture-query-failure|monitor_query_failed
+capture-unwritable|snapshot_directory_unwritable
+EOF
 
-    : > "$effect_log"
-    "$ENV_BIN" -i \
-        HOME="$home" \
-        PATH="$fake_bin:$safe_bin" \
-        TEST_EFFECT_LOG="$effect_log" \
-        TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        "$installed_cli" open \
-        > "$test_root/open.out" 2>&1
-    open_effects=$(<"$effect_log")
-    open_output=$(<"$test_root/open.out")
+    (( failures == 0 ))
+)
 
-    assert_contains "$open_effects" $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2' \
-        'opening the lid should enable the installed laptop output'
-    assert_contains "$open_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=auto-right\tscale=1' \
-        'opening the lid should restore the documented dual-output placement'
-    assert_contains "$open_effects" $'pkill\t-x\t-SIGUSR1\twaybar' \
-        'opening the lid should safely request the documented Waybar refresh'
-    assert_contains "$open_effects" $'sleep\t0.1' \
-        'the Waybar refresh delay must use the fake clock boundary'
-    assert_not_contains "$open_effects" $'systemctl\t' \
-        'a successful open must not request a power action'
+installed_cli_refuses_open_without_a_valid_snapshot() (
+    set -euo pipefail
 
-    assert_contains "$close_output" \
-        'level=info component=lid-switch event=layout_applied action=close laptop=disabled external=DP-2' \
-        'close transition should report a structured success record'
-    assert_contains "$open_output" \
-        'level=info component=lid-switch event=layout_applied action=open layout=dual external=DP-2' \
-        'open transition should report a structured success record'
+    local scenario reason failures=0
+    while IFS='|' read -r scenario reason; do
+        if ! installed_cli_snapshot_failure_is_safe "$scenario" open "$reason"; then
+            failures=$((failures + 1))
+        fi
+    done <<'EOF'
+restore-missing|snapshot_missing
+restore-malformed|snapshot_invalid
+EOF
+
+    (( failures == 0 ))
 )
 
 installed_cli_delegates_laptop_only_close_to_logind() (
@@ -657,7 +848,7 @@ installed_lid_state_matches_expected_behavior() (
     local scenario=$1
     local expected_state=$2
     local expected_error=${3:-}
-    local test_root home fake_bin safe_bin effect_log monitor_fixture lid_root
+    local test_root home fake_bin safe_bin effect_log monitor_fixture lid_root runtime_dir
     local installed_cli installed_daemon cli_effects daemon_output installer_output
     local cli_status=0 daemon_status=0
 
@@ -670,7 +861,8 @@ installed_lid_state_matches_expected_behavior() (
     effect_log="$test_root/effects.log"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     lid_root="$test_root/button/lid"
-    mkdir -p "$home"
+    runtime_dir="$test_root/runtime"
+    mkdir -m 0700 -p "$home" "$runtime_dir"
     prepare_hyprland_config "$home"
     create_lid_state_fixture "$lid_root" "$scenario"
     : > "$effect_log"
@@ -704,10 +896,24 @@ installed_lid_state_matches_expected_behavior() (
     installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
     installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
 
+    if ! "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$installed_cli" close \
+        > "$test_root/seed-close.out" 2>&1; then
+        printf 'could not seed the installed CLI monitor snapshot:\n%s\n' \
+            "$(<"$test_root/seed-close.out")" >&2
+        return 1
+    fi
+
     : > "$effect_log"
     "$ENV_BIN" -i \
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
         HYPR_LID_STATE_ROOT="$lid_root" \
@@ -724,8 +930,8 @@ installed_lid_state_matches_expected_behavior() (
             fi
             assert_contains "$cli_effects" $'monitor\toutput=eDP-1\tdisabled=false' \
                 'an open lid state should select the installed CLI open transition' || return 1
-            assert_contains "$cli_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=auto-right\tscale=1' \
-                'an open lid state should restore the external output placement' || return 1
+            assert_not_contains "$cli_effects" $'monitor\toutput=DP-2' \
+                'an open lid state should preserve the external output placement' || return 1
             ;;
         closed)
             if (( cli_status != 0 )); then
@@ -735,8 +941,8 @@ installed_lid_state_matches_expected_behavior() (
             fi
             assert_contains "$cli_effects" $'monitor\toutput=eDP-1\tdisabled=true' \
                 'a closed lid state should select the installed CLI close transition' || return 1
-            assert_contains "$cli_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=0x0\tscale=1' \
-                'a closed lid state should retain the external output at the origin' || return 1
+            assert_not_contains "$cli_effects" $'monitor\toutput=DP-2' \
+                'a closed lid state should preserve the external output placement' || return 1
             ;;
         unknown)
             if (( cli_status == 0 )); then
@@ -1782,7 +1988,7 @@ installer_migrates_only_the_legacy_default_target_service() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        TEST_REQUIRED_PATHS_BEFORE_DISABLE="$home/.config/hypr/scripts/lid-state.sh:$home/.config/hypr/scripts/lid-switch.sh:$home/.config/hypr/scripts/lid-switch-doctor.sh:$home/.config/hypr/scripts/lid-monitor.sh:$home/.config/hypr/scripts/lid-session-bridge.sh:$home/.config/hypr/arch_lidswitch/session.lua:$home/.config/systemd/user/hyprland-session.target" \
+        TEST_REQUIRED_PATHS_BEFORE_DISABLE="$home/.config/hypr/scripts/lid-state.sh:$home/.config/hypr/scripts/monitor-state.sh:$home/.config/hypr/scripts/lid-switch.sh:$home/.config/hypr/scripts/lid-switch-doctor.sh:$home/.config/hypr/scripts/lid-monitor.sh:$home/.config/hypr/scripts/lid-session-bridge.sh:$home/.config/hypr/arch_lidswitch/session.lua:$home/.config/systemd/user/hyprland-session.target" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1
 
@@ -1828,6 +2034,26 @@ run_test \
     'installed-cli-transitions' \
     'installed CLI handles documented docked close and open transitions' \
     installed_cli_handles_documented_open_and_close
+
+run_test \
+    'BUG-011-framework-round-trip' \
+    'installed CLI round-trips the current Framework internal layout' \
+    installed_cli_round_trips_framework_layout
+
+run_test \
+    'BUG-011-portable-round-trip' \
+    'installed CLI round-trips a rotated fractional internal layout' \
+    installed_cli_round_trips_rotated_fractional_layout
+
+run_test \
+    'BUG-011-close-snapshot-safety' \
+    'installed CLI refuses close mutations without a valid writable snapshot' \
+    installed_cli_refuses_close_without_a_valid_snapshot
+
+run_test \
+    'BUG-011-open-snapshot-safety' \
+    'installed CLI refuses open mutations without a valid saved snapshot' \
+    installed_cli_refuses_open_without_a_valid_snapshot
 
 run_test \
     'BUG-005-runtime-power-owner' \

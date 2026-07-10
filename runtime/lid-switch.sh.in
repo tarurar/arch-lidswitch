@@ -26,11 +26,12 @@ if ! . "$SCRIPT_DIR/lid-state.sh"; then
     log_error lid_state_observer_load_failed
     exit 1
 fi
+if ! . "$SCRIPT_DIR/monitor-state.sh"; then
+    log_error monitor_state_module_load_failed
+    exit 1
+fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
-LAPTOP_MODE="2880x1920@120"
-LAPTOP_POSITION="0x0"
-LAPTOP_SCALE="2"
 
 get_external_display() {
     local monitor_output external_display
@@ -48,19 +49,12 @@ get_external_display() {
 }
 
 configure_clamshell_layout() {
-    local external_display="$1"
-
-    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = true }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"0x0\", scale = 1 })"
-}
-
-enable_laptop_display() {
-    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE })"
+    monitor_state_capture_internal_layout "$LAPTOP_DISPLAY" || return
+    monitor_state_disable_internal_output "$LAPTOP_DISPLAY"
 }
 
 configure_dual_layout() {
-    local external_display="$1"
-
-    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"auto-right\", scale = 1 })"
+    monitor_state_restore_internal_layout "$LAPTOP_DISPLAY"
 }
 
 refresh_waybar_layout() {
@@ -75,7 +69,7 @@ refresh_waybar_layout() {
 }
 
 handle_lid_close() {
-    local discovery_status=0
+    local discovery_status=0 layout_status
 
     log_info transition_started action=close
 
@@ -87,11 +81,17 @@ handle_lid_close() {
 
     if (( discovery_status == 0 )); then
         log_info external_monitor_detected action=close output="$CURRENT_EXTERNAL"
-        if configure_clamshell_layout "$CURRENT_EXTERNAL"; then
+        if configure_clamshell_layout; then
             refresh_waybar_layout
             log_info layout_applied action=close laptop=disabled external="$CURRENT_EXTERNAL"
         else
-            log_error layout_apply_failed action=close
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=close reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
         fi
     elif (( discovery_status == 1 )); then
         log_info power_delegated owner=systemd-logind action=close reason=no_external_monitor
@@ -102,7 +102,7 @@ handle_lid_close() {
 }
 
 handle_lid_open() {
-    local discovery_status=0
+    local discovery_status=0 layout_status
 
     log_info transition_started action=open
 
@@ -114,19 +114,31 @@ handle_lid_open() {
 
     if (( discovery_status == 0 )); then
         log_info external_monitor_detected action=open output="$CURRENT_EXTERNAL"
-        if configure_dual_layout "$CURRENT_EXTERNAL"; then
+        if configure_dual_layout; then
             refresh_waybar_layout
             log_info layout_applied action=open layout=dual external="$CURRENT_EXTERNAL"
         else
-            log_error layout_apply_failed action=open layout=dual
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=open layout=dual reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
         fi
     elif (( discovery_status == 1 )); then
         log_info external_monitor_absent action=open
-        if enable_laptop_display; then
+        if configure_dual_layout; then
             refresh_waybar_layout
             log_info layout_applied action=open layout=laptop_only
         else
-            log_error layout_apply_failed action=open layout=laptop_only
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=open layout=laptop_only reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
         fi
     else
         log_error monitor_query_failed action=open

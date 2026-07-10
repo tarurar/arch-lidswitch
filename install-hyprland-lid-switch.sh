@@ -32,6 +32,7 @@ SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SESSION_TARGET_FILE="$SYSTEMD_USER_DIR/hyprland-session.target"
 SERVICE_FILE="$SYSTEMD_USER_DIR/lid-monitor.service"
 DOCTOR_FILE="$SCRIPTS_DIR/lid-switch-doctor.sh"
+MONITOR_STATE_FILE="$SCRIPTS_DIR/monitor-state.sh"
 
 SESSION_CONFIG_BEGIN='-- BEGIN arch-lidswitch managed session integration'
 SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
@@ -689,6 +690,195 @@ EOF
     log_success "Lid state observer installed at $SCRIPTS_DIR/lid-state.sh"
 }
 
+install_monitor_state_script() {
+    log_info "Installing monitor state module..."
+
+    cat > "$MONITOR_STATE_FILE" << 'EOF'
+#!/bin/bash
+
+MONITOR_STATE_ERROR=""
+MONITOR_STATE_DIR=""
+MONITOR_STATE_FILE=""
+
+monitor_state_fail() {
+    MONITOR_STATE_ERROR=$1
+    return 2
+}
+
+monitor_state_prepare_directory() {
+    local runtime_dir=${XDG_RUNTIME_DIR:-}
+    local state_dir
+
+    if [[ -z "$runtime_dir" || "$runtime_dir" != /* || \
+        ! -d "$runtime_dir" || -L "$runtime_dir" || ! -O "$runtime_dir" ]]; then
+        monitor_state_fail runtime_directory_unavailable
+        return
+    fi
+
+    state_dir="$runtime_dir/arch-lidswitch"
+    if [[ -e "$state_dir" || -L "$state_dir" ]]; then
+        if [[ ! -d "$state_dir" || -L "$state_dir" || ! -O "$state_dir" ]]; then
+            monitor_state_fail snapshot_directory_insecure
+            return
+        fi
+    elif ! mkdir -m 0700 -- "$state_dir"; then
+        monitor_state_fail snapshot_directory_unwritable
+        return
+    fi
+
+    if ! chmod 0700 -- "$state_dir"; then
+        monitor_state_fail snapshot_directory_unwritable
+        return
+    fi
+
+    MONITOR_STATE_DIR=$state_dir
+    MONITOR_STATE_FILE="$state_dir/internal-layout.json"
+}
+
+monitor_state_capture_internal_layout() {
+    local output=$1
+    local monitors_json temporary_snapshot
+
+    MONITOR_STATE_ERROR=""
+    if ! monitor_state_prepare_directory; then
+        return 2
+    fi
+
+    if ! temporary_snapshot=$(mktemp "$MONITOR_STATE_DIR/.internal-layout.XXXXXX"); then
+        monitor_state_fail snapshot_unwritable
+        return
+    fi
+    if ! chmod 0600 -- "$temporary_snapshot"; then
+        rm -f -- "$temporary_snapshot"
+        monitor_state_fail snapshot_unwritable
+        return
+    fi
+
+    if ! monitors_json=$(hyprctl -j monitors all); then
+        rm -f -- "$temporary_snapshot"
+        monitor_state_fail monitor_query_failed
+        return
+    fi
+
+    if ! jq -ce --arg output "$output" '
+        def integer:
+            type == "number" and . == floor;
+        def positive_integer:
+            integer and . > 0;
+        def output_name:
+            type == "string" and test("^[A-Za-z0-9_.:-]+$");
+
+        select(type == "array")
+        | [.[] | select(.name == $output)]
+        | select(length == 1)
+        | .[0] as $monitor
+        | select(
+            ($monitor.name | output_name) and
+            ($monitor.width | positive_integer) and
+            ($monitor.height | positive_integer) and
+            ($monitor.refreshRate | type == "number" and . > 0) and
+            ($monitor.x | integer) and
+            ($monitor.y | integer) and
+            ($monitor.scale | type == "number" and . > 0 and . <= 10) and
+            ($monitor.transform | integer and . >= 0 and . <= 7) and
+            ($monitor.disabled == false) and
+            (($monitor.mirrorOf == "none") or ($monitor.mirrorOf | output_name))
+        )
+        | {
+            output: $monitor.name,
+            mode: (($monitor.width | tostring) + "x" +
+                ($monitor.height | tostring) + "@" +
+                ($monitor.refreshRate | tostring)),
+            position: (($monitor.x | tostring) + "x" +
+                ($monitor.y | tostring)),
+            scale: $monitor.scale,
+            transform: $monitor.transform,
+            mirror: (if $monitor.mirrorOf == "none" then "" else $monitor.mirrorOf end)
+        }
+    ' <<< "$monitors_json" > "$temporary_snapshot"; then
+        rm -f -- "$temporary_snapshot"
+        monitor_state_fail monitor_snapshot_invalid
+        return
+    fi
+
+    if ! mv -f -- "$temporary_snapshot" "$MONITOR_STATE_FILE"; then
+        rm -f -- "$temporary_snapshot"
+        monitor_state_fail snapshot_unwritable
+        return
+    fi
+}
+
+monitor_state_disable_internal_output() {
+    local output=$1
+
+    MONITOR_STATE_ERROR=""
+    if [[ ! "$output" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+        monitor_state_fail internal_output_invalid
+        return
+    fi
+    if ! hyprctl eval \
+        "hl.monitor({ output = \"$output\", disabled = true })"; then
+        MONITOR_STATE_ERROR=disable_apply_failed
+        return 3
+    fi
+}
+
+monitor_state_restore_internal_layout() {
+    local output=$1
+    local restore_expression
+
+    MONITOR_STATE_ERROR=""
+    if ! monitor_state_prepare_directory; then
+        return 2
+    fi
+    if [[ ! -f "$MONITOR_STATE_FILE" || -L "$MONITOR_STATE_FILE" || \
+        ! -O "$MONITOR_STATE_FILE" ]]; then
+        monitor_state_fail snapshot_missing
+        return
+    fi
+
+    if ! restore_expression=$(jq -er --arg output "$output" '
+        def integer:
+            type == "number" and . == floor;
+        def output_name:
+            type == "string" and test("^[A-Za-z0-9_.:-]+$");
+
+        select(type == "object")
+        | select((keys | sort) ==
+            ["mirror", "mode", "output", "position", "scale", "transform"])
+        | select(.output == $output and (.output | output_name))
+        | select(.mode | type == "string" and
+            test("^[1-9][0-9]*x[1-9][0-9]*@[0-9]+([.][0-9]+)?$"))
+        | select(.position | type == "string" and
+            test("^-?[0-9]+x-?[0-9]+$"))
+        | select(.scale | type == "number" and . > 0 and . <= 10)
+        | select(.transform | integer and . >= 0 and . <= 7)
+        | select(.mirror == "" or (.mirror | output_name))
+        | "hl.monitor({ output = \(.output | @json), disabled = false, " +
+            "mode = \(.mode | @json), position = \(.position | @json), " +
+            "scale = \(.scale), transform = \(.transform), " +
+            "mirror = \(.mirror | @json) })"
+    ' "$MONITOR_STATE_FILE"); then
+        monitor_state_fail snapshot_invalid
+        return
+    fi
+
+    if ! hyprctl eval "$restore_expression"; then
+        MONITOR_STATE_ERROR=restore_apply_failed
+        return 3
+    fi
+
+    if ! rm -f -- "$MONITOR_STATE_FILE"; then
+        monitor_state_fail snapshot_cleanup_failed
+        return
+    fi
+}
+EOF
+
+    chmod +x "$MONITOR_STATE_FILE"
+    log_success "Monitor state module installed at $MONITOR_STATE_FILE"
+}
+
 # Install the lid switch script
 install_lid_switch_script() {
     local laptop_monitor="$1"
@@ -724,11 +914,12 @@ if ! . "$SCRIPT_DIR/lid-state.sh"; then
     log_error lid_state_observer_load_failed
     exit 1
 fi
+if ! . "$SCRIPT_DIR/monitor-state.sh"; then
+    log_error monitor_state_module_load_failed
+    exit 1
+fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
-LAPTOP_MODE="2880x1920@120"
-LAPTOP_POSITION="0x0"
-LAPTOP_SCALE="2"
 
 get_external_display() {
     local monitor_output external_display
@@ -746,19 +937,12 @@ get_external_display() {
 }
 
 configure_clamshell_layout() {
-    local external_display="$1"
-
-    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = true }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"0x0\", scale = 1 })"
-}
-
-enable_laptop_display() {
-    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE })"
+    monitor_state_capture_internal_layout "$LAPTOP_DISPLAY" || return
+    monitor_state_disable_internal_output "$LAPTOP_DISPLAY"
 }
 
 configure_dual_layout() {
-    local external_display="$1"
-
-    hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"auto-right\", scale = 1 })"
+    monitor_state_restore_internal_layout "$LAPTOP_DISPLAY"
 }
 
 refresh_waybar_layout() {
@@ -773,7 +957,7 @@ refresh_waybar_layout() {
 }
 
 handle_lid_close() {
-    local discovery_status=0
+    local discovery_status=0 layout_status
 
     log_info transition_started action=close
 
@@ -785,11 +969,17 @@ handle_lid_close() {
 
     if (( discovery_status == 0 )); then
         log_info external_monitor_detected action=close output="$CURRENT_EXTERNAL"
-        if configure_clamshell_layout "$CURRENT_EXTERNAL"; then
+        if configure_clamshell_layout; then
             refresh_waybar_layout
             log_info layout_applied action=close laptop=disabled external="$CURRENT_EXTERNAL"
         else
-            log_error layout_apply_failed action=close
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=close reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
         fi
     elif (( discovery_status == 1 )); then
         log_info power_delegated owner=systemd-logind action=close reason=no_external_monitor
@@ -800,7 +990,7 @@ handle_lid_close() {
 }
 
 handle_lid_open() {
-    local discovery_status=0
+    local discovery_status=0 layout_status
 
     log_info transition_started action=open
 
@@ -812,19 +1002,31 @@ handle_lid_open() {
 
     if (( discovery_status == 0 )); then
         log_info external_monitor_detected action=open output="$CURRENT_EXTERNAL"
-        if configure_dual_layout "$CURRENT_EXTERNAL"; then
+        if configure_dual_layout; then
             refresh_waybar_layout
             log_info layout_applied action=open layout=dual external="$CURRENT_EXTERNAL"
         else
-            log_error layout_apply_failed action=open layout=dual
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=open layout=dual reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
         fi
     elif (( discovery_status == 1 )); then
         log_info external_monitor_absent action=open
-        if enable_laptop_display; then
+        if configure_dual_layout; then
             refresh_waybar_layout
             log_info layout_applied action=open layout=laptop_only
         else
-            log_error layout_apply_failed action=open layout=laptop_only
+            layout_status=$?
+            if (( layout_status == 2 )); then
+                log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
+            else
+                log_error layout_apply_failed action=open layout=laptop_only reason="$MONITOR_STATE_ERROR"
+            fi
+            return "$layout_status"
         fi
     else
         log_error monitor_query_failed action=open
@@ -1275,6 +1477,7 @@ print_final_instructions() {
     echo
     echo -e "${BLUE}What was installed:${NC}"
     echo "  • Lid state observer: $SCRIPTS_DIR/lid-state.sh"
+    echo "  • Monitor state module: $MONITOR_STATE_FILE"
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
     echo "  • Lid switch doctor: $DOCTOR_FILE"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
@@ -1332,6 +1535,7 @@ main() {
     
     # Prepare every non-service artifact before stopping a legacy service.
     install_lid_state_script
+    install_monitor_state_script
     install_lid_switch_script "$laptop_monitor"
     install_lid_switch_doctor
     install_lid_monitor_script

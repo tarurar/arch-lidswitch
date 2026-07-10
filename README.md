@@ -12,20 +12,22 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 📝 **Journal Logging**: Structured service and transition records for troubleshooting
 - 🔁 **Session-Bound Startup**: Systemd user service starts after Hyprland is reachable and stops with the graphical session
 - 💤 **Single Power-Policy Owner**: Leaves every lid-triggered power decision to systemd-logind
+- 📐 **Layout Preservation**: Restores the internal panel's captured mode, position, scale, transform, and mirror without rewriting external outputs
 - 📊 **Waybar Layout Refresh**: Refreshes Waybar layer geometry without restarting the Waybar process
 
 ## How It Works
 
 ### Lid Closed + External Monitor Connected
+- Captures the active internal panel layout in the private runtime directory
 - Disables laptop internal display
-- Moves the external monitor to `0x0`
-- External monitor becomes the only active display
+- Leaves every external monitor's mode, position, scale, transform, and mirror untouched
 - All workspaces remain accessible
 - Waybar is briefly hidden/shown with `SIGUSR1` so its layer geometry follows the new layout
 
 ### Lid Opened
-- Re-enables laptop internal display  
-- Restores dual monitor configuration with the external monitor at `auto-right`
+- Re-enables the laptop internal display from its captured layout
+- Restores its exact mode, position, scale, transform, and mirror settings
+- Leaves the external monitor arrangement untouched
 - Maintains your workspace layout
 - Refreshes Waybar layer geometry without restarting Waybar
 
@@ -40,7 +42,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - **Desktop**: Hyprland 0.55.0 or newer, using the Lua configuration provider
 - **Hardware**: Laptop with ACPI lid switch support
 - **Session**: Wayland session
-- **Tools**: `hyprctl` from the active Hyprland session and `jq`
+- **Tools**: `hyprctl` from the active Hyprland session and `jq` for installer checks and runtime layout validation
 - **Instances**: Exactly one running Hyprland instance matching `HYPRLAND_INSTANCE_SIGNATURE` and the active Wayland socket; automatic instance selection is not supported
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
 - **Power capability**: login1 must report `CanSuspend=yes`; hibernation and swap/resume configuration are not required because this project never requests hibernation
@@ -76,6 +78,7 @@ The installer creates the following files:
 ```
 ~/.config/hypr/scripts/
 ├── lid-state.sh       # Shared ACPI lid state observer
+├── monitor-state.sh   # Secure internal-layout snapshot and restore
 ├── lid-switch.sh      # Core lid switch logic
 ├── lid-switch-doctor.sh # Read-only logind policy diagnostics
 ├── lid-monitor.sh     # Background monitor daemon
@@ -179,10 +182,10 @@ journalctl --user -u lid-monitor.service -b -1 -o cat
 ```
 
 Runtime records use stable fields such as `component=lid-switch`,
-`event=monitor_query_failed`, and `action=close`. The user service sends both
-stdout and stderr to journald with the identifier `arch-lidswitch`; it does not
-create separate log files in `/tmp`. Journal retention follows the host's
-systemd-journald configuration.
+`event=monitor_query_failed`, `event=layout_snapshot_failed`, and
+`action=close`. The user service sends both stdout and stderr to journald with
+the identifier `arch-lidswitch`; it does not create separate log files in
+`/tmp`. Journal retention follows the host's systemd-journald configuration.
 
 ## Troubleshooting
 
@@ -319,20 +322,20 @@ This forces Waybar to recalculate its layer position while keeping the same Wayb
 
 ### Monitor Resolution and Positioning
 
-Edit `~/.config/hypr/scripts/lid-switch.sh` to customize monitor settings:
+Configure monitor geometry in your normal Hyprland Lua configuration, not in
+`lid-switch.sh`. On a docked close, arch-lidswitch validates and atomically
+saves only the active internal output to:
 
-```bash
-# Internal monitor defaults
-LAPTOP_MODE="2880x1920@120"
-LAPTOP_POSITION="0x0"
-LAPTOP_SCALE="2"
-
-# Clamshell mode puts the external monitor at 0x0.
-hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = true }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"0x0\", scale = 1 })"
-
-# Lid-open mode restores the external monitor to the right.
-hyprctl eval "hl.monitor({ output = \"$LAPTOP_DISPLAY\", disabled = false, mode = \"$LAPTOP_MODE\", position = \"$LAPTOP_POSITION\", scale = $LAPTOP_SCALE }); hl.monitor({ output = \"$external_display\", mode = \"preferred\", position = \"auto-right\", scale = 1 })"
+```text
+$XDG_RUNTIME_DIR/arch-lidswitch/internal-layout.json
 ```
+
+The directory is private (`0700`) and the snapshot is private (`0600`). A lid
+open restores that internal output and removes the consumed snapshot. Missing,
+malformed, or unwritable state stops the transition before any monitor change.
+External outputs are never targeted, so custom external modes, positions,
+fractional scales, transforms, and mirroring remain owned by your Hyprland
+configuration.
 
 ### Response Timing
 
@@ -365,6 +368,7 @@ systemctl --user disable lid-monitor.service
 
 # Remove files
 rm -f ~/.config/hypr/scripts/lid-state.sh
+rm -f ~/.config/hypr/scripts/monitor-state.sh
 rm -f ~/.config/hypr/scripts/lid-switch.sh
 rm -f ~/.config/hypr/scripts/lid-switch-doctor.sh
 rm -f ~/.config/hypr/scripts/lid-monitor.sh
