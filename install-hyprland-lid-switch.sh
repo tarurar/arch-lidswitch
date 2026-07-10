@@ -22,13 +22,25 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-HYPR_CONFIG_DIR="$HOME/.config/hypr"
+HYPRLAND_CONFIG_FILE="${HYPR_LID_HYPRLAND_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hypr/hyprland.lua}"
+HYPR_CONFIG_DIR="$(dirname "$HYPRLAND_CONFIG_FILE")"
 SCRIPTS_DIR="$HYPR_CONFIG_DIR/scripts"
+SESSION_MODULE_DIR="$HYPR_CONFIG_DIR/arch_lidswitch"
+SESSION_MODULE="$SESSION_MODULE_DIR/session.lua"
+SESSION_BRIDGE="$SCRIPTS_DIR/lid-session-bridge.sh"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+SESSION_TARGET_FILE="$SYSTEMD_USER_DIR/hyprland-session.target"
+SERVICE_FILE="$SYSTEMD_USER_DIR/lid-monitor.service"
+
+SESSION_CONFIG_BEGIN='-- BEGIN arch-lidswitch managed session integration'
+SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
 
 # Global variables
 laptop_monitor=""
 external_monitor=""
+HYPRCTL_BIN=""
+session_config_state=""
+legacy_default_target_service=false
 
 ################################################################################
 # Utility Functions
@@ -61,6 +73,95 @@ check_hyprland() {
         log_error "This script requires Hyprland to be running"
         exit 1
     fi
+
+    HYPRCTL_BIN=$(command -v hyprctl)
+
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]] || [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+        log_error "This script requires WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE from the active Hyprland session"
+        exit 1
+    fi
+}
+
+write_session_config_block() {
+    cat <<'EOF'
+-- BEGIN arch-lidswitch managed session integration
+do
+    local ok, err = pcall(require, "arch_lidswitch.session")
+    if not ok then
+        print("arch-lidswitch: failed to load session integration: " .. tostring(err))
+    end
+end
+-- END arch-lidswitch managed session integration
+EOF
+}
+
+inspect_session_config() {
+    local begin_count end_count existing_block expected_block
+
+    if [[ -L "$HYPRLAND_CONFIG_FILE" ]]; then
+        log_error "Refusing to replace symlinked Hyprland config: $HYPRLAND_CONFIG_FILE"
+        exit 1
+    fi
+
+    if [[ ! -f "$HYPRLAND_CONFIG_FILE" ]]; then
+        log_error "Could not find Hyprland Lua config: $HYPRLAND_CONFIG_FILE"
+        exit 1
+    fi
+
+    begin_count=$(grep -Fxc -- "$SESSION_CONFIG_BEGIN" "$HYPRLAND_CONFIG_FILE" || true)
+    end_count=$(grep -Fxc -- "$SESSION_CONFIG_END" "$HYPRLAND_CONFIG_FILE" || true)
+
+    if (( begin_count == 0 && end_count == 0 )); then
+        if grep -Fq -- 'arch_lidswitch.session' "$HYPRLAND_CONFIG_FILE"; then
+            log_error "Hyprland config already references arch_lidswitch.session outside the managed block"
+            exit 1
+        fi
+        session_config_state="missing"
+        return 0
+    fi
+
+    if (( begin_count != 1 || end_count != 1 )); then
+        log_error "Hyprland config contains malformed arch-lidswitch ownership markers"
+        exit 1
+    fi
+
+    existing_block=$(awk \
+        -v begin="$SESSION_CONFIG_BEGIN" \
+        -v end="$SESSION_CONFIG_END" \
+        '$0 == begin { capture = 1 } capture { print } $0 == end { capture = 0 }' \
+        "$HYPRLAND_CONFIG_FILE")
+    expected_block=$(write_session_config_block)
+
+    if [[ "$existing_block" != "$expected_block" ]]; then
+        log_error "Hyprland config contains an edited arch-lidswitch managed block"
+        exit 1
+    fi
+
+    session_config_state="present"
+}
+
+integrate_session_config() {
+    local candidate
+
+    if [[ "$session_config_state" == "present" ]]; then
+        log_info "Hyprland session integration is already present"
+        return 0
+    fi
+
+    candidate=$(mktemp "$HYPRLAND_CONFIG_FILE.arch-lidswitch.XXXXXX")
+    if ! cp -p -- "$HYPRLAND_CONFIG_FILE" "$candidate"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+
+    {
+        printf '\n'
+        write_session_config_block
+    } >> "$candidate"
+
+    mv -- "$candidate" "$HYPRLAND_CONFIG_FILE"
+    session_config_state="present"
+    log_success "Hyprland session integration added to $HYPRLAND_CONFIG_FILE"
 }
 
 # Detect laptop and external monitors
@@ -91,9 +192,136 @@ create_directories() {
     log_info "Creating necessary directories..."
     
     mkdir -p "$SCRIPTS_DIR"
+    mkdir -p "$SESSION_MODULE_DIR"
     mkdir -p "$SYSTEMD_USER_DIR"
     
     log_success "Directories created"
+}
+
+# Install the helper that orders environment import before session activation
+install_session_bridge() {
+    log_info "Installing Hyprland session bridge..."
+
+    cat > "$SESSION_BRIDGE" << 'EOF'
+#!/bin/bash
+
+set -euo pipefail
+
+SESSION_TARGET="hyprland-session.target"
+HYPRLAND_ENV_NAMES=(
+    DISPLAY
+    WAYLAND_DISPLAY
+    HYPRLAND_INSTANCE_SIGNATURE
+    XDG_CURRENT_DESKTOP
+    QT_QPA_PLATFORMTHEME
+    PATH
+    XDG_DATA_DIRS
+)
+
+usage() {
+    echo "Usage: $0 {start|stop}" >&2
+}
+
+require_session_environment() {
+    local variable_name
+
+    for variable_name in WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; do
+        if [[ -z "${!variable_name:-}" ]]; then
+            echo "arch-lidswitch: required session variable is missing: $variable_name" >&2
+            return 1
+        fi
+    done
+}
+
+start_session() {
+    local variable_name
+    local -a defined_names=()
+
+    require_session_environment
+
+    for variable_name in "${HYPRLAND_ENV_NAMES[@]}"; do
+        if [[ -v "$variable_name" ]]; then
+            defined_names+=("$variable_name")
+        fi
+    done
+
+    systemctl --user import-environment "${defined_names[@]}"
+    systemctl --user start "$SESSION_TARGET"
+}
+
+stop_session() {
+    local stop_status=0
+
+    systemctl --user stop "$SESSION_TARGET" || stop_status=$?
+    sleep 0.1
+    return "$stop_status"
+}
+
+case "${1:-}" in
+    start)
+        start_session
+        ;;
+    stop)
+        stop_session
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
+EOF
+
+    chmod +x "$SESSION_BRIDGE"
+    log_success "Hyprland session bridge installed at $SESSION_BRIDGE"
+}
+
+# Install the isolated Lua event handlers next to hyprland.lua
+install_session_module() {
+    log_info "Installing Hyprland session module..."
+
+    cat > "$SESSION_MODULE" << 'EOF'
+local source = debug.getinfo(1, "S").source
+local module_path = source:match("^@(.+)$")
+local config_dir = module_path and module_path:match("^(.*)/arch_lidswitch/session%.lua$")
+
+if not config_dir then
+    error("arch-lidswitch: unable to locate the Hyprland configuration directory")
+end
+
+local function shell_quote(value)
+    return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local bridge = shell_quote(config_dir .. "/scripts/lid-session-bridge.sh")
+
+hl.on("hyprland.start", function()
+    hl.exec_cmd(bridge .. " start")
+end)
+
+hl.on("hyprland.shutdown", function()
+    os.execute(bridge .. " stop")
+end)
+
+return true
+EOF
+
+    log_success "Hyprland session module installed at $SESSION_MODULE"
+}
+
+# Install the compositor-specific target that owns graphical-session.target
+install_session_target() {
+    log_info "Installing Hyprland session target..."
+
+    cat > "$SESSION_TARGET_FILE" << 'EOF'
+[Unit]
+Description=Hyprland session
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+PropagatesStopTo=graphical-session.target
+EOF
+
+    log_success "Hyprland session target installed at $SESSION_TARGET_FILE"
 }
 
 # Install the shared lid state observer
@@ -460,26 +688,42 @@ EOF
 install_systemd_service() {
     log_info "Installing systemd user service..."
     
-    cat > "$SYSTEMD_USER_DIR/lid-monitor.service" << EOF
+    cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Hyprland Lid Switch Monitor
+PartOf=graphical-session.target
 After=graphical-session.target
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
-Type=simple
+Type=exec
+ExecStartPre=$HYPRCTL_BIN monitors
 ExecStart=$SCRIPTS_DIR/lid-monitor.sh
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=arch-lidswitch
-Restart=always
+Restart=on-failure
 RestartSec=2
-Environment="DISPLAY=:0"
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 EOF
     
     log_success "Systemd service installed at $SYSTEMD_USER_DIR/lid-monitor.service"
+}
+
+detect_legacy_default_target_service() {
+    if [[ -f "$SERVICE_FILE" ]] && grep -Fqx 'WantedBy=default.target' "$SERVICE_FILE"; then
+        legacy_default_target_service=true
+    fi
+}
+
+migrate_legacy_default_target_service() {
+    if [[ "$legacy_default_target_service" == true ]]; then
+        log_info "Stopping the legacy default-target lid monitor service..."
+        systemctl --user disable --now lid-monitor.service
+    fi
 }
 
 # Enable and start the service
@@ -489,10 +733,13 @@ enable_service() {
     # Reload systemd daemon
     systemctl --user daemon-reload
     
-    # Enable service to start on boot
+    # Enable the daemon as part of the graphical session.
     systemctl --user enable lid-monitor.service
-    
-    # Start service now
+
+    # Import the current compositor environment before starting its target.
+    "$SESSION_BRIDGE" start
+
+    # Ensure the daemon is started even if the session target was already active.
     systemctl --user start lid-monitor.service
     
     # Check if service started successfully
@@ -544,6 +791,9 @@ print_final_instructions() {
     echo "  • Lid state observer: $SCRIPTS_DIR/lid-state.sh"
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
+    echo "  • Hyprland session bridge: $SESSION_BRIDGE"
+    echo "  • Hyprland session module: $SESSION_MODULE"
+    echo "  • Hyprland session target: hyprland-session.target"
     echo "  • Systemd user service: lid-monitor.service"
     echo
     echo -e "${BLUE}How it works:${NC}"
@@ -574,6 +824,7 @@ main() {
     # Pre-installation checks
     log_info "Performing pre-installation checks..."
     check_hyprland
+    inspect_session_config
     
     # Detect monitors
     log_info "Detecting Monitors..."
@@ -581,21 +832,33 @@ main() {
     
     # Backup existing files
     backup_existing_files
+
+    # Detect the previous default-target unit before replacing it.
+    detect_legacy_default_target_service
     
     # Create directories
     create_directories
     
-    # Install scripts and service
+    # Prepare every non-service artifact before stopping a legacy service.
     install_lid_state_script
     install_lid_switch_script "$laptop_monitor"
     install_lid_monitor_script
-    install_systemd_service
+    install_session_bridge
+    install_session_module
+    install_session_target
 
     # Test the same lid observer used by the runtime scripts
     test_lid_detection
+
+    # Replace the legacy lifecycle only after all preparation succeeded.
+    migrate_legacy_default_target_service
+    install_systemd_service
     
     # Enable and start service
     enable_service
+
+    # Make future compositor sessions start and stop the target.
+    integrate_session_config
     
     # Print final instructions
     print_final_instructions

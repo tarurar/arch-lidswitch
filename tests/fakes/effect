@@ -75,6 +75,17 @@ case "$command_name" in
         ;;
     systemctl)
         log_command "$@"
+        if [[ "${1:-}" == "--user" && "${2:-}" == "disable" && "${3:-}" == "--now" && \
+            -n "${TEST_REQUIRED_PATHS_BEFORE_DISABLE:-}" ]]; then
+            IFS=':' read -r -a required_paths <<< "$TEST_REQUIRED_PATHS_BEFORE_DISABLE"
+            for required_path in "${required_paths[@]}"; do
+                if [[ ! -e "$required_path" ]]; then
+                    printf 'Required preparation was missing before service disable: %s\n' \
+                        "$required_path" >&2
+                    exit 95
+                fi
+            done
+        fi
         for argument in "$@"; do
             case "$argument" in
                 hibernate|hybrid-sleep|poweroff|reboot|suspend|suspend-then-hibernate)

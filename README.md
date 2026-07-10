@@ -10,7 +10,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 🛡️ **Hyprland Lua Compatible**: Uses `hyprctl eval`/`hl.monitor()` for modern Hyprland Lua configs
 - 🔧 **Zero Configuration**: Works out of the box after installation
 - 📝 **Journal Logging**: Structured service and transition records for troubleshooting
-- 🔁 **Automatic Startup**: Systemd user service starts with your session
+- 🔁 **Session-Bound Startup**: Systemd user service starts after Hyprland is reachable and stops with the graphical session
 - 💤 **Smart Power Management**: Hibernates when lid closes without external monitor
 - 📊 **Waybar Layout Refresh**: Refreshes Waybar layer geometry without restarting the Waybar process
 
@@ -71,11 +71,19 @@ The installer creates the following files:
 ~/.config/hypr/scripts/
 ├── lid-state.sh       # Shared ACPI lid state observer
 ├── lid-switch.sh      # Core lid switch logic
-└── lid-monitor.sh     # Background monitor daemon
+├── lid-monitor.sh     # Background monitor daemon
+└── lid-session-bridge.sh # Ordered Hyprland/systemd session startup
+
+~/.config/hypr/arch_lidswitch/
+└── session.lua        # Hyprland start and shutdown event handlers
 
 ~/.config/systemd/user/
-└── lid-monitor.service # Systemd service configuration
+├── hyprland-session.target # Graphical-session lifecycle target
+└── lid-monitor.service     # Session-bound daemon configuration
 ```
+
+The installer also appends one clearly marked, idempotent `pcall(require, ...)`
+block to `hyprland.lua`. Existing Lua callbacks and configuration are preserved.
 
 ## Usage
 
@@ -158,6 +166,7 @@ systemd-journald configuration.
    ```bash
    echo $XDG_SESSION_TYPE  # Should output 'wayland'
    hyprctl monitors        # Should list your monitors
+   systemctl --user is-active hyprland-session.target graphical-session.target
    ```
 
 3. **Check lid detection**:
@@ -279,11 +288,18 @@ systemctl --user disable lid-monitor.service
 rm -f ~/.config/hypr/scripts/lid-state.sh
 rm -f ~/.config/hypr/scripts/lid-switch.sh
 rm -f ~/.config/hypr/scripts/lid-monitor.sh
+rm -f ~/.config/hypr/scripts/lid-session-bridge.sh
+rm -f ~/.config/hypr/arch_lidswitch/session.lua
+rm -f ~/.config/systemd/user/hyprland-session.target
 rm -f ~/.config/systemd/user/lid-monitor.service
 
 # Reload systemd
 systemctl --user daemon-reload
 ```
+
+Remove the exact block between `BEGIN arch-lidswitch managed session
+integration` and `END arch-lidswitch managed session integration` from
+`~/.config/hypr/hyprland.lua` as well. Do not remove surrounding user-owned Lua.
 
 No separate runtime log files need removal. Existing journal records expire
 according to the host's systemd-journald retention policy.

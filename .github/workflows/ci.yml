@@ -12,5 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Lua 5.4
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends lua5.4
       - name: Check generated files, syntax, and behavior
+        env:
+          LUA_BIN: /usr/bin/lua5.4
+          LUAC: /usr/bin/luac5.4
         run: make check

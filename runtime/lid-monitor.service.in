@@ -1,16 +1,19 @@
 [Unit]
 Description=Hyprland Lid Switch Monitor
+PartOf=graphical-session.target
 After=graphical-session.target
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
-Type=simple
+Type=exec
+ExecStartPre=$HYPRCTL_BIN monitors
 ExecStart=$SCRIPTS_DIR/lid-monitor.sh
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=arch-lidswitch
-Restart=always
+Restart=on-failure
 RestartSec=2
-Environment="DISPLAY=:0"
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

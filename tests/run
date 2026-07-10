@@ -6,6 +6,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_BIN=$(command -v env)
 REAL_SLEEP_BIN=$(command -v sleep)
 TIMEOUT_BIN=$(command -v timeout)
+LUA_BIN=${LUA_BIN:-$(command -v lua)}
+SYSTEMD_ANALYZE_BIN=$(command -v systemd-analyze)
 TEST_FILTER=${1:-}
 
 if [[ $# -gt 1 ]]; then
@@ -50,10 +52,40 @@ install_safe_path() {
 
     # Only ordinary utilities needed inside the isolated HOME are exposed.
     # Power, compositor, process-signal, and timing commands exist solely as fakes.
-    for command_name in awk cat chmod cp cut date dirname grep head mkdir sed; do
+    for command_name in awk cat chmod cp cut date dirname grep head mkdir mktemp mv rm sed; do
         command_path=$(command -v "$command_name")
         ln -s "$command_path" "$safe_bin/$command_name"
     done
+}
+
+prepare_hyprland_config() {
+    local home=$1
+
+    mkdir -p "$home/.config/hypr"
+    printf '%s\n' '-- isolated Hyprland Lua test config' \
+        > "$home/.config/hypr/hyprland.lua"
+}
+
+assert_before() {
+    local actual=$1
+    local first=$2
+    local second=$3
+    local message=$4
+    local first_prefix second_prefix
+
+    if [[ "$actual" != *"$first"* ]] || [[ "$actual" != *"$second"* ]]; then
+        printf 'assertion failed: %s\nrequired ordered values were absent\nactual:\n%s\n' \
+            "$message" "$actual" >&2
+        return 1
+    fi
+
+    first_prefix=${actual%%"$first"*}
+    second_prefix=${actual%%"$second"*}
+    if (( ${#first_prefix} >= ${#second_prefix} )); then
+        printf 'assertion failed: %s\nfirst: %s\nsecond: %s\nactual:\n%s\n' \
+            "$message" "$first" "$second" "$actual" >&2
+        return 1
+    fi
 }
 
 installed_cli_handles_documented_open_and_close() (
@@ -71,12 +103,15 @@ installed_cli_handles_documented_open_and_close() (
     effect_log="$test_root/effects.log"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     mkdir -p "$home"
+    prepare_hyprland_config "$home"
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
 
     "$ENV_BIN" -i \
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
@@ -160,12 +195,15 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
     install_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     missing_runtime_fixture="$test_root/missing-monitors.txt"
     mkdir -p "$home"
+    prepare_hyprland_config "$home"
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
 
     "$ENV_BIN" -i \
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$install_fixture" \
@@ -270,6 +308,7 @@ installed_runtime_reports_through_the_journal_boundary() (
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     lid_root="$test_root/button/lid"
     mkdir -p "$home"
+    prepare_hyprland_config "$home"
     create_lid_state_fixture "$lid_root" lid0
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
@@ -277,6 +316,8 @@ installed_runtime_reports_through_the_journal_boundary() (
     "$ENV_BIN" -i \
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
@@ -366,6 +407,7 @@ installed_lid_state_matches_expected_behavior() (
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     lid_root="$test_root/button/lid"
     mkdir -p "$home"
+    prepare_hyprland_config "$home"
     create_lid_state_fixture "$lid_root" "$scenario"
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
@@ -373,6 +415,8 @@ installed_lid_state_matches_expected_behavior() (
     if ! "$ENV_BIN" -i \
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
@@ -545,12 +589,15 @@ installer_matches_fixture_expectation() (
     effect_log="$test_root/effects.log"
     fixture="$ROOT_DIR/tests/fixtures/monitors/$fixture_name"
     mkdir -p "$home"
+    prepare_hyprland_config "$home"
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
 
     "$ENV_BIN" -i \
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$fixture" \
@@ -617,6 +664,419 @@ installer_rejects_a_missing_laptop_monitor() {
         'Could not detect laptop monitor (eDP-*)' \
         'a missing laptop output should produce the intended explicit error'
 }
+
+installed_session_lifecycle_is_bound_to_hyprland() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local hyprland_config original_config installed_unit installed_target
+    local installed_bridge installed_module unit_contents target_contents
+    local config_contents effects verification_errors failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    hyprland_config="$home/.config/hypr/hyprland.lua"
+    original_config='hl.on("hyprland.start", function() print("existing start") end)'
+
+    mkdir -p "$(dirname "$hyprland_config")"
+    printf '%s\n' "$original_config" > "$hyprland_config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        DISPLAY=:9 \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_CURRENT_DESKTOP=Hyprland \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_unit="$home/.config/systemd/user/lid-monitor.service"
+    installed_target="$home/.config/systemd/user/hyprland-session.target"
+    installed_bridge="$home/.config/hypr/scripts/lid-session-bridge.sh"
+    installed_module="$home/.config/hypr/arch_lidswitch/session.lua"
+
+    unit_contents=$(<"$installed_unit")
+    assert_contains "$unit_contents" 'PartOf=graphical-session.target' \
+        'the installed daemon should stop and restart with the graphical session' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'After=graphical-session.target' \
+        'the installed daemon should start after the graphical session target' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE' \
+        'the installed daemon should require a selected Hyprland instance' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'ConditionEnvironment=WAYLAND_DISPLAY' \
+        'the installed daemon should require a Wayland display' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" "ExecStartPre=$fake_bin/hyprctl monitors" \
+        'the service should prove Hyprland reachability with the installed absolute hyprctl path' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'Restart=on-failure' \
+        'the session daemon should restart only after failures' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'WantedBy=graphical-session.target' \
+        'the installed daemon should be enabled by the graphical session' \
+        || failures=$((failures + 1))
+    assert_not_contains "$unit_contents" 'Environment="DISPLAY=' \
+        'the installed daemon must not hard-code an X11 display' \
+        || failures=$((failures + 1))
+    assert_not_contains "$unit_contents" 'WantedBy=default.target' \
+        'the installed daemon must not start before the graphical session' \
+        || failures=$((failures + 1))
+
+    if [[ ! -r "$installed_target" ]]; then
+        printf 'installer did not create hyprland-session.target\n' >&2
+        failures=$((failures + 1))
+    else
+        target_contents=$(<"$installed_target")
+        assert_contains "$target_contents" 'BindsTo=graphical-session.target' \
+            'the Hyprland session target should bind the passive graphical target' \
+            || failures=$((failures + 1))
+        assert_contains "$target_contents" 'PropagatesStopTo=graphical-session.target' \
+            'stopping the Hyprland session should stop graphical-session.target' \
+            || failures=$((failures + 1))
+    fi
+
+    if ! SYSTEMD_BYPASS_USERDB=1 "$SYSTEMD_ANALYZE_BIN" --user verify "$installed_target" "$installed_unit" \
+        > "$test_root/systemd-analyze.out" 2>&1; then
+        verification_errors=$(grep -Fv \
+            'Failed to turn off SO_PASSRIGHTS on user lookup socket, ignoring: Operation not permitted' \
+            "$test_root/systemd-analyze.out" | grep -Fv \
+            'Failed to enable SO_PASSCRED on handoff timestamp socket: Operation not permitted' || true)
+        if [[ -n "$verification_errors" ]]; then
+            printf 'systemd rejected installed session units:\n%s\n' \
+                "$verification_errors" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
+    for installed_artifact in "$installed_bridge" "$installed_module"; do
+        if [[ ! -r "$installed_artifact" ]]; then
+            printf 'installer did not create session artifact: %s\n' "$installed_artifact" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    config_contents=$(<"$hyprland_config")
+    assert_contains "$config_contents" "$original_config" \
+        'session integration should preserve the existing Hyprland configuration' \
+        || failures=$((failures + 1))
+    assert_contains "$config_contents" '-- BEGIN arch-lidswitch managed session integration' \
+        'the installer should add an owned session-integration block' \
+        || failures=$((failures + 1))
+    assert_contains "$config_contents" 'pcall(require, "arch_lidswitch.session")' \
+        'the owned integration should load the adjacent module without breaking the main config' \
+        || failures=$((failures + 1))
+
+    effects=$(<"$effect_log")
+    assert_contains "$effects" $'systemctl\t--user\timport-environment\tDISPLAY\tWAYLAND_DISPLAY\tHYPRLAND_INSTANCE_SIGNATURE\tXDG_CURRENT_DESKTOP\tPATH' \
+        'current-session activation should synchronously import defined Hyprland variables' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'systemctl\t--user\tstart\thyprland-session.target' \
+        'current-session activation should start the Hyprland session target' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_session_bridge_orders_start_and_stop() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture bridge
+    local effects expected_import start_status=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    mkdir -p "$home"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        DISPLAY=:9 \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_CURRENT_DESKTOP=Hyprland \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    bridge="$home/.config/hypr/scripts/lid-session-bridge.sh"
+    : > "$effect_log"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        DISPLAY=:10 \
+        WAYLAND_DISPLAY=wayland-ordered \
+        HYPRLAND_INSTANCE_SIGNATURE=ordered-instance \
+        XDG_CURRENT_DESKTOP=Hyprland \
+        XDG_SESSION_TYPE=wayland \
+        QT_QPA_PLATFORMTHEME=qt6ct \
+        XDG_DATA_DIRS=/test/share \
+        TEST_EFFECT_LOG="$effect_log" \
+        UNRELATED_SECRET=must-not-be-imported \
+        "$bridge" start
+
+    effects=$(<"$effect_log")
+    expected_import=$'systemctl\t--user\timport-environment\tDISPLAY\tWAYLAND_DISPLAY\tHYPRLAND_INSTANCE_SIGNATURE\tXDG_CURRENT_DESKTOP\tQT_QPA_PLATFORMTHEME\tPATH\tXDG_DATA_DIRS'
+    assert_before "$effects" "$expected_import" \
+        $'systemctl\t--user\tstart\thyprland-session.target' \
+        'the session target must start only after the curated environment import'
+    assert_not_contains "$effects" 'XDG_SESSION_TYPE' \
+        'the bridge should not expand Hyprland upstream curated environment ownership'
+    assert_not_contains "$effects" 'UNRELATED_SECRET' \
+        'the bridge should never import unrelated session values'
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        "$bridge" stop
+    effects=$(<"$effect_log")
+    assert_before "$effects" \
+        $'systemctl\t--user\tstop\thyprland-session.target' \
+        $'sleep\t0.1' \
+        'normal Hyprland shutdown should synchronously stop the target before the short grace period'
+    assert_not_contains "$effects" 'unset-environment' \
+        'Hyprland should retain ownership of activation-environment cleanup'
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-missing-instance \
+        TEST_EFFECT_LOG="$effect_log" \
+        "$bridge" start \
+        > "$test_root/missing.out" 2>&1 || start_status=$?
+
+    if (( start_status == 0 )); then
+        printf 'session bridge accepted a missing Hyprland instance signature\n' >&2
+        return 1
+    fi
+    if [[ -s "$effect_log" ]]; then
+        printf 'missing session identity caused system effects:\n%s\n' \
+            "$(<"$effect_log")" >&2
+        return 1
+    fi
+    assert_contains "$(<"$test_root/missing.out")" 'HYPRLAND_INSTANCE_SIGNATURE' \
+        'the bridge should identify the missing required session variable'
+)
+
+installed_session_module_registers_isolated_hooks() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture module harness output
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    mkdir -p "$home"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    module="$home/.config/hypr/arch_lidswitch/session.lua"
+    harness="$test_root/harness.lua"
+    printf '%s\n' \
+        'local handlers = {}' \
+        'hl = {' \
+        '  on = function(name, callback) handlers[name] = callback end,' \
+        '  exec_cmd = function(command) print("async\t" .. command) end,' \
+        '}' \
+        'os.execute = function(command) print("sync\t" .. command); return true, "exit", 0 end' \
+        'assert(dofile(arg[1]) == true)' \
+        'assert(type(handlers["hyprland.start"]) == "function")' \
+        'assert(type(handlers["hyprland.shutdown"]) == "function")' \
+        'handlers["hyprland.start"]()' \
+        'handlers["hyprland.shutdown"]()' \
+        > "$harness"
+
+    output=$("$LUA_BIN" "$harness" "$module")
+    assert_contains "$output" "async"$'\t'"'$home/.config/hypr/scripts/lid-session-bridge.sh' start" \
+        'the Lua start hook should delegate asynchronously to the installed bridge'
+    assert_contains "$output" "sync"$'\t'"'$home/.config/hypr/scripts/lid-session-bridge.sh' stop" \
+        'the Lua shutdown hook should block on the installed bridge'
+)
+
+installer_session_config_integration_is_idempotent() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config
+    local original contents begin_count end_count require_count iteration
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    original='hl.on("hyprland.start", function() print("keep me") end)'
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$original" > "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    for iteration in 1 2; do
+        "$ENV_BIN" -i \
+            HOME="$home" \
+            PATH="$fake_bin:$safe_bin" \
+            WAYLAND_DISPLAY=wayland-test \
+            HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+            XDG_SESSION_TYPE=wayland \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+            > "$test_root/installer-$iteration.out" 2>&1
+    done
+
+    contents=$(<"$config")
+    assert_contains "$contents" "$original" \
+        'reinstallation should preserve the user-owned Hyprland callback'
+    begin_count=$(grep -Fxc -- '-- BEGIN arch-lidswitch managed session integration' "$config")
+    end_count=$(grep -Fxc -- '-- END arch-lidswitch managed session integration' "$config")
+    require_count=$(grep -Fxc -- '    local ok, err = pcall(require, "arch_lidswitch.session")' "$config")
+    if (( begin_count != 1 || end_count != 1 || require_count != 1 )); then
+        printf 'expected one canonical managed block after reinstall; begin=%d end=%d require=%d\n%s\n' \
+            "$begin_count" "$end_count" "$require_count" "$contents" >&2
+        return 1
+    fi
+)
+
+installer_refuses_malformed_session_config_ownership() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config
+    local original status=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    original=$'print("user config")\n-- BEGIN arch-lidswitch managed session integration\nprint("edited partial block")'
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$original" > "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || status=$?
+
+    if (( status == 0 )); then
+        printf 'installer accepted malformed session ownership markers\n' >&2
+        return 1
+    fi
+    if [[ "$(<"$config")" != "$original" ]]; then
+        printf 'installer changed a malformed user config:\n%s\n' "$(<"$config")" >&2
+        return 1
+    fi
+    if [[ -s "$effect_log" ]]; then
+        printf 'malformed config ownership caused external effects:\n%s\n' \
+            "$(<"$effect_log")" >&2
+        return 1
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'malformed arch-lidswitch ownership markers' \
+        'the refusal should explain the managed-block ownership problem'
+)
+
+installer_migrates_only_the_legacy_default_target_service() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture service effects
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    service="$home/.config/systemd/user/lid-monitor.service"
+    mkdir -p "$(dirname "$service")"
+    prepare_hyprland_config "$home"
+    printf '%s\n' '[Install]' 'WantedBy=default.target' > "$service"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_REQUIRED_PATHS_BEFORE_DISABLE="$home/.config/hypr/scripts/lid-state.sh:$home/.config/hypr/scripts/lid-switch.sh:$home/.config/hypr/scripts/lid-monitor.sh:$home/.config/hypr/scripts/lid-session-bridge.sh:$home/.config/hypr/arch_lidswitch/session.lua:$home/.config/systemd/user/hyprland-session.target" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    effects=$(<"$effect_log")
+    assert_before "$effects" \
+        $'systemctl\t--user\tdisable\t--now\tlid-monitor.service' \
+        $'systemctl\t--user\tdaemon-reload' \
+        'the legacy default-target process should stop before the replacement unit is loaded'
+    assert_not_contains "$effects" $'systemctl\t--user\trestart\tlid-monitor.service' \
+        'BUG-003 should not absorb the general reinstall restart behavior from BUG-013'
+    assert_not_contains "$(<"$service")" 'WantedBy=default.target' \
+        'the migrated unit should no longer retain the early-login enablement target'
+)
 
 tests_run=0
 tests_failed=0
@@ -719,6 +1179,36 @@ run_test \
     'BUG-007-no-laptop' \
     'installer explains why installation cannot continue without a laptop output' \
     installer_rejects_a_missing_laptop_monitor
+
+run_test \
+    'BUG-003-session-lifecycle' \
+    'installed daemon is bound to the reachable Hyprland graphical session' \
+    installed_session_lifecycle_is_bound_to_hyprland
+
+run_test \
+    'BUG-003-session-bridge' \
+    'installed session bridge orders curated startup and synchronous shutdown' \
+    installed_session_bridge_orders_start_and_stop
+
+run_test \
+    'BUG-003-lua-hooks' \
+    'installed Lua module registers isolated Hyprland start and shutdown hooks' \
+    installed_session_module_registers_isolated_hooks
+
+run_test \
+    'BUG-003-config-idempotence' \
+    'installer preserves user Lua and owns one idempotent integration block' \
+    installer_session_config_integration_is_idempotent
+
+run_test \
+    'BUG-003-config-ownership' \
+    'installer refuses malformed session integration ownership without effects' \
+    installer_refuses_malformed_session_config_ownership
+
+run_test \
+    'BUG-003-legacy-migration' \
+    'installer migrates only the legacy default-target service lifecycle' \
+    installer_migrates_only_the_legacy_default_target_service
 
 if (( tests_selected == 0 )); then
     printf 'No tests matched filter: %s\n' "$TEST_FILTER" >&2

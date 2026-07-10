@@ -45,6 +45,15 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         '@@LID_MONITOR_SERVICE@@')
             sed -n 'p' "$ROOT_DIR/runtime/lid-monitor.service.in"
             ;;
+        '@@HYPRLAND_SESSION_TARGET@@')
+            sed -n 'p' "$ROOT_DIR/runtime/hyprland-session.target"
+            ;;
+        '@@LID_SESSION_BRIDGE@@')
+            sed -n 'p' "$ROOT_DIR/runtime/lid-session-bridge.sh"
+            ;;
+        '@@HYPRLAND_SESSION_MODULE@@')
+            sed -n 'p' "$ROOT_DIR/runtime/arch_lidswitch/session.lua"
+            ;;
         *)
             printf '%s\n' "$line"
             ;;
