@@ -553,6 +553,56 @@ release_workflow_publishes_pinned_verified_assets() (
     (( failures == 0 ))
 )
 
+workflows_test_on_declared_coreutils_baseline() (
+    set -euo pipefail
+
+    local workflow_path workflow failures=0
+
+    for workflow_path in \
+        "$ROOT_DIR/.github/workflows/ci.yml" \
+        "$ROOT_DIR/.github/workflows/release.yml"; do
+        if [[ ! -r "$workflow_path" ]]; then
+            printf 'workflow is missing: %s\n' "$workflow_path" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+        workflow=$(<"$workflow_path")
+
+        assert_contains "$workflow" 'runs-on: ubuntu-24.04' \
+            "$workflow_path should pin the runner that provides Linuxbrew" \
+            || failures=$((failures + 1))
+        assert_contains "$workflow" \
+            'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' \
+            "$workflow_path should pin checkout to the reviewed commit" \
+            || failures=$((failures + 1))
+        assert_contains "$workflow" 'brew install coreutils' \
+            "$workflow_path should install a current GNU coreutils build" \
+            || failures=$((failures + 1))
+        assert_contains "$workflow" '/libexec/gnubin' \
+            "$workflow_path should expose unprefixed GNU coreutils commands" \
+            || failures=$((failures + 1))
+        assert_contains "$workflow" \
+            'coreutils_version="$("$coreutils_bin/mv" --version' \
+            "$workflow_path should validate the mv binary used by the suite" \
+            || failures=$((failures + 1))
+        assert_contains "$workflow" 'minimum_coreutils_version=9.11' \
+            "$workflow_path should enforce the documented coreutils baseline" \
+            || failures=$((failures + 1))
+        assert_before "$workflow" \
+            'coreutils_version="$("$coreutils_bin/mv" --version' \
+            'echo "$coreutils_bin" >> "$GITHUB_PATH"' \
+            "$workflow_path should validate coreutils before exporting its path" \
+            || failures=$((failures + 1))
+        assert_before "$workflow" \
+            'echo "$coreutils_bin" >> "$GITHUB_PATH"' \
+            'run: make check' \
+            "$workflow_path should export coreutils before running the suite" \
+            || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+)
+
 installed_cli_round_trips_internal_layout_profile() (
     set -euo pipefail
 
@@ -7879,6 +7929,11 @@ run_test \
     'BUG-019-release-publication' \
     'release workflow publishes pinned verified assets from version tags' \
     release_workflow_publishes_pinned_verified_assets
+
+run_test \
+    'BUG-019-ci-coreutils-baseline' \
+    'CI and release test on the documented GNU coreutils baseline' \
+    workflows_test_on_declared_coreutils_baseline
 
 run_test \
     'BUG-001-single-locker-owner' \

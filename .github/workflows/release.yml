@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Validate the release tag
@@ -31,10 +31,22 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Lua 5.4
+      - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends lua5.4
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install coreutils
+          coreutils_bin="$(brew --prefix coreutils)/libexec/gnubin"
+          coreutils_version="$("$coreutils_bin/mv" --version | awk 'NR == 1 { print $NF }')"
+          minimum_coreutils_version=9.11
+          if [[ "$(printf '%s\n' \
+            "$minimum_coreutils_version" "$coreutils_version" \
+            | sort -V | head -n 1)" != "$minimum_coreutils_version" ]]; then
+            echo "GNU coreutils $minimum_coreutils_version or newer required; found $coreutils_version" >&2
+            exit 1
+          fi
+          echo "$coreutils_bin" >> "$GITHUB_PATH"
 
       - name: Check tagged source
         env:
