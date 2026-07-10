@@ -181,12 +181,12 @@ check_hyprland_capabilities() {
     fi
 
     if ! lua_probe_output=$("$HYPRCTL_BIN" eval \
-        'assert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")'); then
-        log_error "Hyprland Lua capability probe failed: hl.monitor is unavailable"
+        'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")'); then
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
         return 1
     fi
     if [[ "$lua_probe_output" != "ok" ]]; then
-        log_error "Hyprland Lua capability probe failed: hl.monitor is unavailable"
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
         return 1
     fi
 
@@ -746,6 +746,7 @@ MONITOR_STATE_ERROR=""
 MONITOR_STATE_DIR=""
 MONITOR_STATE_FILE=""
 MONITOR_STATE_TOPOLOGY=""
+MONITOR_STATE_SNAPSHOT=""
 
 monitor_state_fail() {
     MONITOR_STATE_ERROR=$1
@@ -786,7 +787,9 @@ monitor_state_observe_topology() {
         | select(all(.[];
             type == "object" and
             (.name | output_name) and
-            (.disabled | type == "boolean")))
+            (.disabled | type == "boolean") and
+            ((has("dpmsStatus") | not) or
+                (.dpmsStatus | type == "boolean"))))
         | select((map(.name) | length) == (map(.name) | unique | length))
         | . as $monitors
         | [$monitors[] | select(.name == $output)]
@@ -832,6 +835,12 @@ monitor_state_internal_enabled() {
     jq -er '.internal.enabled' <<< "$MONITOR_STATE_TOPOLOGY"
 }
 
+monitor_state_internal_dpms() {
+    jq -er '.internal.dpms
+        | if type == "boolean" then tostring else error("invalid dpms") end' \
+        <<< "$MONITOR_STATE_TOPOLOGY"
+}
+
 monitor_state_enabled_external_count() {
     jq -er '[.externals[] | select(.enabled)] | length' \
         <<< "$MONITOR_STATE_TOPOLOGY"
@@ -841,13 +850,11 @@ monitor_state_topology_fingerprint() {
     jq -cer '{
         internal: {
             output: .internal.output,
-            enabled: .internal.enabled,
-            dpms: .internal.dpms
+            enabled: .internal.enabled
         },
         externals: [.externals[] | {
             output: .output,
-            enabled: .enabled,
-            dpms: .dpms
+            enabled: .enabled
         }]
     }' <<< "$MONITOR_STATE_TOPOLOGY"
 }
@@ -880,6 +887,71 @@ monitor_state_prepare_directory() {
 
     MONITOR_STATE_DIR=$state_dir
     MONITOR_STATE_FILE="$state_dir/internal-layout.json"
+}
+
+monitor_state_snapshot_present() {
+    MONITOR_STATE_ERROR=""
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        return 1
+    fi
+    if ! monitor_state_prepare_directory; then
+        return 2
+    fi
+    [[ -e "$MONITOR_STATE_FILE" || -L "$MONITOR_STATE_FILE" ]]
+}
+
+monitor_state_load_internal_layout_snapshot() {
+    local output=$1
+
+    MONITOR_STATE_ERROR=""
+    MONITOR_STATE_SNAPSHOT=""
+    if ! monitor_state_prepare_directory; then
+        return 2
+    fi
+    if [[ ! -f "$MONITOR_STATE_FILE" || -L "$MONITOR_STATE_FILE" || \
+        ! -O "$MONITOR_STATE_FILE" ]]; then
+        monitor_state_fail snapshot_missing
+        return
+    fi
+
+    if ! MONITOR_STATE_SNAPSHOT=$(jq -ce --arg output "$output" '
+        def integer:
+            type == "number" and . == floor;
+        def output_name:
+            type == "string" and test("^[A-Za-z0-9_.:-]+$");
+
+        select(type == "object")
+        | select((keys | sort) ==
+            ["mirror", "mode", "output", "position", "scale", "transform"])
+        | select(.output == $output and (.output | output_name))
+        | select(.mode | type == "string" and
+            test("^[1-9][0-9]*x[1-9][0-9]*@[0-9]+([.][0-9]+)?$"))
+        | select(.position | type == "string" and
+            test("^-?[0-9]+x-?[0-9]+$"))
+        | select(.scale | type == "number" and . > 0 and . <= 10)
+        | select(.transform | integer and . >= 0 and . <= 7)
+        | select(.mirror == "" or (.mirror | output_name))
+    ' "$MONITOR_STATE_FILE"); then
+        monitor_state_fail snapshot_invalid
+        return
+    fi
+}
+
+monitor_state_internal_layout_matches_snapshot() {
+    local output=$1
+    local load_status
+
+    if monitor_state_load_internal_layout_snapshot "$output"; then
+        :
+    else
+        load_status=$?
+        return "$load_status"
+    fi
+    jq -e --arg output "$output" --argjson snapshot "$MONITOR_STATE_SNAPSHOT" '
+        .internal.output == $output and
+        .internal.enabled and
+        .internal.layout == $snapshot
+    ' <<< "$MONITOR_STATE_TOPOLOGY" >/dev/null
 }
 
 monitor_state_capture_internal_layout() {
@@ -920,14 +992,19 @@ monitor_state_capture_internal_layout() {
 
 monitor_state_disable_internal_output() {
     local output=$1
+    local apply_output
 
     MONITOR_STATE_ERROR=""
     if [[ ! "$output" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
         monitor_state_fail internal_output_invalid
         return
     fi
-    if ! hyprctl eval \
-        "hl.monitor({ output = \"$output\", disabled = true })"; then
+    if ! apply_output=$(hyprctl eval \
+        "hl.monitor({ output = \"$output\", disabled = true })"); then
+        MONITOR_STATE_ERROR=disable_apply_failed
+        return 3
+    fi
+    if [[ "$apply_output" != ok ]]; then
         MONITOR_STATE_ERROR=disable_apply_failed
         return 3
     fi
@@ -935,47 +1012,69 @@ monitor_state_disable_internal_output() {
 
 monitor_state_restore_internal_layout() {
     local output=$1
-    local restore_expression
+    local restore_expression apply_output
+    local load_status
 
     MONITOR_STATE_ERROR=""
-    if ! monitor_state_prepare_directory; then
-        return 2
-    fi
-    if [[ ! -f "$MONITOR_STATE_FILE" || -L "$MONITOR_STATE_FILE" || \
-        ! -O "$MONITOR_STATE_FILE" ]]; then
-        monitor_state_fail snapshot_missing
-        return
+    if monitor_state_load_internal_layout_snapshot "$output"; then
+        :
+    else
+        load_status=$?
+        return "$load_status"
     fi
 
-    if ! restore_expression=$(jq -er --arg output "$output" '
-        def integer:
-            type == "number" and . == floor;
-        def output_name:
-            type == "string" and test("^[A-Za-z0-9_.:-]+$");
-
-        select(type == "object")
-        | select((keys | sort) ==
-            ["mirror", "mode", "output", "position", "scale", "transform"])
-        | select(.output == $output and (.output | output_name))
-        | select(.mode | type == "string" and
-            test("^[1-9][0-9]*x[1-9][0-9]*@[0-9]+([.][0-9]+)?$"))
-        | select(.position | type == "string" and
-            test("^-?[0-9]+x-?[0-9]+$"))
-        | select(.scale | type == "number" and . > 0 and . <= 10)
-        | select(.transform | integer and . >= 0 and . <= 7)
-        | select(.mirror == "" or (.mirror | output_name))
-        | "hl.monitor({ output = \(.output | @json), disabled = false, " +
+    if ! restore_expression=$(jq -er '
+        "hl.monitor({ output = \(.output | @json), disabled = false, " +
             "mode = \(.mode | @json), position = \(.position | @json), " +
             "scale = \(.scale), transform = \(.transform), " +
             "mirror = \(.mirror | @json) })"
-    ' "$MONITOR_STATE_FILE"); then
+    ' <<< "$MONITOR_STATE_SNAPSHOT"); then
         monitor_state_fail snapshot_invalid
         return
     fi
 
-    if ! hyprctl eval "$restore_expression"; then
+    if ! apply_output=$(hyprctl eval "$restore_expression"); then
         MONITOR_STATE_ERROR=restore_apply_failed
         return 3
+    fi
+    if [[ "$apply_output" != ok ]]; then
+        MONITOR_STATE_ERROR=restore_apply_failed
+        return 3
+    fi
+}
+
+monitor_state_enable_internal_dpms() {
+    local output=$1
+    local apply_output
+
+    MONITOR_STATE_ERROR=""
+    if [[ ! "$output" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+        monitor_state_fail internal_output_invalid
+        return
+    fi
+    if ! apply_output=$(hyprctl eval \
+        "hl.dispatch(hl.dsp.dpms({ action = \"enable\", monitor = \"$output\" }))"); then
+        MONITOR_STATE_ERROR=dpms_apply_failed
+        return 3
+    fi
+    if [[ "$apply_output" != ok ]]; then
+        MONITOR_STATE_ERROR=dpms_apply_failed
+        return 3
+    fi
+}
+
+monitor_state_cleanup_internal_layout() {
+    MONITOR_STATE_ERROR=""
+    if ! monitor_state_prepare_directory; then
+        return 2
+    fi
+    if [[ ! -e "$MONITOR_STATE_FILE" && ! -L "$MONITOR_STATE_FILE" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$MONITOR_STATE_FILE" || -L "$MONITOR_STATE_FILE" || \
+        ! -O "$MONITOR_STATE_FILE" ]]; then
+        monitor_state_fail snapshot_insecure
+        return
     fi
 
     if ! rm -f -- "$MONITOR_STATE_FILE"; then
@@ -1031,15 +1130,6 @@ fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 
-configure_clamshell_layout() {
-    monitor_state_capture_internal_layout "$LAPTOP_DISPLAY" || return
-    monitor_state_disable_internal_output "$LAPTOP_DISPLAY"
-}
-
-configure_dual_layout() {
-    monitor_state_restore_internal_layout "$LAPTOP_DISPLAY"
-}
-
 refresh_waybar_layout() {
     if pgrep -x waybar >/dev/null 2>&1; then
         pkill -x -SIGUSR1 waybar || {
@@ -1051,117 +1141,273 @@ refresh_waybar_layout() {
     fi
 }
 
-handle_lid_close() {
-    local internal_enabled enabled_external_count layout_status
+reconcile_lid_state() {
+    local action=$1
+    local preserve_dpms=$2
+    local internal_enabled enabled_external_count desired_internal
+    local post_external_count post_desired_internal snapshot_status
+    local wake_required=false desired_dpms=preserved
+    local mutation_status=0 mutation_reason=none
+    local layout_changed=false snapshot_involved=false noop_reason=""
+    local verified_internal verified_dpms topology_snapshot
 
-    log_info transition_started action=close
-
+    log_info transition_started action="$action"
     if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
-        log_error monitor_query_failed action=close reason="$MONITOR_STATE_ERROR"
+        log_error monitor_query_failed action="$action" reason="$MONITOR_STATE_ERROR"
+        log_error reconciliation_failed action="$action" phase=observe \
+            desired_internal=unknown status=2 reason="$MONITOR_STATE_ERROR"
         return 2
     fi
+
+    topology_snapshot=$MONITOR_STATE_TOPOLOGY
     internal_enabled=$(monitor_state_internal_enabled)
     enabled_external_count=$(monitor_state_enabled_external_count)
+    if [[ "$action" == close && "$enabled_external_count" -gt 0 ]]; then
+        desired_internal=disabled
+    else
+        desired_internal=enabled
+    fi
 
-    if (( enabled_external_count > 0 )); then
+    if [[ "$action" == open ]]; then
+        if [[ "$preserve_dpms" != true || "$internal_enabled" == false ]]; then
+            wake_required=true
+            desired_dpms=true
+        fi
+    fi
+
+    log_info reconciliation_attempt action="$action" \
+        desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+        enabled_external_count="$enabled_external_count" \
+        topology="$topology_snapshot"
+
+    if [[ "$desired_internal" == disabled ]]; then
         if [[ "$internal_enabled" == false ]]; then
-            log_info layout_noop action=close reason=internal_already_disabled \
-                enabled_external_count="$enabled_external_count"
-            return 0
-        fi
-
-        if configure_clamshell_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=close laptop=disabled \
-                enabled_external_count="$enabled_external_count"
-            return 0
-        else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
+            if monitor_state_load_internal_layout_snapshot "$LAPTOP_DISPLAY"; then
+                noop_reason=internal_already_disabled
             else
-                log_error layout_apply_failed action=close reason="$MONITOR_STATE_ERROR"
+                mutation_status=$?
+                mutation_reason=$MONITOR_STATE_ERROR
             fi
-            return "$layout_status"
-        fi
-    fi
-
-    if [[ "$internal_enabled" == false ]]; then
-        if configure_dual_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=close layout=internal_restored \
-                enabled_external_count=0
+        elif ! monitor_state_capture_internal_layout "$LAPTOP_DISPLAY"; then
+            mutation_status=2
+            mutation_reason=$MONITOR_STATE_ERROR
+        elif monitor_state_disable_internal_output "$LAPTOP_DISPLAY"; then
+            layout_changed=true
         else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
-            else
-                log_error layout_apply_failed action=close layout=internal_restored \
-                    reason="$MONITOR_STATE_ERROR"
-            fi
-            return "$layout_status"
+            mutation_status=$?
+            mutation_reason=$MONITOR_STATE_ERROR
         fi
     else
-        log_info layout_noop action=close reason=internal_already_enabled \
-            enabled_external_count=0
+        if [[ "$internal_enabled" == false ]]; then
+            if monitor_state_restore_internal_layout "$LAPTOP_DISPLAY"; then
+                layout_changed=true
+                snapshot_involved=true
+            else
+                mutation_status=$?
+                mutation_reason=$MONITOR_STATE_ERROR
+            fi
+        else
+            if monitor_state_snapshot_present; then
+                snapshot_involved=true
+                if monitor_state_internal_layout_matches_snapshot \
+                    "$LAPTOP_DISPLAY"; then
+                    noop_reason=internal_already_enabled
+                else
+                    snapshot_status=$?
+                    if (( snapshot_status == 1 )); then
+                        if monitor_state_restore_internal_layout \
+                            "$LAPTOP_DISPLAY"; then
+                            layout_changed=true
+                        else
+                            mutation_status=$?
+                            mutation_reason=$MONITOR_STATE_ERROR
+                        fi
+                    else
+                        mutation_status=$snapshot_status
+                        mutation_reason=$MONITOR_STATE_ERROR
+                    fi
+                fi
+            else
+                snapshot_status=$?
+                if (( snapshot_status == 1 )); then
+                    noop_reason=internal_already_enabled
+                else
+                    mutation_status=$snapshot_status
+                    mutation_reason=$MONITOR_STATE_ERROR
+                fi
+            fi
+        fi
+
+        if (( mutation_status == 0 )) && [[ "$wake_required" == true ]]; then
+            if monitor_state_enable_internal_dpms "$LAPTOP_DISPLAY"; then
+                :
+            else
+                mutation_status=$?
+                mutation_reason=$MONITOR_STATE_ERROR
+            fi
+        fi
     fi
-
-    log_info power_delegated owner=systemd-logind action=close \
-        reason=no_enabled_external
-}
-
-handle_lid_open() {
-    local internal_enabled enabled_external_count layout_status
-
-    log_info transition_started action=open
 
     if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
-        log_error monitor_query_failed action=open reason="$MONITOR_STATE_ERROR"
+        log_error monitor_query_failed action="$action" phase=postcondition \
+            reason="$MONITOR_STATE_ERROR"
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=2 reason="$MONITOR_STATE_ERROR" \
+            apply_status="$mutation_status" apply_reason="$mutation_reason"
         return 2
     fi
-    internal_enabled=$(monitor_state_internal_enabled)
-    enabled_external_count=$(monitor_state_enabled_external_count)
 
-    if [[ "$internal_enabled" == true ]]; then
-        log_info layout_noop action=open reason=internal_already_enabled \
-            enabled_external_count="$enabled_external_count"
-        return 0
+    topology_snapshot=$MONITOR_STATE_TOPOLOGY
+    verified_internal=$(monitor_state_internal_enabled)
+    if verified_dpms=$(monitor_state_internal_dpms); then
+        :
+    else
+        verified_dpms=unknown
+    fi
+    post_external_count=$(monitor_state_enabled_external_count)
+    if [[ "$action" == close && "$post_external_count" -gt 0 ]]; then
+        post_desired_internal=disabled
+    else
+        post_desired_internal=enabled
     fi
 
-    if configure_dual_layout; then
-        refresh_waybar_layout
-        log_info layout_applied action=open layout=restored \
+    if [[ "$post_desired_internal" != "$desired_internal" ]]; then
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" \
+            observed_desired_internal="$post_desired_internal" \
+            desired_dpms="$desired_dpms" status=4 reason=policy_changed \
+            topology="$topology_snapshot"
+        return 4
+    fi
+
+    if (( mutation_status != 0 )); then
+        if (( mutation_status == 2 )); then
+            log_error layout_snapshot_failed action="$action" \
+                reason="$mutation_reason"
+        else
+            log_error layout_apply_failed action="$action" \
+                reason="$mutation_reason"
+        fi
+        log_error reconciliation_failed action="$action" phase=apply \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status="$mutation_status" reason="$mutation_reason" \
+            topology="$topology_snapshot"
+        return "$mutation_status"
+    fi
+
+    if [[ "$desired_internal" == enabled && "$verified_internal" != true ]] || \
+        [[ "$desired_internal" == disabled && "$verified_internal" != false ]] || \
+        { [[ "$wake_required" == true ]] && [[ "$verified_dpms" != true ]]; }; then
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=4 reason=postcondition_mismatch topology="$topology_snapshot"
+        return 4
+    fi
+
+    if [[ "$desired_internal" == disabled ]] && \
+        ! monitor_state_load_internal_layout_snapshot "$LAPTOP_DISPLAY"; then
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=2 reason="$MONITOR_STATE_ERROR" topology="$topology_snapshot"
+        return 2
+    fi
+
+    if [[ "$snapshot_involved" == true ]]; then
+        if monitor_state_internal_layout_matches_snapshot "$LAPTOP_DISPLAY"; then
+            :
+        else
+            snapshot_status=$?
+            if (( snapshot_status == 1 )); then
+                log_error reconciliation_failed action="$action" \
+                    phase=postcondition desired_internal="$desired_internal" \
+                    desired_dpms="$desired_dpms" status=4 \
+                    reason=layout_postcondition_mismatch \
+                    topology="$topology_snapshot"
+                return 4
+            fi
+            log_error reconciliation_failed action="$action" \
+                phase=postcondition desired_internal="$desired_internal" \
+                desired_dpms="$desired_dpms" status=2 \
+                reason="$MONITOR_STATE_ERROR" topology="$topology_snapshot"
+            return 2
+        fi
+    fi
+
+    if [[ "$snapshot_involved" == true ]] && \
+        ! monitor_state_cleanup_internal_layout; then
+        log_error layout_snapshot_failed action="$action" \
+            reason="$MONITOR_STATE_ERROR"
+        log_error reconciliation_failed action="$action" phase=snapshot_cleanup \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=2 reason="$MONITOR_STATE_ERROR" topology="$topology_snapshot"
+        return 2
+    fi
+
+    if [[ -n "$noop_reason" ]]; then
+        log_info layout_noop action="$action" reason="$noop_reason" \
+            enabled_external_count="$enabled_external_count"
+    elif [[ "$desired_internal" == disabled ]]; then
+        log_info layout_applied action="$action" laptop=disabled \
             enabled_external_count="$enabled_external_count"
     else
-        layout_status=$?
-        if (( layout_status == 2 )); then
-            log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
-        else
-            log_error layout_apply_failed action=open layout=restored reason="$MONITOR_STATE_ERROR"
-        fi
-        return "$layout_status"
+        log_info layout_applied action="$action" layout=internal_restored \
+            enabled_external_count="$enabled_external_count"
     fi
+
+    if [[ "$layout_changed" == true ]]; then
+        refresh_waybar_layout
+    fi
+    if [[ "$action" == close && "$enabled_external_count" -eq 0 ]]; then
+        log_info power_delegated owner=systemd-logind action=close \
+            reason=no_enabled_external
+    fi
+    log_info reconciliation_verified action="$action" \
+        desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+        topology="$topology_snapshot"
 }
+
+preserve_dpms=false
+if [[ "${1:-}" == --preserve-dpms ]]; then
+    preserve_dpms=true
+    shift
+fi
+
+if (( $# > 1 )); then
+    log_error invalid_arguments status=1
+    exit 1
+fi
 
 case "${1:-}" in
-    "close")
-        handle_lid_close
-        ;;
-    "open")
-        handle_lid_open
-        ;;
-    *)
-        if ! lid_state=$(read_lid_state); then
-            log_error lid_state_unknown action=auto
+    close|closed)
+        if [[ "$preserve_dpms" == true ]]; then
+            log_error invalid_arguments status=1 reason=preserve_dpms_requires_open
             exit 1
         fi
-        log_info lid_state_detected state="$lid_state"
-        
-        if [[ "$lid_state" == "closed" ]]; then
-            handle_lid_close
-        else
-            handle_lid_open
+        reconcile_lid_state close false
+        ;;
+    open)
+        reconcile_lid_state open "$preserve_dpms"
+        ;;
+    "")
+        if [[ "$preserve_dpms" == true ]]; then
+            log_error invalid_arguments status=1 reason=preserve_dpms_requires_open
+            exit 1
         fi
+        if ! lid_state=$(read_lid_state); then
+            log_error lid_state_unknown action=auto status=2
+            exit 2
+        fi
+        log_info lid_state_detected state="$lid_state"
+        if [[ "$lid_state" == closed ]]; then
+            reconcile_lid_state close false
+        else
+            reconcile_lid_state open false
+        fi
+        ;;
+    *)
+        log_error invalid_arguments status=1 action="${1:-}"
+        exit 1
         ;;
 esac
 EOF
@@ -1366,12 +1612,11 @@ install_lid_monitor_script() {
     cat > "$SCRIPTS_DIR/lid-monitor.sh" << 'EOF'
 #!/bin/bash
 
-# Hyprland Lid State Monitor
-# This script continuously monitors the lid state and triggers the appropriate action
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LID_SWITCH_SCRIPT="$SCRIPT_DIR/lid-switch.sh"
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
+MAX_RECONCILIATION_ATTEMPTS=3
+RECONCILIATION_COOLDOWN_TICKS=5
 
 log_record() {
     local level=$1
@@ -1403,23 +1648,13 @@ observe_lid_state() {
         observation_status=$?
     fi
 
-    observed_state="unknown"
+    observed_state=unknown
     case "$observation_status" in
-        2)
-            observed_error="missing"
-            ;;
-        3)
-            observed_error="unreadable"
-            ;;
-        4)
-            observed_error="malformed"
-            ;;
-        5)
-            observed_error="conflicting"
-            ;;
-        *)
-            observed_error="unknown"
-            ;;
+        2) observed_error=missing ;;
+        3) observed_error=unreadable ;;
+        4) observed_error=malformed ;;
+        5) observed_error=conflicting ;;
+        *) observed_error=unknown ;;
     esac
     return "$observation_status"
 }
@@ -1433,57 +1668,156 @@ observe_topology() {
             return 0
         fi
         observation_status=$?
-        observed_topology_error="topology_fingerprint_failed"
+        observed_topology_error=topology_fingerprint_failed
     else
         observation_status=$?
-        observed_topology_error="$MONITOR_STATE_ERROR"
+        observed_topology_error=$MONITOR_STATE_ERROR
     fi
 
     observed_topology=""
     return "$observation_status"
 }
 
-reconcile_current_joint_state() {
+observe_joint_state() {
     local trigger=$1
-    local reconciliation_status
+    local observation_status
 
     current_state=""
     current_topology=""
-
     if observe_lid_state; then
-        current_state="$observed_state"
+        current_state=$observed_state
         previous_lid_error=""
     else
-        reconciliation_status=$?
-        previous_lid_error="$observed_error"
+        observation_status=$?
+        previous_lid_error=$observed_error
         log_error lid_state_observation_failed reason="$observed_error" \
             trigger="$trigger"
-        return "$reconciliation_status"
+        return 2
     fi
 
     if observe_topology; then
-        current_topology="$observed_topology"
+        current_topology=$observed_topology
         previous_topology_error=""
     else
-        reconciliation_status=$?
-        previous_topology_error="$observed_topology_error"
+        observation_status=$?
+        previous_topology_error=$observed_topology_error
         log_error topology_observation_failed reason="$observed_topology_error" \
             trigger="$trigger"
+        return 2
+    fi
+}
+
+observed_joint_state_matches_policy() {
+    local state=$1
+    local require_dpms=$2
+    local internal_enabled enabled_external_count internal_dpms
+
+    internal_enabled=$(jq -er '.internal.enabled | tostring' \
+        <<< "$current_topology") || return 1
+    enabled_external_count=$(jq -er \
+        '[.externals[] | select(.enabled)] | length' \
+        <<< "$current_topology") || return 1
+
+    if [[ "$state" == closed && "$enabled_external_count" -gt 0 ]]; then
+        [[ "$internal_enabled" == false ]] || return 1
+    else
+        [[ "$internal_enabled" == true ]] || return 1
+    fi
+    if [[ "$state" == open && "$require_dpms" == true ]]; then
+        internal_dpms=$(monitor_state_internal_dpms) || return 1
+        [[ "$internal_dpms" == true ]] || return 1
+    fi
+}
+
+apply_observed_joint_state() {
+    local trigger=$1
+    local attempt=$2
+    local preserve_dpms=$3
+    local attempted_state=$current_state
+    local attempted_topology=$current_topology
+    local attempted_internal wake_required=false
+    local reconciliation_status
+
+    log_info reconciliation_started trigger="$trigger" attempt="$attempt" \
+        state="$attempted_state" preserve_dpms="$preserve_dpms" \
+        topology="$attempted_topology"
+    if [[ "$attempted_state" == open && "$preserve_dpms" == true ]]; then
+        "$LID_SWITCH_SCRIPT" --preserve-dpms open
+        reconciliation_status=$?
+    else
+        "$LID_SWITCH_SCRIPT" "$attempted_state"
+        reconciliation_status=$?
+    fi
+
+    if (( reconciliation_status != 0 )); then
+        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+            state="$attempted_state" status="$reconciliation_status" \
+            applied_ready="$applied_ready"
         return "$reconciliation_status"
     fi
 
-    log_info reconciliation_started trigger="$trigger" state="$current_state" \
-        topology="$current_topology"
-    if "$LID_SWITCH_SCRIPT" "$current_state"; then
-        log_info reconciliation_succeeded trigger="$trigger" state="$current_state"
-        return 0
+    if observe_joint_state post_action; then
+        :
     else
         reconciliation_status=$?
+        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+            state="$attempted_state" status="$reconciliation_status" \
+            reason=post_action_observation_failed applied_ready="$applied_ready"
+        return "$reconciliation_status"
+    fi
+    if [[ "$current_state" != "$attempted_state" ]]; then
+        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+            state="$attempted_state" status=4 \
+            reason=lid_state_changed_during_reconciliation \
+            observed_state="$current_state" applied_ready="$applied_ready"
+        return 4
+    fi
+    attempted_internal=$(jq -er '.internal.enabled | tostring' \
+        <<< "$attempted_topology")
+    if [[ "$attempted_state" == open ]] && \
+        { [[ "$preserve_dpms" != true ]] || \
+            [[ "$attempted_internal" == false ]]; }; then
+        wake_required=true
+    fi
+    if ! observed_joint_state_matches_policy "$attempted_state" \
+        "$wake_required"; then
+        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+            state="$attempted_state" status=4 \
+            reason=post_action_policy_mismatch topology="$current_topology" \
+            applied_ready="$applied_ready"
+        return 4
     fi
 
-    log_error reconciliation_failed trigger="$trigger" state="$current_state" \
-        status="$reconciliation_status"
-    return "$reconciliation_status"
+    applied_state=$current_state
+    applied_topology=$current_topology
+    applied_ready=true
+    log_info reconciliation_succeeded trigger="$trigger" attempt="$attempt" \
+        state="$applied_state" topology="$applied_topology"
+}
+
+run_reconciliation_attempt() {
+    local trigger=$1
+    local attempt=$2
+    local preserve_dpms=$3
+    local reconciliation_status
+
+    if observe_joint_state "$trigger"; then
+        :
+    else
+        reconciliation_status=$?
+        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+            state=unknown status="$reconciliation_status" applied_ready="$applied_ready"
+        return "$reconciliation_status"
+    fi
+    apply_observed_joint_state "$trigger" "$attempt" "$preserve_dpms"
+}
+
+record_last_observed_state() {
+    if [[ -n "$current_state" && -n "$current_topology" ]]; then
+        last_observed_state=$current_state
+        last_observed_topology=$current_topology
+        last_observed_ready=true
+    fi
 }
 
 if ! . "$SCRIPT_DIR/lid-state.sh"; then
@@ -1491,7 +1825,7 @@ if ! . "$SCRIPT_DIR/lid-state.sh"; then
     exit 1
 fi
 
-if [[ "${1:-}" == "--print-state" ]]; then
+if [[ "${1:-}" == --print-state ]]; then
     read_lid_state
     exit $?
 fi
@@ -1501,87 +1835,127 @@ if ! . "$SCRIPT_DIR/monitor-state.sh"; then
     exit 1
 fi
 
-if [[ "${1:-}" == "--once" ]]; then
-    previous_lid_error=""
-    previous_topology_error=""
-    reconcile_current_joint_state once
-    exit $?
-fi
-
-# Reconcile the first complete joint observation before establishing the
-# baseline used to detect later lid or topology changes.
-baseline_ready=false
-previous_state="unknown"
-previous_topology=""
+applied_ready=false
+applied_state=unknown
+applied_topology=""
+last_observed_ready=false
+last_observed_state=unknown
+last_observed_topology=""
 previous_lid_error=""
 previous_topology_error=""
 current_state=""
 current_topology=""
 
-reconcile_current_joint_state startup || true
-if [[ -n "$current_state" && -n "$current_topology" ]]; then
-    previous_state="$current_state"
-    previous_topology="$current_topology"
-    baseline_ready=true
+if [[ "${1:-}" == --once ]]; then
+    reconciliation_status=2
+    for ((attempt = 1; attempt <= MAX_RECONCILIATION_ATTEMPTS; attempt++)); do
+        if run_reconciliation_attempt once "$attempt" true; then
+            exit 0
+        else
+            reconciliation_status=$?
+        fi
+        if (( reconciliation_status == 1 )); then
+            log_error reconciliation_fatal trigger=once attempt="$attempt" \
+                status=1 reason=contract_or_initialization_failure
+            exit 1
+        fi
+        if (( attempt < MAX_RECONCILIATION_ATTEMPTS )); then
+            sleep 0.05
+        fi
+    done
+    log_error reconciliation_exhausted trigger=once \
+        attempt="$MAX_RECONCILIATION_ATTEMPTS" status="$reconciliation_status"
+    exit "$reconciliation_status"
 fi
-log_info monitor_started state="$previous_state" \
-    topology="${previous_topology:-unavailable}" baseline_ready="$baseline_ready"
+
+pending_reconciliation=true
+pending_preserve_dpms=true
+burst_attempts=0
+cooldown_ticks=0
+
+burst_attempts=1
+if run_reconciliation_attempt startup "$burst_attempts" "$pending_preserve_dpms"; then
+    pending_reconciliation=false
+    burst_attempts=0
+else
+    reconciliation_status=$?
+    if (( reconciliation_status == 1 )); then
+        log_error reconciliation_fatal trigger=startup attempt=1 status=1 \
+            reason=contract_or_initialization_failure
+        exit 1
+    fi
+fi
+record_last_observed_state
+log_info monitor_started observed_state="$last_observed_state" \
+    observed_topology="${last_observed_topology:-unavailable}" \
+    applied_ready="$applied_ready" applied_state="$applied_state" \
+    applied_topology="${applied_topology:-unavailable}"
 
 while true; do
-    if observe_lid_state; then
-        current_state="$observed_state"
-        previous_lid_error=""
-    else
-        if [[ "$observed_error" != "$previous_lid_error" ]]; then
-            log_error lid_state_observation_failed reason="$observed_error"
-        fi
-        previous_lid_error="$observed_error"
+    if ! observe_joint_state poll; then
         sleep 1
         continue
     fi
 
-    if observe_topology; then
-        current_topology="$observed_topology"
-        previous_topology_error=""
-    else
-        if [[ "$observed_topology_error" != "$previous_topology_error" ]]; then
-            log_error topology_observation_failed reason="$observed_topology_error"
-        fi
-        previous_topology_error="$observed_topology_error"
-        sleep 1
-        continue
-    fi
-
-    if [[ "$baseline_ready" != true ]]; then
-        previous_state="$current_state"
-        previous_topology="$current_topology"
-        baseline_ready=true
+    if [[ "$last_observed_ready" != true ]]; then
+        pending_reconciliation=true
+        pending_preserve_dpms=true
+        burst_attempts=0
+        cooldown_ticks=0
         log_info joint_state_baselined state="$current_state" \
             topology="$current_topology"
-        sleep 1
-        continue
-    fi
-
-    if [[ "$current_state" != "$previous_state" || \
-        "$current_topology" != "$previous_topology" ]]; then
-        detected_state="$current_state"
-        detected_topology="$current_topology"
-        log_info joint_state_changed previous_state="$previous_state" \
+    elif [[ "$current_state" != "$last_observed_state" || \
+        "$current_topology" != "$last_observed_topology" ]]; then
+        log_info joint_state_changed previous_state="$last_observed_state" \
             current_state="$current_state" \
-            previous_topology="$previous_topology" \
+            previous_topology="$last_observed_topology" \
             current_topology="$current_topology"
-
-        if [[ "$current_state" != "$previous_state" ]]; then
-            log_info lid_state_changed previous="$previous_state" current="$current_state"
+        if [[ "$current_state" != "$last_observed_state" ]]; then
+            log_info lid_state_changed previous="$last_observed_state" \
+                current="$current_state"
+            if [[ "$last_observed_state" == closed && "$current_state" == open ]]; then
+                pending_preserve_dpms=false
+            else
+                pending_preserve_dpms=true
+            fi
+        elif [[ "$current_state" == open && "$pending_reconciliation" != true ]]; then
+            pending_preserve_dpms=true
         fi
+        pending_reconciliation=true
+        burst_attempts=0
+        cooldown_ticks=0
+    fi
+    record_last_observed_state
 
-        reconcile_current_joint_state joint_change || true
-        if [[ -n "$current_state" && -n "$current_topology" ]]; then
-            previous_state="$current_state"
-            previous_topology="$current_topology"
+    if [[ "$pending_reconciliation" == true ]]; then
+        if (( cooldown_ticks > 0 )); then
+            cooldown_ticks=$((cooldown_ticks - 1))
+            log_info reconciliation_cooldown_tick ticks_remaining="$cooldown_ticks"
+            if (( cooldown_ticks == 0 )); then
+                burst_attempts=0
+                log_info reconciliation_rearmed reason=cooldown_elapsed
+            fi
         else
-            previous_state="$detected_state"
-            previous_topology="$detected_topology"
+            burst_attempts=$((burst_attempts + 1))
+            if apply_observed_joint_state pending "$burst_attempts" \
+                "$pending_preserve_dpms"; then
+                pending_reconciliation=false
+                pending_preserve_dpms=true
+                burst_attempts=0
+                record_last_observed_state
+            else
+                reconciliation_status=$?
+                if (( reconciliation_status == 1 )); then
+                    log_error reconciliation_fatal trigger=pending \
+                        attempt="$burst_attempts" status=1 \
+                        reason=contract_or_initialization_failure
+                    exit 1
+                elif (( burst_attempts >= MAX_RECONCILIATION_ATTEMPTS )); then
+                    cooldown_ticks=$RECONCILIATION_COOLDOWN_TICKS
+                    log_error reconciliation_cooldown_started \
+                        ticks="$cooldown_ticks" applied_ready="$applied_ready"
+                fi
+            fi
         fi
     fi
 
@@ -1618,6 +1992,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=arch-lidswitch
 Restart=on-failure
+RestartPreventExitStatus=1
 RestartSec=2
 
 [Install]

@@ -393,8 +393,8 @@ installed_cli_reconciles_closed_topology_without_external_mutation() (
                 "$label" "$runtime_status" "$runtime_output" >&2
             return 1
         fi
-        if (( query_count != 1 )); then
-            printf 'expected %s to use one topology query, got %d\n%s\n' \
+        if (( query_count != 2 )); then
+            printf 'expected %s to use pre/post topology queries, got %d\n%s\n' \
                 "$label" "$query_count" "$effects" >&2
             return 1
         fi
@@ -512,27 +512,26 @@ installed_daemon_observes_joint_lid_and_topology_changes() (
         > "$test_root/installer.out" 2>&1
     installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
 
-    # Startup observes and reconciles the undocked state. Each later change is
-    # observed once by the loop and again by the shared reconciliation path;
-    # lid-switch then performs its own current-topology query.
+    # Startup and every changed joint state receive a child pre/post query and
+    # a daemon post-action observation. The failed poll stays pending without
+    # consuming or corrupting the later topology transitions.
     printf '%s\n' "$undocked_enabled" > "$sequence_dir/0.json"
     printf '%s\n' "$undocked_enabled" > "$sequence_dir/1.json"
-    printf '%s\n' '__FAIL__' > "$sequence_dir/2.json"
-    printf '%s\n' "$inactive" > "$sequence_dir/3.json"
-    printf '%s\n' "$inactive" > "$sequence_dir/4.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/2.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/3.json"
+    printf '%s\n' '__FAIL__' > "$sequence_dir/4.json"
     printf '%s\n' "$inactive" > "$sequence_dir/5.json"
-    printf '%s\n' "$docked" > "$sequence_dir/6.json"
-    printf '%s\n' "$docked" > "$sequence_dir/7.json"
-    printf '%s\n' "$docked" > "$sequence_dir/8.json"
-    printf '%s\n' "$docked_disabled" > "$sequence_dir/9.json"
-    printf '%s\n' "$docked_disabled" > "$sequence_dir/10.json"
+    printf '%s\n' "$inactive" > "$sequence_dir/6.json"
+    printf '%s\n' "$inactive" > "$sequence_dir/7.json"
+    printf '%s\n' "$inactive" > "$sequence_dir/8.json"
+    printf '%s\n' "$docked" > "$sequence_dir/9.json"
+    printf '%s\n' "$docked" > "$sequence_dir/10.json"
     printf '%s\n' "$docked_disabled" > "$sequence_dir/11.json"
-    printf '%s\n' "$undocked_disabled" > "$sequence_dir/12.json"
+    printf '%s\n' "$docked_disabled" > "$sequence_dir/12.json"
     printf '%s\n' "$undocked_disabled" > "$sequence_dir/13.json"
     printf '%s\n' "$undocked_disabled" > "$sequence_dir/14.json"
     printf '%s\n' "$undocked_enabled" > "$sequence_dir/15.json"
     printf '%s\n' "$undocked_enabled" > "$sequence_dir/16.json"
-    printf '%s\n' "$undocked_enabled" > "$sequence_dir/17.json"
     printf '%s\n' "$undocked_enabled" > "$sequence_dir/final.json"
     printf '%s\n' 0 > "$sequence_counter"
 
@@ -802,11 +801,12 @@ installed_daemon_once_refuses_invalid_joint_observations() (
             "$runtime_status" "$runtime_output" >&2
         failures=$((failures + 1))
     fi
-    if [[ -s "$effect_log" ]]; then
-        printf 'missing lid state caused external effects:\n%s\n' \
-            "$(<"$effect_log")" >&2
-        failures=$((failures + 1))
-    fi
+    assert_not_contains "$(<"$effect_log")" $'hyprctl\t' \
+        'missing lid retries must not query or mutate the compositor' \
+        || failures=$((failures + 1))
+    assert_not_contains "$(<"$effect_log")" $'systemctl\t' \
+        'missing lid retries must not request power' \
+        || failures=$((failures + 1))
 
     printf '%s\n' "$framework" > "$sequence_dir/0.json"
     printf '%s\n' '__FAIL__' > "$sequence_dir/1.json"
@@ -832,13 +832,13 @@ installed_daemon_once_refuses_invalid_joint_observations() (
             "$runtime_status" "$runtime_output" >&2
         failures=$((failures + 1))
     fi
-    if (( query_count != 2 )); then
-        printf 'expected one joint query plus one child query, got %d\n%s\n' \
+    if (( query_count != 4 )); then
+        printf 'expected the bounded joint/child query attempts, got %d\n%s\n' \
             "$query_count" "$effects" >&2
         failures=$((failures + 1))
     fi
     assert_contains "$runtime_output" \
-        'event=reconciliation_failed trigger=once state=closed status=2' \
+        'event=reconciliation_failed trigger=once attempt=1 state=closed status=2' \
         '--once should expose the installed lid-switch failure status' \
         || failures=$((failures + 1))
     assert_not_contains "$effects" $'monitor\t' \
@@ -924,7 +924,7 @@ installed_normal_daemon_reconciles_before_first_edge() (
         failures=$((failures + 1))
     fi
     assert_contains "$runtime_output" \
-        'event=reconciliation_succeeded trigger=startup state=closed' \
+        'event=reconciliation_succeeded trigger=startup attempt=1 state=closed' \
         'normal daemon startup should report successful immediate reconciliation' \
         || failures=$((failures + 1))
     assert_not_contains "$runtime_output" 'event=joint_state_changed' \
@@ -1721,6 +1721,9 @@ installed_lid_state_matches_expected_behavior() (
         return 1
     fi
 
+    rm -f "$effect_log.monitors-state.json" \
+        "$effect_log.monitors-state.json.requested"
+
     : > "$effect_log"
     "$ENV_BIN" -i \
         HOME="$home" \
@@ -1924,8 +1927,8 @@ installer_matches_fixture_expectation() (
                 return 1
             fi
             assert_contains "$effects" \
-                $'hyprctl\teval\tassert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")' \
-                'successful installation should prove the typed hl.monitor contract' \
+                $'hyprctl\teval\tassert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")' \
+                'successful installation should prove the typed monitor and DPMS API contract' \
                 || return 1
             assert_not_contains "$effects" $'monitor\t' \
                 'the Hyprland capability probe must not mutate monitor state' \
@@ -2297,7 +2300,7 @@ installer_rejects_non_array_hyprland_monitors() {
 
 installer_rejects_unavailable_hl_monitor_api() {
     installer_hyprland_profile_is_rejected \
-        'Hyprland Lua capability probe failed: hl.monitor is unavailable' \
+        'Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable' \
         'TEST_HYPRCTL_CAPABILITY_EVAL_OUTPUT=error: hl.monitor unavailable'
 }
 
@@ -2576,6 +2579,9 @@ installed_session_lifecycle_is_bound_to_hyprland() (
         || failures=$((failures + 1))
     assert_contains "$unit_contents" 'Restart=on-failure' \
         'the session daemon should restart only after failures' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'RestartPreventExitStatus=1' \
+        'permanent runtime contract failures must not enter a systemd restart loop' \
         || failures=$((failures + 1))
     assert_contains "$unit_contents" 'WantedBy=graphical-session.target' \
         'the installed daemon should be enabled by the graphical session' \
@@ -2929,6 +2935,638 @@ installer_migrates_only_the_legacy_default_target_service() (
         'the migrated unit should no longer retain the early-login enablement target'
 )
 
+write_monitor_sequence() {
+    local sequence_dir=$1
+    local sequence_counter=$2
+    local sequence_index=0
+    local sequence_value final_value
+
+    shift 2
+    rm -f "$sequence_dir"/*.json
+    for sequence_value in "$@"; do
+        printf '%s\n' "$sequence_value" > \
+            "$sequence_dir/$sequence_index.json"
+        final_value=$sequence_value
+        sequence_index=$((sequence_index + 1))
+    done
+    printf '%s\n' "$final_value" > "$sequence_dir/final.json"
+    printf '%s\n' 0 > "$sequence_counter"
+}
+
+write_internal_layout_snapshot() {
+    local runtime_dir=$1
+    local snapshot_dir="$runtime_dir/arch-lidswitch"
+    local snapshot_file="$snapshot_dir/internal-layout.json"
+
+    mkdir -m 0700 -p "$snapshot_dir"
+    printf '%s\n' \
+        '{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}' \
+        > "$snapshot_file"
+    chmod 0600 "$snapshot_file"
+}
+
+installed_cli_verifies_postconditions_and_dpms() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir monitor_fixture
+    local sequence_dir sequence_counter framework disabled asleep awake invalid_dpms installed_cli
+    local snapshot_file runtime_status output effects query_count command_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    sequence_dir="$test_root/topology-sequence"
+    sequence_counter="$test_root/topology-counter"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    disabled=$(jq -c 'map(if .name == "eDP-1" then
+        .disabled = true | .dpmsStatus = false else . end)' <<< "$framework")
+    asleep=$(jq -c 'map(if .name == "eDP-1" then
+        .dpmsStatus = false else . end)' <<< "$framework")
+    awake=$framework
+    invalid_dpms=$(jq -c 'map(if .name == "eDP-1" then
+        .dpmsStatus = "true" else . end)' <<< "$framework")
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$invalid_dpms"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        "$installed_cli" open > "$test_root/invalid-dpms.out" 2>&1 \
+        || runtime_status=$?
+    if (( runtime_status != 2 )); then
+        printf 'non-boolean DPMS evidence should fail 2, got %d\n%s\n' \
+            "$runtime_status" "$(<"$test_root/invalid-dpms.out")" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$(<"$effect_log")" $'dpms\t' \
+        'invalid DPMS evidence must remain nonmutating' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        "$installed_cli" close > "$test_root/wrong.out" 2>&1 \
+        || runtime_status=$?
+    output=$(<"$test_root/wrong.out")
+    effects=$(<"$effect_log")
+    query_count=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
+        "$effect_log" || true)
+    command_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
+    if (( runtime_status != 4 || query_count != 2 || command_count != 1 )); then
+        printf 'wrong postcondition should fail 4 after one apply/verify, got status=%d queries=%d commands=%d\n%s\n%s\n' \
+            "$runtime_status" "$query_count" "$command_count" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" 'desired_internal=disabled' \
+        'postcondition failure should record the desired internal state' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'reason=postcondition_mismatch' \
+        'postcondition failure should expose its reason' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'topology=' \
+        'postcondition failure should retain the verified topology snapshot' \
+        || failures=$((failures + 1))
+    if [[ ! -f "$snapshot_file" ]]; then
+        printf 'failed close verification discarded its recovery snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    write_internal_layout_snapshot "$runtime_dir"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$awake"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        "$installed_cli" open > "$test_root/open.out" 2>&1 \
+        || runtime_status=$?
+    output=$(<"$test_root/open.out")
+    effects=$(<"$effect_log")
+    if (( runtime_status != 0 )); then
+        printf 'targeted open should verify successfully, got %d\n%s\n' \
+            "$runtime_status" "$output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" \
+        $'hyprctl\teval\thl.dispatch(hl.dsp.dpms({ action = "enable", monitor = "eDP-1" }))' \
+        'explicit open should use the Hyprland 0.55 targeted DPMS Lua API' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'dpms\toutput=eDP-1\tstate=on' \
+        'explicit open should target only the internal output for wake' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'desired_dpms=true' \
+        'successful explicit open should log its verified DPMS postcondition' \
+        || failures=$((failures + 1))
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+        printf 'verified open did not clean its restored snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$asleep" "$asleep"
+    printf '%s\n' 0 > "$test_root/dpms-counter"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        TEST_HYPRCTL_DPMS_FAILURES=1 \
+        TEST_HYPRCTL_DPMS_COUNTER="$test_root/dpms-counter" \
+        "$installed_cli" open > "$test_root/dpms-failed.out" 2>&1 \
+        || runtime_status=$?
+    effects=$(<"$effect_log")
+    query_count=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
+        "$effect_log" || true)
+    if (( runtime_status != 3 || query_count != 2 )); then
+        printf 'failed DPMS command should verify once and fail 3, got status=%d queries=%d\n%s\n' \
+            "$runtime_status" "$query_count" \
+            "$(<"$test_root/dpms-failed.out")" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$asleep" "$awake"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        TEST_HYPRCTL_DPMS_OUTPUT=error \
+        "$installed_cli" open > "$test_root/dpms-non-ok.out" 2>&1 \
+        || runtime_status=$?
+    if (( runtime_status != 3 )); then
+        printf 'exit-zero/non-ok DPMS output should fail 3, got %d\n%s\n' \
+            "$runtime_status" "$(<"$test_root/dpms-non-ok.out")" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        TEST_HYPRCTL_EVAL_OUTPUT=error \
+        "$installed_cli" close > "$test_root/eval-non-ok.out" 2>&1 \
+        || runtime_status=$?
+    if (( runtime_status != 3 )); then
+        printf 'exit-zero/non-ok monitor output should fail 3, got %d\n%s\n' \
+            "$runtime_status" "$(<"$test_root/eval-non-ok.out")" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_internal_layout_snapshot "$runtime_dir"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$disabled"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        "$installed_cli" open > "$test_root/restore-failed.out" 2>&1 \
+        || runtime_status=$?
+    if (( runtime_status != 4 )) || [[ ! -f "$snapshot_file" ]]; then
+        printf 'failed restore verification should retain snapshot (status=%d exists=%s)\n%s\n' \
+            "$runtime_status" "$([[ -f "$snapshot_file" ]] && printf yes || printf no)" \
+            "$(<"$test_root/restore-failed.out")" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$awake"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        "$installed_cli" open > "$test_root/restore-recovered.out" 2>&1 \
+        || runtime_status=$?
+    if (( runtime_status != 0 )) || [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+        printf 'recovered restore should verify and clean snapshot (status=%d)\n%s\n' \
+            "$runtime_status" "$(<"$test_root/restore-recovered.out")" >&2
+        failures=$((failures + 1))
+    fi
+    effects=$(<"$effect_log")
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'BUG-010 recovery must not mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'BUG-010 recovery must not request a power action' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_daemon_once_bounds_and_recovers_transient_failures() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture sequence_dir sequence_counter framework disabled
+    local laptop_enabled laptop_disabled installed_daemon
+    local runtime_status output effects query_count command_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    sequence_dir="$test_root/topology-sequence"
+    sequence_counter="$test_root/topology-counter"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    disabled=$(jq -c 'map(if .name == "eDP-1" then
+        .disabled = true | .dpmsStatus = false else . end)' <<< "$framework")
+    laptop_enabled=$(jq -c '[.[] | select(.name == "eDP-1")]' \
+        <<< "$framework")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = false]' <<< "$framework")
+
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework" "$framework" \
+        "$framework" "$framework" "$framework" \
+        "$framework" "$framework" "$framework"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once > "$test_root/bounded.out" 2>&1 \
+        || runtime_status=$?
+    output=$(<"$test_root/bounded.out")
+    effects=$(<"$effect_log")
+    query_count=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
+        "$effect_log" || true)
+    command_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
+    if (( runtime_status != 4 || query_count != 9 || command_count != 3 )); then
+        printf '%s\n' "--once should stop after three failed attempts, got status=$runtime_status queries=$query_count commands=$command_count" \
+            "$output" "$effects" \
+            >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" 'attempt=3' \
+        '--once terminal failure should identify the bounded third attempt' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'sleep\t1' \
+        '--once must not enter the unbounded daemon loop' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" '__FAIL__' \
+        "$framework" "$framework" "$disabled" "$disabled"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once > "$test_root/query-recovered.out" 2>&1 \
+        || runtime_status=$?
+    if (( runtime_status != 0 )); then
+        printf 'transient query failure did not recover: %d\n%s\n' \
+            "$runtime_status" "$(<"$test_root/query-recovered.out")" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$(<"$test_root/query-recovered.out")" 'attempt=2' \
+        'query recovery should be recorded on the second attempt' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework" "$framework" \
+        "$framework" "$framework" "$disabled" "$disabled"
+    printf '%s\n' 0 > "$test_root/eval-counter"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        TEST_HYPRCTL_EVAL_FAILURES=1 \
+        TEST_HYPRCTL_EVAL_COUNTER="$test_root/eval-counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once > "$test_root/apply-recovered.out" 2>&1 \
+        || runtime_status=$?
+    if (( runtime_status != 0 )); then
+        printf 'transient apply failure did not recover: %d\n%s\n' \
+            "$runtime_status" "$(<"$test_root/apply-recovered.out")" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework" "$framework" \
+        "$framework" "$framework" "$disabled" "$disabled"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once > "$test_root/post-recovered.out" 2>&1 \
+        || runtime_status=$?
+    effects=$(<"$effect_log")
+    command_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
+    if (( runtime_status != 0 || command_count != 2 )); then
+        printf 'transient postcondition failure did not recover: status=%d commands=%d\n%s\n' \
+            "$runtime_status" "$command_count" \
+            "$(<"$test_root/post-recovered.out")" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$(<"$test_root/post-recovered.out")" 'attempt=2' \
+        'postcondition recovery should be recorded on the second attempt' \
+        || failures=$((failures + 1))
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework" "$disabled" "$laptop_disabled" \
+        "$laptop_disabled" "$laptop_disabled" \
+        "$laptop_enabled" "$laptop_enabled"
+    runtime_status=0
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once > "$test_root/policy-race.out" 2>&1 \
+        || runtime_status=$?
+    output=$(<"$test_root/policy-race.out")
+    if (( runtime_status != 0 )); then
+        printf 'post-action topology race did not remain pending and recover: %d\n%s\n' \
+            "$runtime_status" "$output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" 'reason=post_action_policy_mismatch' \
+        'daemon must not mark a stale child postcondition as applied' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'trigger=once attempt=2' \
+        'post-action policy mismatch should retry with the fresh joint state' \
+        || failures=$((failures + 1))
+    effects=$(<"$effect_log")
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'bounded retries must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'bounded retries must never request a power action' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_daemon_separates_observed_applied_and_dpms_state() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture sequence_dir sequence_counter framework disabled asleep
+    local installed_daemon output command_count started_count lid_writer failures=0
+    local -a sequence_values=()
+    local sequence_index
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    sequence_dir="$test_root/topology-sequence"
+    sequence_counter="$test_root/topology-counter"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    disabled=$(jq -c 'map(if .name == "eDP-1" then
+        .disabled = true | .dpmsStatus = false else . end)' <<< "$framework")
+    asleep=$(jq -c 'map(if .name == "eDP-1" then
+        .dpmsStatus = false else . end)' <<< "$framework")
+
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    for ((sequence_index = 0; sequence_index < 16; sequence_index++)); do
+        sequence_values+=("$framework")
+    done
+    sequence_values+=("$disabled" "$disabled")
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "${sequence_values[@]}"
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$TIMEOUT_BIN" 0.4 "$installed_daemon" \
+        > "$test_root/pending.out" 2>&1 || true
+    output=$(<"$test_root/pending.out")
+    command_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
+    if (( command_count != 4 )); then
+        printf 'stable pending reconciliation should retry 3, cool down, then recover; got %d applies\n%s\n' \
+            "$command_count" "$output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" 'event=reconciliation_cooldown_started ticks=5' \
+        'three normal-daemon failures should arm a five-tick cooldown' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'event=reconciliation_succeeded' \
+        'a pending stable transition should recover without another input edge' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=joint_state_changed' \
+        'post-action observation must not masquerade as a new input edge' \
+        || failures=$((failures + 1))
+
+    printf '%s\n' 'state: open' > "$lid_root/LID1/state"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework" "$framework" "$framework" "$asleep"
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$TIMEOUT_BIN" 0.3 "$installed_daemon" \
+        > "$test_root/dpms-only.out" 2>&1 || true
+    output=$(<"$test_root/dpms-only.out")
+    started_count=$(grep -Fc 'event=reconciliation_started' \
+        "$test_root/dpms-only.out" || true)
+    if (( started_count != 1 )); then
+        printf 'DPMS-only observation should not reconcile; got %d reconciliations\n%s\n' \
+            "$started_count" "$output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$(<"$effect_log")" $'dpms\t' \
+        'steady open startup and idle DPMS changes must not wake the panel' \
+        || failures=$((failures + 1))
+
+    printf '%s\n' 'state: closed' > "$lid_root/LID1/state"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$framework" "$disabled" "$disabled" "$disabled" \
+        "$disabled" "$disabled" "$framework" "$framework"
+    rm -f "$fake_bin/sleep"
+    ln -s "$REAL_SLEEP_BIN" "$fake_bin/sleep"
+    (
+        "$REAL_SLEEP_BIN" 0.2
+        printf '%s\n' 'state: open' > "$lid_root/LID1/state"
+    ) &
+    lid_writer=$!
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$TIMEOUT_BIN" 1.4 "$installed_daemon" \
+        > "$test_root/open-edge.out" 2>&1 || true
+    wait "$lid_writer"
+    output=$(<"$test_root/open-edge.out")
+    command_count=$(grep -Fxc $'dpms\toutput=eDP-1\tstate=on' \
+        "$effect_log" || true)
+    if (( command_count != 1 )); then
+        printf 'a real closed-to-open edge should wake eDP-1 once, got %d\n%s\n' \
+            "$command_count" "$output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" \
+        'event=lid_state_changed previous=closed current=open' \
+        'daemon should distinguish a real open edge from steady open state' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'state=open preserve_dpms=false' \
+        'the real open-edge wake intent must be preserved through reconciliation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$(<"$effect_log")" $'monitor\toutput=DP-2' \
+        'a real open edge must not mutate the external output' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 tests_run=0
 tests_failed=0
 tests_selected=0
@@ -3120,6 +3758,21 @@ run_test \
     'BUG-009-idempotent-restart' \
     'repeated one-shot reconciliation is outcome-idempotent' \
     installed_daemon_once_is_outcome_idempotent
+
+run_test \
+    'BUG-010-cli-postconditions' \
+    'installed CLI verifies monitor and targeted DPMS postconditions' \
+    installed_cli_verifies_postconditions_and_dpms
+
+run_test \
+    'BUG-010-once-retries' \
+    'one-shot daemon reconciliation bounds and recovers transient failures' \
+    installed_daemon_once_bounds_and_recovers_transient_failures
+
+run_test \
+    'BUG-010-daemon-pending-state' \
+    'daemon retains pending applied state and ignores DPMS-only observations' \
+    installed_daemon_separates_observed_applied_and_dpms_state
 
 run_test \
     'BUG-016-jq-dependency' \

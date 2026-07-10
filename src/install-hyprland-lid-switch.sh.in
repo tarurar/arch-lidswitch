@@ -181,12 +181,12 @@ check_hyprland_capabilities() {
     fi
 
     if ! lua_probe_output=$("$HYPRCTL_BIN" eval \
-        'assert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")'); then
-        log_error "Hyprland Lua capability probe failed: hl.monitor is unavailable"
+        'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")'); then
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
         return 1
     fi
     if [[ "$lua_probe_output" != "ok" ]]; then
-        log_error "Hyprland Lua capability probe failed: hl.monitor is unavailable"
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
         return 1
     fi
 

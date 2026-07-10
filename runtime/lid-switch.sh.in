@@ -33,15 +33,6 @@ fi
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 
-configure_clamshell_layout() {
-    monitor_state_capture_internal_layout "$LAPTOP_DISPLAY" || return
-    monitor_state_disable_internal_output "$LAPTOP_DISPLAY"
-}
-
-configure_dual_layout() {
-    monitor_state_restore_internal_layout "$LAPTOP_DISPLAY"
-}
-
 refresh_waybar_layout() {
     if pgrep -x waybar >/dev/null 2>&1; then
         pkill -x -SIGUSR1 waybar || {
@@ -53,116 +44,272 @@ refresh_waybar_layout() {
     fi
 }
 
-handle_lid_close() {
-    local internal_enabled enabled_external_count layout_status
+reconcile_lid_state() {
+    local action=$1
+    local preserve_dpms=$2
+    local internal_enabled enabled_external_count desired_internal
+    local post_external_count post_desired_internal snapshot_status
+    local wake_required=false desired_dpms=preserved
+    local mutation_status=0 mutation_reason=none
+    local layout_changed=false snapshot_involved=false noop_reason=""
+    local verified_internal verified_dpms topology_snapshot
 
-    log_info transition_started action=close
-
+    log_info transition_started action="$action"
     if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
-        log_error monitor_query_failed action=close reason="$MONITOR_STATE_ERROR"
+        log_error monitor_query_failed action="$action" reason="$MONITOR_STATE_ERROR"
+        log_error reconciliation_failed action="$action" phase=observe \
+            desired_internal=unknown status=2 reason="$MONITOR_STATE_ERROR"
         return 2
     fi
+
+    topology_snapshot=$MONITOR_STATE_TOPOLOGY
     internal_enabled=$(monitor_state_internal_enabled)
     enabled_external_count=$(monitor_state_enabled_external_count)
+    if [[ "$action" == close && "$enabled_external_count" -gt 0 ]]; then
+        desired_internal=disabled
+    else
+        desired_internal=enabled
+    fi
 
-    if (( enabled_external_count > 0 )); then
+    if [[ "$action" == open ]]; then
+        if [[ "$preserve_dpms" != true || "$internal_enabled" == false ]]; then
+            wake_required=true
+            desired_dpms=true
+        fi
+    fi
+
+    log_info reconciliation_attempt action="$action" \
+        desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+        enabled_external_count="$enabled_external_count" \
+        topology="$topology_snapshot"
+
+    if [[ "$desired_internal" == disabled ]]; then
         if [[ "$internal_enabled" == false ]]; then
-            log_info layout_noop action=close reason=internal_already_disabled \
-                enabled_external_count="$enabled_external_count"
-            return 0
-        fi
-
-        if configure_clamshell_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=close laptop=disabled \
-                enabled_external_count="$enabled_external_count"
-            return 0
-        else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
+            if monitor_state_load_internal_layout_snapshot "$LAPTOP_DISPLAY"; then
+                noop_reason=internal_already_disabled
             else
-                log_error layout_apply_failed action=close reason="$MONITOR_STATE_ERROR"
+                mutation_status=$?
+                mutation_reason=$MONITOR_STATE_ERROR
             fi
-            return "$layout_status"
-        fi
-    fi
-
-    if [[ "$internal_enabled" == false ]]; then
-        if configure_dual_layout; then
-            refresh_waybar_layout
-            log_info layout_applied action=close layout=internal_restored \
-                enabled_external_count=0
+        elif ! monitor_state_capture_internal_layout "$LAPTOP_DISPLAY"; then
+            mutation_status=2
+            mutation_reason=$MONITOR_STATE_ERROR
+        elif monitor_state_disable_internal_output "$LAPTOP_DISPLAY"; then
+            layout_changed=true
         else
-            layout_status=$?
-            if (( layout_status == 2 )); then
-                log_error layout_snapshot_failed action=close reason="$MONITOR_STATE_ERROR"
-            else
-                log_error layout_apply_failed action=close layout=internal_restored \
-                    reason="$MONITOR_STATE_ERROR"
-            fi
-            return "$layout_status"
+            mutation_status=$?
+            mutation_reason=$MONITOR_STATE_ERROR
         fi
     else
-        log_info layout_noop action=close reason=internal_already_enabled \
-            enabled_external_count=0
+        if [[ "$internal_enabled" == false ]]; then
+            if monitor_state_restore_internal_layout "$LAPTOP_DISPLAY"; then
+                layout_changed=true
+                snapshot_involved=true
+            else
+                mutation_status=$?
+                mutation_reason=$MONITOR_STATE_ERROR
+            fi
+        else
+            if monitor_state_snapshot_present; then
+                snapshot_involved=true
+                if monitor_state_internal_layout_matches_snapshot \
+                    "$LAPTOP_DISPLAY"; then
+                    noop_reason=internal_already_enabled
+                else
+                    snapshot_status=$?
+                    if (( snapshot_status == 1 )); then
+                        if monitor_state_restore_internal_layout \
+                            "$LAPTOP_DISPLAY"; then
+                            layout_changed=true
+                        else
+                            mutation_status=$?
+                            mutation_reason=$MONITOR_STATE_ERROR
+                        fi
+                    else
+                        mutation_status=$snapshot_status
+                        mutation_reason=$MONITOR_STATE_ERROR
+                    fi
+                fi
+            else
+                snapshot_status=$?
+                if (( snapshot_status == 1 )); then
+                    noop_reason=internal_already_enabled
+                else
+                    mutation_status=$snapshot_status
+                    mutation_reason=$MONITOR_STATE_ERROR
+                fi
+            fi
+        fi
+
+        if (( mutation_status == 0 )) && [[ "$wake_required" == true ]]; then
+            if monitor_state_enable_internal_dpms "$LAPTOP_DISPLAY"; then
+                :
+            else
+                mutation_status=$?
+                mutation_reason=$MONITOR_STATE_ERROR
+            fi
+        fi
     fi
-
-    log_info power_delegated owner=systemd-logind action=close \
-        reason=no_enabled_external
-}
-
-handle_lid_open() {
-    local internal_enabled enabled_external_count layout_status
-
-    log_info transition_started action=open
 
     if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
-        log_error monitor_query_failed action=open reason="$MONITOR_STATE_ERROR"
+        log_error monitor_query_failed action="$action" phase=postcondition \
+            reason="$MONITOR_STATE_ERROR"
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=2 reason="$MONITOR_STATE_ERROR" \
+            apply_status="$mutation_status" apply_reason="$mutation_reason"
         return 2
     fi
-    internal_enabled=$(monitor_state_internal_enabled)
-    enabled_external_count=$(monitor_state_enabled_external_count)
 
-    if [[ "$internal_enabled" == true ]]; then
-        log_info layout_noop action=open reason=internal_already_enabled \
-            enabled_external_count="$enabled_external_count"
-        return 0
+    topology_snapshot=$MONITOR_STATE_TOPOLOGY
+    verified_internal=$(monitor_state_internal_enabled)
+    if verified_dpms=$(monitor_state_internal_dpms); then
+        :
+    else
+        verified_dpms=unknown
+    fi
+    post_external_count=$(monitor_state_enabled_external_count)
+    if [[ "$action" == close && "$post_external_count" -gt 0 ]]; then
+        post_desired_internal=disabled
+    else
+        post_desired_internal=enabled
     fi
 
-    if configure_dual_layout; then
-        refresh_waybar_layout
-        log_info layout_applied action=open layout=restored \
+    if [[ "$post_desired_internal" != "$desired_internal" ]]; then
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" \
+            observed_desired_internal="$post_desired_internal" \
+            desired_dpms="$desired_dpms" status=4 reason=policy_changed \
+            topology="$topology_snapshot"
+        return 4
+    fi
+
+    if (( mutation_status != 0 )); then
+        if (( mutation_status == 2 )); then
+            log_error layout_snapshot_failed action="$action" \
+                reason="$mutation_reason"
+        else
+            log_error layout_apply_failed action="$action" \
+                reason="$mutation_reason"
+        fi
+        log_error reconciliation_failed action="$action" phase=apply \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status="$mutation_status" reason="$mutation_reason" \
+            topology="$topology_snapshot"
+        return "$mutation_status"
+    fi
+
+    if [[ "$desired_internal" == enabled && "$verified_internal" != true ]] || \
+        [[ "$desired_internal" == disabled && "$verified_internal" != false ]] || \
+        { [[ "$wake_required" == true ]] && [[ "$verified_dpms" != true ]]; }; then
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=4 reason=postcondition_mismatch topology="$topology_snapshot"
+        return 4
+    fi
+
+    if [[ "$desired_internal" == disabled ]] && \
+        ! monitor_state_load_internal_layout_snapshot "$LAPTOP_DISPLAY"; then
+        log_error reconciliation_failed action="$action" phase=postcondition \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=2 reason="$MONITOR_STATE_ERROR" topology="$topology_snapshot"
+        return 2
+    fi
+
+    if [[ "$snapshot_involved" == true ]]; then
+        if monitor_state_internal_layout_matches_snapshot "$LAPTOP_DISPLAY"; then
+            :
+        else
+            snapshot_status=$?
+            if (( snapshot_status == 1 )); then
+                log_error reconciliation_failed action="$action" \
+                    phase=postcondition desired_internal="$desired_internal" \
+                    desired_dpms="$desired_dpms" status=4 \
+                    reason=layout_postcondition_mismatch \
+                    topology="$topology_snapshot"
+                return 4
+            fi
+            log_error reconciliation_failed action="$action" \
+                phase=postcondition desired_internal="$desired_internal" \
+                desired_dpms="$desired_dpms" status=2 \
+                reason="$MONITOR_STATE_ERROR" topology="$topology_snapshot"
+            return 2
+        fi
+    fi
+
+    if [[ "$snapshot_involved" == true ]] && \
+        ! monitor_state_cleanup_internal_layout; then
+        log_error layout_snapshot_failed action="$action" \
+            reason="$MONITOR_STATE_ERROR"
+        log_error reconciliation_failed action="$action" phase=snapshot_cleanup \
+            desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+            status=2 reason="$MONITOR_STATE_ERROR" topology="$topology_snapshot"
+        return 2
+    fi
+
+    if [[ -n "$noop_reason" ]]; then
+        log_info layout_noop action="$action" reason="$noop_reason" \
+            enabled_external_count="$enabled_external_count"
+    elif [[ "$desired_internal" == disabled ]]; then
+        log_info layout_applied action="$action" laptop=disabled \
             enabled_external_count="$enabled_external_count"
     else
-        layout_status=$?
-        if (( layout_status == 2 )); then
-            log_error layout_snapshot_failed action=open reason="$MONITOR_STATE_ERROR"
-        else
-            log_error layout_apply_failed action=open layout=restored reason="$MONITOR_STATE_ERROR"
-        fi
-        return "$layout_status"
+        log_info layout_applied action="$action" layout=internal_restored \
+            enabled_external_count="$enabled_external_count"
     fi
+
+    if [[ "$layout_changed" == true ]]; then
+        refresh_waybar_layout
+    fi
+    if [[ "$action" == close && "$enabled_external_count" -eq 0 ]]; then
+        log_info power_delegated owner=systemd-logind action=close \
+            reason=no_enabled_external
+    fi
+    log_info reconciliation_verified action="$action" \
+        desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
+        topology="$topology_snapshot"
 }
+
+preserve_dpms=false
+if [[ "${1:-}" == --preserve-dpms ]]; then
+    preserve_dpms=true
+    shift
+fi
+
+if (( $# > 1 )); then
+    log_error invalid_arguments status=1
+    exit 1
+fi
 
 case "${1:-}" in
-    "close")
-        handle_lid_close
-        ;;
-    "open")
-        handle_lid_open
-        ;;
-    *)
-        if ! lid_state=$(read_lid_state); then
-            log_error lid_state_unknown action=auto
+    close|closed)
+        if [[ "$preserve_dpms" == true ]]; then
+            log_error invalid_arguments status=1 reason=preserve_dpms_requires_open
             exit 1
         fi
-        log_info lid_state_detected state="$lid_state"
-        
-        if [[ "$lid_state" == "closed" ]]; then
-            handle_lid_close
-        else
-            handle_lid_open
+        reconcile_lid_state close false
+        ;;
+    open)
+        reconcile_lid_state open "$preserve_dpms"
+        ;;
+    "")
+        if [[ "$preserve_dpms" == true ]]; then
+            log_error invalid_arguments status=1 reason=preserve_dpms_requires_open
+            exit 1
         fi
+        if ! lid_state=$(read_lid_state); then
+            log_error lid_state_unknown action=auto status=2
+            exit 2
+        fi
+        log_info lid_state_detected state="$lid_state"
+        if [[ "$lid_state" == closed ]]; then
+            reconcile_lid_state close false
+        else
+            reconcile_lid_state open false
+        fi
+        ;;
+    *)
+        log_error invalid_arguments status=1 action="${1:-}"
+        exit 1
         ;;
 esac

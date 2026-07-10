@@ -51,6 +51,90 @@ emit_monitor_effect() {
     printf '\n' >> "$TEST_EFFECT_LOG"
 }
 
+configured_failure_pending() {
+    local failure_limit=$1
+    local counter_file=$2
+    local failure_label=$3
+    local failure_count=0
+
+    if [[ ! "$failure_limit" =~ ^[0-9]+$ ]]; then
+        printf 'Invalid configured %s failure count: %s\n' \
+            "$failure_label" "$failure_limit" >&2
+        return 99
+    fi
+    if (( failure_limit == 0 )); then
+        return 1
+    fi
+    if [[ -z "$counter_file" ]]; then
+        printf 'Missing configured %s failure counter\n' "$failure_label" >&2
+        return 99
+    fi
+    if [[ -r "$counter_file" ]]; then
+        read -r failure_count < "$counter_file"
+    fi
+    if [[ ! "$failure_count" =~ ^[0-9]+$ ]]; then
+        printf 'Invalid configured %s failure counter: %s\n' \
+            "$failure_label" "$failure_count" >&2
+        return 99
+    fi
+    printf '%s\n' "$((failure_count + 1))" > "$counter_file"
+    (( failure_count < failure_limit ))
+}
+
+structured_monitor_state_file() {
+    printf '%s\n' "${TEST_HYPRCTL_MONITORS_STATE_FILE:-$TEST_EFFECT_LOG.monitors-state.json}"
+}
+
+prepare_structured_monitor_state() {
+    local state_file request_file requested_state previous_request=""
+
+    state_file=$(structured_monitor_state_file)
+    request_file="$state_file.requested"
+    requested_state=${TEST_HYPRCTL_MONITORS_JSON:?}
+    if [[ -r "$request_file" ]]; then
+        previous_request=$(<"$request_file")
+    fi
+    if [[ ! -r "$state_file" || "$previous_request" != "$requested_state" ]]; then
+        printf '%s\n' "$requested_state" > "$state_file"
+        printf '%s\n' "$requested_state" > "$request_file"
+    fi
+    printf '%s\n' "$state_file"
+}
+
+apply_monitor_effect_to_structured_state() {
+    local expression=$1
+    local output disabled state_file temporary_state
+
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 0
+    fi
+    output=$(property_value "$expression" output) || return 0
+    disabled=$(property_value "$expression" disabled) || return 0
+    state_file=$(prepare_structured_monitor_state)
+    temporary_state="$state_file.tmp"
+    jq -c --arg output "$output" --argjson disabled "$disabled" \
+        'map(if .name == $output then .disabled = $disabled else . end)' \
+        "$state_file" > "$temporary_state" || return 99
+    mv -f "$temporary_state" "$state_file"
+}
+
+apply_dpms_effect_to_structured_state() {
+    local output=$1
+    local state_file temporary_state
+
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 0
+    fi
+    state_file=$(prepare_structured_monitor_state)
+    temporary_state="$state_file.tmp"
+    jq -c --arg output "$output" \
+        'map(if .name == $output then .dpmsStatus = true else . end)' \
+        "$state_file" > "$temporary_state" || return 99
+    mv -f "$temporary_state" "$state_file"
+}
+
 case "$command_name" in
     busctl)
         log_command "$@"
@@ -183,12 +267,13 @@ case "$command_name" in
                 printf 'Configured structured monitor query failure\n' >&2
                 exit 94
             elif [[ -n "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
-                printf '%s\n' "$TEST_HYPRCTL_MONITORS_JSON"
+                structured_state_file=$(prepare_structured_monitor_state)
+                cat "$structured_state_file"
             else
                 printf '%s\n' '[{"id":0,"name":"eDP-1","width":2880,"height":1920,"refreshRate":120,"x":0,"y":0,"scale":2,"transform":0,"disabled":false,"mirrorOf":"none"},{"id":1,"name":"DP-2","width":3840,"height":2160,"refreshRate":60,"x":1440,"y":0,"scale":1,"transform":0,"disabled":false,"mirrorOf":"none"}]'
             fi
         elif [[ "${1:-}" == "eval" && \
-            "${2:-}" == 'assert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")' ]]; then
+            "${2:-}" == assert\(type\(hl\)* ]]; then
             log_command "$@"
             if [[ "${TEST_HYPRCTL_CAPABILITY_EVAL_FAIL:-0}" == 1 ]]; then
                 printf 'Configured Hyprland Lua capability failure\n' >&2
@@ -203,12 +288,52 @@ case "$command_name" in
                 exit 99
             fi
             cat "$TEST_MONITORS_FIXTURE"
+        elif [[ "${1:-}" == "eval" && \
+            "${2:-}" == 'hl.dispatch(hl.dsp.dpms({ action = "enable", monitor = "'* ]]; then
+            log_command "$@"
+            if ! dpms_output=$(property_value "${2:-}" monitor); then
+                printf 'Fake could not identify a DPMS monitor in: %s\n' \
+                    "${2:-}" >&2
+                exit 96
+            fi
+            printf 'dpms\toutput=%s\tstate=on\n' "$dpms_output" >> "$TEST_EFFECT_LOG"
+            if configured_failure_pending \
+                "${TEST_HYPRCTL_DPMS_FAILURES:-0}" \
+                "${TEST_HYPRCTL_DPMS_COUNTER:-}" dpms; then
+                printf 'Configured targeted DPMS failure\n' >&2
+                exit 94
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
+            fi
+            dpms_output_value=${TEST_HYPRCTL_DPMS_OUTPUT:-ok}
+            if [[ "$dpms_output_value" == ok ]]; then
+                apply_dpms_effect_to_structured_state "$dpms_output" || exit $?
+            fi
+            printf '%s\n' "$dpms_output_value"
         elif [[ "${1:-}" == "eval" ]]; then
+            log_command "$@"
+            if configured_failure_pending \
+                "${TEST_HYPRCTL_EVAL_FAILURES:-0}" \
+                "${TEST_HYPRCTL_EVAL_COUNTER:-}" eval; then
+                printf 'Configured monitor apply failure\n' >&2
+                exit 94
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
+            fi
             IFS=';' read -r -a monitor_expressions <<< "${2:-}"
             for expression in "${monitor_expressions[@]}"; do
                 emit_monitor_effect "$expression"
+                if [[ "${TEST_HYPRCTL_EVAL_OUTPUT:-ok}" == ok ]]; then
+                    apply_monitor_effect_to_structured_state "$expression" || exit $?
+                fi
             done
-            printf '%s\n' ok
+            printf '%s\n' "${TEST_HYPRCTL_EVAL_OUTPUT:-ok}"
         else
             log_command "$@"
             printf 'Unsupported fake hyprctl operation: %s\n' "${1:-}" >&2

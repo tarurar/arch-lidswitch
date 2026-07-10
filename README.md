@@ -56,6 +56,7 @@ separately and never changes whether an output is classified as enabled.
 - **Hardware**: Laptop with ACPI lid switch support
 - **Session**: Wayland session
 - **Tools**: `hyprctl` from the active Hyprland session and `jq` for installer checks and runtime layout validation
+- **Lua APIs**: `hl.monitor`, `hl.dispatch`, and `hl.dsp.dpms`; the installer probes all three without changing display state
 - **Instances**: Exactly one running Hyprland instance matching `HYPRLAND_INSTANCE_SIGNATURE` and the active Wayland socket; automatic instance selection is not supported
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
 - **Power capability**: login1 must report `CanSuspend=yes`; hibernation and swap/resume configuration are not required because this project never requests hibernation
@@ -249,9 +250,9 @@ the identifier `arch-lidswitch`; it does not create separate log files in
    instance selected by the current session environment, `configProvider`
    equal to `lua`, and a monitor response whose JSON type is `array`.
 
-3. **Check the required Lua monitor API without changing the layout**:
+3. **Check the required Lua display APIs without changing the layout**:
    ```bash
-   hyprctl eval 'assert(type(hl) == "table" and type(hl.monitor) == "function", "hl.monitor unavailable")'
+   hyprctl eval 'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")'
    ```
 
    A compatible compositor prints exactly `ok`. The installer runs this

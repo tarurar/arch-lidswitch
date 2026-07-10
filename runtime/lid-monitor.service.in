@@ -13,6 +13,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=arch-lidswitch
 Restart=on-failure
+RestartPreventExitStatus=1
 RestartSec=2
 
 [Install]
