@@ -1,0 +1,98 @@
+#!/bin/bash
+
+set -u
+
+command_name=${0##*/}
+: "${TEST_EFFECT_LOG:?TEST_EFFECT_LOG must name the fake-effects log}"
+
+log_command() {
+    {
+        printf '%s' "$command_name"
+        printf '\t%s' "$@"
+        printf '\n'
+    } >> "$TEST_EFFECT_LOG"
+}
+
+property_value() {
+    local expression=$1
+    local property=$2
+    local pattern
+
+    pattern="$property"'[[:space:]]*=[[:space:]]*"([^"]*)"'
+    if [[ "$expression" =~ $pattern ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    pattern="$property"'[[:space:]]*=[[:space:]]*([^,}[:space:]]+)'
+    if [[ "$expression" =~ $pattern ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    return 1
+}
+
+emit_monitor_effect() {
+    local expression=$1
+    local output property value
+
+    if ! output=$(property_value "$expression" output); then
+        printf 'Fake could not identify a monitor output in: %s\n' "$expression" >&2
+        return 96
+    fi
+
+    printf 'monitor\toutput=%s' "$output" >> "$TEST_EFFECT_LOG"
+    for property in disabled mode position scale; do
+        if value=$(property_value "$expression" "$property"); then
+            printf '\t%s=%s' "$property" "$value" >> "$TEST_EFFECT_LOG"
+        fi
+    done
+    printf '\n' >> "$TEST_EFFECT_LOG"
+}
+
+case "$command_name" in
+    hyprctl)
+        if [[ "${1:-}" == "monitors" ]]; then
+            log_command "$@"
+            printf '%s\n' \
+                'Monitor eDP-1 (ID 0):' \
+                '    2880x1920@120.00000 at 0x0' \
+                'Monitor DP-2 (ID 1):' \
+                '    2560x1440@60.00000 at 2880x0'
+        elif [[ "${1:-}" == "eval" ]]; then
+            IFS=';' read -r -a monitor_expressions <<< "${2:-}"
+            for expression in "${monitor_expressions[@]}"; do
+                emit_monitor_effect "$expression"
+            done
+            printf '%s\n' ok
+        else
+            log_command "$@"
+            printf 'Unsupported fake hyprctl operation: %s\n' "${1:-}" >&2
+            exit 98
+        fi
+        ;;
+    systemctl)
+        log_command "$@"
+        for argument in "$@"; do
+            case "$argument" in
+                hibernate|hybrid-sleep|poweroff|reboot|suspend|suspend-then-hibernate)
+                    printf 'Refusing real or simulated power action: %s\n' "$argument" >&2
+                    exit 97
+                    ;;
+            esac
+        done
+        ;;
+    pgrep)
+        log_command "$@"
+        # Model a running Waybar so its refresh path is exercised safely.
+        exit 0
+        ;;
+    pkill|sleep)
+        log_command "$@"
+        ;;
+    *)
+        printf 'Unsupported fake command name: %s\n' "$command_name" >&2
+        exit 98
+        ;;
+esac

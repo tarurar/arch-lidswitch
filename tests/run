@@ -1,0 +1,163 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_BIN=$(command -v env)
+
+assert_contains() {
+    local actual=$1
+    local expected=$2
+    local message=$3
+
+    if [[ "$actual" != *"$expected"* ]]; then
+        printf 'assertion failed: %s\nmissing: %s\nactual:\n%s\n' \
+            "$message" "$expected" "$actual" >&2
+        return 1
+    fi
+}
+
+assert_not_contains() {
+    local actual=$1
+    local unexpected=$2
+    local message=$3
+
+    if [[ "$actual" == *"$unexpected"* ]]; then
+        printf 'assertion failed: %s\nunexpected: %s\nactual:\n%s\n' \
+            "$message" "$unexpected" "$actual" >&2
+        return 1
+    fi
+}
+
+install_safe_path() {
+    local fake_bin=$1
+    local safe_bin=$2
+    local command_name command_path
+
+    mkdir -p "$fake_bin" "$safe_bin"
+
+    for command_name in hyprctl systemctl pgrep pkill sleep; do
+        ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/$command_name"
+    done
+
+    # Only ordinary utilities needed inside the isolated HOME are exposed.
+    # Power, compositor, process-signal, and timing commands exist solely as fakes.
+    for command_name in awk cat chmod cp cut date grep head mkdir sed; do
+        command_path=$(command -v "$command_name")
+        ln -s "$command_path" "$safe_bin/$command_name"
+    done
+}
+
+installed_cli_handles_documented_open_and_close() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log switch_log installed_cli
+    local close_effects open_effects runtime_log
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    switch_log="$test_root/lid-switch.log"
+    mkdir -p "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    if [[ ! -x "$installed_cli" ]]; then
+        printf 'installer did not create an executable lid-switch CLI\n' >&2
+        return 1
+    fi
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
+        "$installed_cli" close
+    close_effects=$(<"$effect_log")
+
+    assert_contains "$close_effects" $'monitor\toutput=eDP-1\tdisabled=true' \
+        'closing the lid should disable the installed laptop output'
+    assert_contains "$close_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=0x0\tscale=1' \
+        'closing the lid should keep the external output at the origin'
+    assert_contains "$close_effects" $'pkill\t-x\t-SIGUSR1\twaybar' \
+        'closing the lid should safely request the documented Waybar refresh'
+    assert_contains "$close_effects" $'sleep\t0.1' \
+        'the Waybar refresh delay must use the fake clock boundary'
+    assert_not_contains "$close_effects" $'systemctl\t' \
+        'a successful docked close must not request a power action'
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
+        "$installed_cli" open
+    open_effects=$(<"$effect_log")
+
+    assert_contains "$open_effects" $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2' \
+        'opening the lid should enable the installed laptop output'
+    assert_contains "$open_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=auto-right\tscale=1' \
+        'opening the lid should restore the documented dual-output placement'
+    assert_contains "$open_effects" $'pkill\t-x\t-SIGUSR1\twaybar' \
+        'opening the lid should safely request the documented Waybar refresh'
+    assert_contains "$open_effects" $'sleep\t0.1' \
+        'the Waybar refresh delay must use the fake clock boundary'
+    assert_not_contains "$open_effects" $'systemctl\t' \
+        'a successful open must not request a power action'
+
+    if [[ ! -f "$switch_log" ]]; then
+        printf 'installed CLI ignored the isolated log path\n' >&2
+        return 1
+    fi
+    runtime_log=$(<"$switch_log")
+    assert_contains "$runtime_log" 'Laptop display disabled, DP-2 remains as primary' \
+        'close transition should report success through the CLI log'
+    assert_contains "$runtime_log" 'Dual monitor setup restored with DP-2' \
+        'open transition should report success through the CLI log'
+)
+
+tests_run=0
+tests_failed=0
+
+run_test() {
+    local description=$1
+    local test_function=$2
+    local output
+
+    tests_run=$((tests_run + 1))
+    if output=$("$test_function" 2>&1); then
+        printf 'ok %d - %s\n' "$tests_run" "$description"
+    else
+        printf 'not ok %d - %s\n' "$tests_run" "$description"
+        while IFS= read -r line; do
+            printf '# %s\n' "$line"
+        done <<< "$output"
+        tests_failed=$((tests_failed + 1))
+    fi
+}
+
+run_test \
+    'installed CLI handles documented docked close and open transitions' \
+    installed_cli_handles_documented_open_and_close
+
+printf '1..%d\n' "$tests_run"
+
+if (( tests_failed > 0 )); then
+    exit 1
+fi

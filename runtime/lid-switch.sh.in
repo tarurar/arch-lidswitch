@@ -4,7 +4,7 @@ LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 LAPTOP_MODE="2880x1920@120"
 LAPTOP_POSITION="0x0"
 LAPTOP_SCALE="2"
-LOG_FILE="/tmp/hypr-lid-switch.log"
+LOG_FILE="${HYPR_LID_SWITCH_LOG_FILE:-/tmp/hypr-lid-switch.log}"
 
 log_message() {
     echo "$(date): $1" >> "$LOG_FILE"
