@@ -1,0 +1,13 @@
+[Unit]
+Description=Hyprland Lid Switch Monitor
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=$SCRIPTS_DIR/lid-monitor.sh
+Restart=always
+RestartSec=2
+Environment="DISPLAY=:0"
+
+[Install]
+WantedBy=default.target
