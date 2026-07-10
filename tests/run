@@ -7623,6 +7623,206 @@ readme_documents_complete_transaction_uninstall() {
     (( failures == 0 ))
 }
 
+hyprlock_config_checker_enforces_one_locker_owner() (
+    set -euo pipefail
+
+    local test_root unsafe_hypridle unsafe_hyprland
+    local safe_hypridle safe_hyprland long_hyprland
+    local misplaced_hypridle empty_hyprland
+    local unsafe_status=0 safe_status=0 long_status=0 misplaced_status=0
+    local unsafe_output long_output misplaced_output readme_contents
+    local manual_review_diagnostics failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    unsafe_hypridle="$test_root/unsafe=hypridle.conf"
+    unsafe_hyprland="$test_root/unsafe=hyprland.lua"
+    safe_hypridle="$test_root/safe-hypridle.conf"
+    safe_hyprland="$test_root/safe-hyprland.lua"
+    long_hyprland="$test_root/long-hyprland.lua"
+    misplaced_hypridle="$test_root/misplaced-hypridle.conf"
+    empty_hyprland="$test_root/empty-hyprland.lua"
+
+    printf '%s\n' \
+        'general {' \
+        '    lock_cmd = hyprlock' \
+        '    unlock_cmd = killall -q hyprlock' \
+        '    unlock_cmd = /usr/bin/systemctl --user stop hyprlock.service' \
+        '    before_sleep_cmd = hyprlock' \
+        '    after_sleep_cmd = hyprlock' \
+        '}' \
+        'listener {' \
+        '    timeout = 180' \
+        '    on-timeout = hyprlock' \
+        '    on-resume = hyprlock' \
+        '}' \
+        > "$unsafe_hypridle"
+    printf '%s\n' \
+        'hl . bind(mainMod .. " + L", hl.dsp.exec_cmd("hyprlock"))' \
+        > "$unsafe_hyprland"
+
+    printf '%s\n' \
+        'general {' \
+        '    lock_cmd = pidof hyprlock || hyprlock # one guarded owner' \
+        '    unlock_cmd =' \
+        '    before_sleep_cmd = loginctl lock-session # lock before suspend' \
+        '    on_unlock_cmd = notify-send "locker unlocked"' \
+        '    after_sleep_cmd = notify-send "locker resumed"' \
+        '}' \
+        '# on-timeout = hyprlock' \
+        'listener {' \
+        '    timeout = 180' \
+        '    on-timeout = loginctl lock-session # request the designated owner' \
+        '}' \
+        > "$safe_hypridle"
+    printf '%s\n' \
+        '-- hl.bind(mainMod .. " + L", hl.dsp.exec_cmd("hyprlock"))' \
+        '--[=[' \
+        'hl . bind(mainMod .. " + L", hl.dsp.exec_cmd("hyprlock"))' \
+        ']=]' \
+        'hl . bind(mainMod .. " + L", hl.dsp.exec_cmd("loginctl lock-session")) -- replaced direct hyprlock' \
+        'hl.bind(mainMod .. " + N", hl.dsp.exec_cmd("notify-send locker"))' \
+        'hl.bind(mainMod .. " + H", hl.dsp.exec_cmd("notify-send '\''exec_cmd ready'\''"))' \
+        > "$safe_hyprland"
+    printf '%s\n' \
+        'hl.bind(mainMod .. " + L", hl.dsp.exec_cmd("/usr/bin/hyprlock"))' \
+        'hl.bind(mainMod .. " + O", hl.dsp.exec_cmd("exec /usr/bin/hyprlock"))' \
+        'hl.bind(mainMod .. " + P", hl.dsp.exec_cmd([[env -- /usr/bin/hyprlock]]))' \
+        'hl.bind(mainMod .. " + U", hl.dsp.exec_cmd("LOCK_MODE=idle /usr/bin/hyprlock"))' \
+        'hl.bind(mainMod .. " + Y", hl.dsp.exec_cmd("pidof hyprlock || /usr/bin/hyprlock"))' \
+        'hl.bind(mainMod .. " + X", hl.dsp.exec_cmd("env -u LOCK_MODE /usr/bin/hyprlock"))' \
+        'hl.bind(mainMod .. " + Z", hl.dsp.exec_cmd("'\''hyprlock'\'' --immediate"))' \
+        'hl.bind(mainMod .. " + F1", hl.dsp.exec_cmd("false||hyprlock"))' \
+        'hl.bind(mainMod .. " + F2", hl.dsp.exec_cmd("notify-send ready;hyprlock"))' \
+        'hl.bind(mainMod .. " + F3", hl.dsp.exec_cmd("hyprlock>/tmp/hyprlock.log"))' \
+        'hl.bind(mainMod .. " + F4", hl.dsp.exec_cmd("exec -- hyprlock"))' \
+        'hl.bind(mainMod .. " + F5", hl.dsp.exec_cmd("/usr/bin/env -- hyprlock"))' \
+        'hl.bind(mainMod .. " + A", hl.dsp.exec_cmd("hyprlock")); hl.bind(mainMod .. " + D", hl.dsp.exec_cmd("loginctl lock-session"))' \
+        > "$long_hyprland"
+
+    printf '%s\n' \
+        'listener {' \
+        '    lock_cmd = pidof hyprlock || hyprlock' \
+        '    before_sleep_cmd = loginctl lock-session' \
+        '}' \
+        > "$misplaced_hypridle"
+    : > "$empty_hyprland"
+
+    (
+        cd "$test_root"
+        "$ROOT_DIR/scripts/check-hyprlock-config.sh" \
+            "${unsafe_hypridle##*/}" "${unsafe_hyprland##*/}"
+    ) > "$test_root/unsafe.out" 2>&1 || unsafe_status=$?
+    unsafe_output=$(<"$test_root/unsafe.out")
+
+    if (( unsafe_status != 1 )); then
+        printf 'unsafe locker ownership returned status %d instead of 1:\n%s\n' \
+            "$unsafe_status" "$unsafe_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$unsafe_output" \
+        'unguarded lock_cmd: expected "pidof hyprlock || hyprlock"' \
+        'checker should diagnose an unguarded designated locker owner' \
+        || failures=$((failures + 1))
+    assert_contains "$unsafe_output" \
+        'unlock_cmd terminates hyprlock' \
+        'checker should diagnose external locker termination' \
+        || failures=$((failures + 1))
+    assert_contains "$unsafe_output" \
+        'unlock_cmd controls hyprlock directly' \
+        'checker should diagnose non-signal locker termination' \
+        || failures=$((failures + 1))
+    assert_contains "$unsafe_output" \
+        'before_sleep_cmd launches hyprlock directly' \
+        'checker should diagnose a competing pre-sleep locker owner' \
+        || failures=$((failures + 1))
+    assert_contains "$unsafe_output" \
+        'competing hyprlock launcher: on-timeout' \
+        'checker should identify the idle-listener launch site' \
+        || failures=$((failures + 1))
+    assert_contains "$unsafe_output" \
+        'competing hyprlock launcher: Lua keybind' \
+        'checker should identify the Lua keybind launch site' \
+        || failures=$((failures + 1))
+    assert_contains "$unsafe_output" \
+        'competing hyprlock launcher: after_sleep_cmd' \
+        'checker should diagnose a post-sleep locker launch' \
+        || failures=$((failures + 1))
+    assert_contains "$unsafe_output" \
+        'competing hyprlock launcher: on-resume' \
+        'checker should diagnose a listener resume locker launch' \
+        || failures=$((failures + 1))
+
+    "$ROOT_DIR/scripts/check-hyprlock-config.sh" \
+        "$safe_hypridle" "$safe_hyprland" \
+        > "$test_root/safe.out" 2>&1 || safe_status=$?
+    if (( safe_status != 0 )); then
+        printf 'single-owner locker configuration returned status %d:\n%s\n' \
+            "$safe_status" "$(<"$test_root/safe.out")" >&2
+        failures=$((failures + 1))
+    fi
+
+    "$ROOT_DIR/scripts/check-hyprlock-config.sh" \
+        "$safe_hypridle" "$long_hyprland" \
+        > "$test_root/long.out" 2>&1 || long_status=$?
+    long_output=$(<"$test_root/long.out")
+    if (( long_status != 1 )); then
+        printf 'long-string locker launch returned status %d instead of 1:\n%s\n' \
+            "$long_status" "$long_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$long_output" \
+        'unclassified hyprlock reference requires manual review: Lua keybind' \
+        'checker should fail closed on a Lua long-string command' \
+        || failures=$((failures + 1))
+    manual_review_diagnostics=$(grep -cF \
+        'unclassified hyprlock reference requires manual review' \
+        "$test_root/long.out" || true)
+    if (( manual_review_diagnostics != 12 )); then
+        printf 'checker failed closed on %d of 12 unclassified Lua forms:\n%s\n' \
+            "$manual_review_diagnostics" "$long_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$long_output" \
+        'multiple exec_cmd calls on one line are unsupported' \
+        'checker should fail closed on ambiguous same-line Lua calls' \
+        || failures=$((failures + 1))
+
+    "$ROOT_DIR/scripts/check-hyprlock-config.sh" \
+        "$misplaced_hypridle" "$empty_hyprland" \
+        > "$test_root/misplaced.out" 2>&1 || misplaced_status=$?
+    misplaced_output=$(<"$test_root/misplaced.out")
+    if (( misplaced_status != 1 )); then
+        printf 'misplaced locker ownership returned status %d instead of 1:\n%s\n' \
+            "$misplaced_status" "$misplaced_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$misplaced_output" \
+        'lock_cmd must be inside general' \
+        'checker should reject a designated owner in the wrong scope' \
+        || failures=$((failures + 1))
+    assert_contains "$misplaced_output" \
+        'before_sleep_cmd must be inside general' \
+        'checker should reject a pre-sleep request in the wrong scope' \
+        || failures=$((failures + 1))
+
+    readme_contents=$(<"$ROOT_DIR/README.md")
+    assert_contains "$readme_contents" \
+        'ef8ebe821be16394747c09fa0881c9322a56f7f1' \
+        'locker guidance should pin the upstream destructor fix' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" \
+        'loginctl terminate-session <graphical-session-id>' \
+        'locker guidance should document secure SDDM recovery' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" \
+        'Never kill hyprlock as an unlock workaround' \
+        'locker guidance should reject insecure or permanent-blank recovery' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 tests_run=0
 tests_failed=0
 tests_selected=0
@@ -7679,6 +7879,11 @@ run_test \
     'BUG-019-release-publication' \
     'release workflow publishes pinned verified assets from version tags' \
     release_workflow_publishes_pinned_verified_assets
+
+run_test \
+    'BUG-001-single-locker-owner' \
+    'hyprlock configuration checker enforces one guarded locker owner' \
+    hyprlock_config_checker_enforces_one_locker_owner
 
 run_test \
     'BUG-011-framework-round-trip' \

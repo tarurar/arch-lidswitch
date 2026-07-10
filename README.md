@@ -66,6 +66,84 @@ across the sleep cycle and coalesces resume requests into the main daemon.
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
 - **Power capability**: login1 must report `CanSuspend=yes`; hibernation and swap/resume configuration are not required because this project never requests hibernation
 
+## Locker Integration and Secure Recovery
+
+arch-lidswitch does not start, stop, or authenticate through the session locker.
+Hypridle should be the one process allowed to start `hyprlock`; every idle,
+keyboard, and pre-sleep request should ask systemd-logind to lock the session.
+This follows the upstream Hypridle single-owner configuration:
+
+```text
+general {
+    lock_cmd = pidof hyprlock || hyprlock
+    before_sleep_cmd = loginctl lock-session
+}
+
+listener {
+    timeout = 180
+    on-timeout = loginctl lock-session
+}
+```
+
+Use `loginctl lock-session` for a Hyprland lock keybinding as well. Remove an
+`unlock_cmd` that kills the locker; Hyprland and the authenticated lock client
+own the unlock handshake. Keep display wake commands in the existing bounded
+display owner instead of adding a second global resume mutation.
+
+From a repository checkout, validate the relevant Hypridle and Lua entrypoints
+without starting a locker or changing session state:
+
+```bash
+./scripts/check-hyprlock-config.sh \
+  ~/.config/hypr/hypridle.conf ~/.config/hypr/hyprland.lua
+```
+
+Exit status `0` means the known launch sites use the single-owner pattern, `1`
+reports policy violations with file and line numbers, and `2` reports invalid
+arguments or unreadable inputs. This is a containment check; it cannot prove
+that an upstream locker survives physical output removal. It checks active,
+single-line `general` command assignments, listener `on-timeout`/`on-resume`
+assignments, and `hl.bind(... exec_cmd(...))` calls in the supplied files.
+Each inspected Lua binding must contain only one `exec_cmd` call on its physical
+line; ambiguous multi-call lines are rejected. Variables, multiline Lua,
+included files, wrappers, and other services remain the administrator's
+responsibility. Within the inspected command fields, an active `hyprlock`
+reference that cannot be classified safely is rejected for manual review rather
+than treated as a successful check.
+
+The July 2026 incident core was a second `hyprlock 0.9.5-4` process. It failed
+to acquire the already-owned session lock and then crashed while global objects
+were being destroyed. Upstream fixed that exact null dereference in commit
+[`ef8ebe821be16394747c09fa0881c9322a56f7f1`](https://github.com/hyprwm/hyprlock/commit/ef8ebe821be16394747c09fa0881c9322a56f7f1).
+Until the Arch package contains that commit, the lowest-churn remedy is to
+backport only that commit onto Arch's released package. `hyprlock-git` also
+contains the fix when its upstream head includes the commit, but its AUR package
+replaces several stable Hyprland libraries with moving VCS packages.
+
+After updating the locker, validate 20 locked suspend, undock, and lid-open
+cycles on the real hardware. Confirm that the UI moves to the internal display
+and that `coredumpctl list hyprlock` gains no new entry. This manual field test
+is required because neither a shell test nor a nested compositor reproduces the
+Framework dock and GPU transition faithfully.
+
+If the graphical session remains securely blank, recover without powering off:
+
+1. Press `Ctrl+Alt+F3` (or another available text-console key), then log in.
+2. Run `loginctl list-sessions`, then use
+   `loginctl show-session <id> -p Name -p Type -p Class -p Seat -p TTY` to
+   identify the `Type=wayland` Hyprland session rather than the new text-console
+   session.
+3. Run `loginctl terminate-session <graphical-session-id>`. This ends the stuck
+   graphical session and allows SDDM to present a fresh login screen without
+   exposing its previous contents. It also discards unsaved work in that
+   graphical session; use it only after ordinary authentication is unavailable.
+
+The same commands can be run over a trusted SSH connection when a text console
+is unavailable. Never kill hyprlock as an unlock workaround, and do not force
+`loginctl unlock-session`: the Wayland session-lock protocol requires the
+compositor to remain locked when its owning client disappears, which can turn a
+recoverable failure into a permanent blank session.
+
 ## Installation
 
 ### Verified Pinned Install
