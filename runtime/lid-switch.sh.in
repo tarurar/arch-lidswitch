@@ -15,8 +15,18 @@ get_lid_state() {
 }
 
 get_external_display() {
-    # Dynamically get the external display name
-    hyprctl monitors | grep -E "^Monitor (DP|HDMI|USB-C)" | grep -v "$LAPTOP_DISPLAY" | head -1 | cut -d' ' -f2
+    local monitor_output external_display
+
+    if ! monitor_output=$(hyprctl monitors); then
+        return 2
+    fi
+
+    external_display=$(grep -E "^Monitor (DP|HDMI|USB-C)" <<< "$monitor_output" | grep -v "$LAPTOP_DISPLAY" | head -1 | cut -d' ' -f2)
+    if [[ -z "$external_display" ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$external_display"
 }
 
 configure_clamshell_layout() {
@@ -47,10 +57,17 @@ refresh_waybar_layout() {
 }
 
 handle_lid_close() {
+    local discovery_status=0
+
     log_message "Lid closed - checking for external monitor"
-    
-    CURRENT_EXTERNAL=$(get_external_display)
-    if [[ -n "$CURRENT_EXTERNAL" ]]; then
+
+    if CURRENT_EXTERNAL=$(get_external_display); then
+        discovery_status=0
+    else
+        discovery_status=$?
+    fi
+
+    if (( discovery_status == 0 )); then
         log_message "External monitor detected: $CURRENT_EXTERNAL, disabling laptop display"
         if configure_clamshell_layout "$CURRENT_EXTERNAL"; then
             refresh_waybar_layout
@@ -58,17 +75,27 @@ handle_lid_close() {
         else
             log_message "Failed to disable laptop display"
         fi
-    else
+    elif (( discovery_status == 1 )); then
         log_message "No external monitor detected, hibernating system"
         systemctl hibernate
+    else
+        log_message "Failed to query Hyprland monitors; refusing lid close transition"
+        return 2
     fi
 }
 
 handle_lid_open() {
+    local discovery_status=0
+
     log_message "Lid opened - re-enabling laptop display"
-    
-    CURRENT_EXTERNAL=$(get_external_display)
-    if [[ -n "$CURRENT_EXTERNAL" ]]; then
+
+    if CURRENT_EXTERNAL=$(get_external_display); then
+        discovery_status=0
+    else
+        discovery_status=$?
+    fi
+
+    if (( discovery_status == 0 )); then
         log_message "External monitor detected: $CURRENT_EXTERNAL, setting up dual monitor configuration"
         if configure_dual_layout "$CURRENT_EXTERNAL"; then
             refresh_waybar_layout
@@ -76,7 +103,7 @@ handle_lid_open() {
         else
             log_message "Failed to enable laptop display"
         fi
-    else
+    elif (( discovery_status == 1 )); then
         log_message "No external monitor, enabling laptop display only"
         if enable_laptop_display; then
             refresh_waybar_layout
@@ -84,6 +111,9 @@ handle_lid_open() {
         else
             log_message "Failed to enable laptop display"
         fi
+    else
+        log_message "Failed to query Hyprland monitors; refusing lid open transition"
+        return 2
     fi
 }
 

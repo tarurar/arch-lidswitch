@@ -142,6 +142,82 @@ installed_cli_handles_documented_open_and_close() (
         'open transition should report success through the CLI log'
 )
 
+installed_cli_refuses_actions_when_monitor_query_fails() (
+    set -euo pipefail
+
+    local transition=$1
+    local test_root home fake_bin safe_bin effect_log switch_log installed_cli
+    local install_fixture missing_runtime_fixture runtime_effects runtime_log
+    local runtime_output runtime_status=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    switch_log="$test_root/lid-switch.log"
+    runtime_output="$test_root/runtime.out"
+    install_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    missing_runtime_fixture="$test_root/missing-monitors.txt"
+    mkdir -p "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$install_fixture" \
+        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    : > "$effect_log"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$missing_runtime_fixture" \
+        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
+        "$installed_cli" "$transition" \
+        > "$runtime_output" 2>&1 || runtime_status=$?
+
+    runtime_effects=$(<"$effect_log")
+    runtime_log=$(<"$switch_log")
+
+    assert_contains "$runtime_effects" $'hyprctl\tmonitors' \
+        'the installed CLI should reach the failing monitor-query boundary'
+    assert_not_contains "$runtime_effects" $'systemctl\t' \
+        'a monitor-query failure must not request a power action'
+    assert_not_contains "$runtime_effects" $'monitor\t' \
+        'a monitor-query failure must not change monitor state'
+
+    if (( runtime_status != 2 )); then
+        printf 'expected query failure status 2, got %d\nruntime output:\n%s\n' \
+            "$runtime_status" "$(<"$runtime_output")" >&2
+        return 1
+    fi
+
+    assert_contains "$runtime_log" \
+        "Failed to query Hyprland monitors; refusing lid $transition transition" \
+        'the query failure should be distinguishable in the runtime log'
+    assert_not_contains "$runtime_log" 'No external monitor' \
+        'a query failure must not be reported as a valid empty topology'
+)
+
+installed_cli_refuses_power_when_close_monitor_query_fails() {
+    installed_cli_refuses_actions_when_monitor_query_fails close
+}
+
+installed_cli_refuses_display_when_open_monitor_query_fails() {
+    installed_cli_refuses_actions_when_monitor_query_fails open
+}
+
 installer_matches_fixture_expectation() (
     set -euo pipefail
 
@@ -265,6 +341,16 @@ run_test \
     'installed-cli-transitions' \
     'installed CLI handles documented docked close and open transitions' \
     installed_cli_handles_documented_open_and_close
+
+run_test \
+    'BUG-004-close-query-failure' \
+    'installed CLI refuses power when the close monitor query fails' \
+    installed_cli_refuses_power_when_close_monitor_query_fails
+
+run_test \
+    'BUG-004-open-query-failure' \
+    'installed CLI refuses display changes when the open monitor query fails' \
+    installed_cli_refuses_display_when_open_monitor_query_fails
 
 run_test \
     'BUG-007-laptop-only' \
