@@ -1,5 +1,11 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! . "$SCRIPT_DIR/lid-state.sh"; then
+    printf 'Unable to load lid state observer\n' >&2
+    exit 1
+fi
+
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 LAPTOP_MODE="2880x1920@120"
 LAPTOP_POSITION="0x0"
@@ -8,10 +14,6 @@ LOG_FILE="${HYPR_LID_SWITCH_LOG_FILE:-/tmp/hypr-lid-switch.log}"
 
 log_message() {
     echo "$(date): $1" >> "$LOG_FILE"
-}
-
-get_lid_state() {
-    cat /proc/acpi/button/lid/*/state 2>/dev/null | grep -q "closed" && echo "closed" || echo "open"
 }
 
 get_external_display() {
@@ -117,7 +119,7 @@ handle_lid_open() {
     fi
 }
 
-case "$1" in
+case "${1:-}" in
     "close")
         handle_lid_close
         ;;
@@ -125,7 +127,10 @@ case "$1" in
         handle_lid_open
         ;;
     *)
-        lid_state=$(get_lid_state)
+        if ! lid_state=$(read_lid_state); then
+            log_message "Unable to determine lid state; refusing automatic transition"
+            exit 1
+        fi
         log_message "Auto-detecting lid state: $lid_state"
         
         if [[ "$lid_state" == "closed" ]]; then

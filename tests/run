@@ -48,7 +48,7 @@ install_safe_path() {
 
     # Only ordinary utilities needed inside the isolated HOME are exposed.
     # Power, compositor, process-signal, and timing commands exist solely as fakes.
-    for command_name in awk cat chmod cp cut date grep head mkdir sed; do
+    for command_name in awk cat chmod cp cut date dirname grep head mkdir sed; do
         command_path=$(command -v "$command_name")
         ln -s "$command_path" "$safe_bin/$command_name"
     done
@@ -218,6 +218,228 @@ installed_cli_refuses_display_when_open_monitor_query_fails() {
     installed_cli_refuses_actions_when_monitor_query_fails open
 }
 
+create_lid_state_fixture() {
+    local lid_root=$1
+    local scenario=$2
+
+    case "$scenario" in
+        lid0)
+            mkdir -p "$lid_root/LID0"
+            printf '%s\n' 'state: open' > "$lid_root/LID0/state"
+            ;;
+        lid1)
+            mkdir -p "$lid_root/LID1"
+            printf '%s\n' 'state: closed' > "$lid_root/LID1/state"
+            ;;
+        multiple-agreeing)
+            mkdir -p "$lid_root/LID0" "$lid_root/LID1"
+            printf '%s\n' 'state: open' > "$lid_root/LID0/state"
+            printf '%s\n' 'state: open' > "$lid_root/LID1/state"
+            ;;
+        multiple-conflicting)
+            mkdir -p "$lid_root/LID0" "$lid_root/LID1"
+            printf '%s\n' 'state: open' > "$lid_root/LID0/state"
+            printf '%s\n' 'state: closed' > "$lid_root/LID1/state"
+            ;;
+        missing)
+            ;;
+        unreadable)
+            mkdir -p "$lid_root/LID0/state"
+            ;;
+        malformed)
+            mkdir -p "$lid_root/LID0"
+            printf '%s\n' 'state: ajar' > "$lid_root/LID0/state"
+            ;;
+        *)
+            printf 'unknown lid state fixture: %s\n' "$scenario" >&2
+            return 2
+            ;;
+    esac
+}
+
+installed_lid_state_matches_expected_behavior() (
+    set -euo pipefail
+
+    local scenario=$1
+    local expected_state=$2
+    local expected_error=${3:-}
+    local test_root home fake_bin safe_bin effect_log switch_log monitor_fixture lid_root
+    local installed_cli installed_daemon cli_effects daemon_output installer_output runtime_log
+    local cli_status=0 daemon_status=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    switch_log="$test_root/lid-switch.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    lid_root="$test_root/button/lid"
+    mkdir -p "$home"
+    create_lid_state_fixture "$lid_root" "$scenario"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    if ! "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1; then
+        printf 'installer failed for lid fixture %s:\n%s\n' \
+            "$scenario" "$(<"$test_root/installer.out")" >&2
+        return 1
+    fi
+    installer_output=$(<"$test_root/installer.out")
+
+    if [[ "$expected_state" == 'unknown' ]]; then
+        assert_contains "$installer_output" 'Could not determine lid state' \
+            'installer should report an unavailable lid state without guessing' || return 1
+    else
+        assert_contains "$installer_output" "Lid state detection working: $expected_state" \
+            'installer should use the shared runtime lid observer' || return 1
+    fi
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
+        "$installed_cli" \
+        > "$test_root/cli.out" 2> "$test_root/cli.err" || cli_status=$?
+    cli_effects=$(<"$effect_log")
+
+    case "$expected_state" in
+        open)
+            if (( cli_status != 0 )); then
+                printf 'expected open CLI status 0, got %d:\n%s\n' \
+                    "$cli_status" "$(<"$test_root/cli.err")" >&2
+                return 1
+            fi
+            assert_contains "$cli_effects" $'monitor\toutput=eDP-1\tdisabled=false' \
+                'an open lid state should select the installed CLI open transition' || return 1
+            assert_contains "$cli_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=auto-right\tscale=1' \
+                'an open lid state should restore the external output placement' || return 1
+            ;;
+        closed)
+            if (( cli_status != 0 )); then
+                printf 'expected closed CLI status 0, got %d:\n%s\n' \
+                    "$cli_status" "$(<"$test_root/cli.err")" >&2
+                return 1
+            fi
+            assert_contains "$cli_effects" $'monitor\toutput=eDP-1\tdisabled=true' \
+                'a closed lid state should select the installed CLI close transition' || return 1
+            assert_contains "$cli_effects" $'monitor\toutput=DP-2\tmode=preferred\tposition=0x0\tscale=1' \
+                'a closed lid state should retain the external output at the origin' || return 1
+            ;;
+        unknown)
+            if (( cli_status == 0 )); then
+                printf 'installed CLI accepted unavailable lid fixture: %s\n' "$scenario" >&2
+                return 1
+            fi
+            if [[ -s "$effect_log" ]]; then
+                printf 'unavailable lid state caused external effects:\n%s\n' \
+                    "$cli_effects" >&2
+                return 1
+            fi
+            runtime_log=$(<"$switch_log")
+            assert_contains "$runtime_log" \
+                'Unable to determine lid state; refusing automatic transition' \
+                'the installed CLI should explain why automatic action was refused' || return 1
+            ;;
+        *)
+            printf 'unknown expected lid state: %s\n' "$expected_state" >&2
+            return 2
+            ;;
+    esac
+
+    assert_not_contains "$cli_effects" $'systemctl\t' \
+        'lid observation must not request a power action in the docked fixture' || return 1
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --print-state \
+        > "$test_root/daemon.out" 2> "$test_root/daemon.err" || daemon_status=$?
+    daemon_output=$(<"$test_root/daemon.out")
+
+    if [[ "$expected_state" == 'unknown' ]]; then
+        if (( daemon_status == 0 )); then
+            printf 'daemon accepted unavailable lid fixture: %s\n' "$scenario" >&2
+            return 1
+        fi
+        if [[ "$daemon_output" != 'unknown' ]]; then
+            printf 'expected daemon to report unknown, got: %s\n' "$daemon_output" >&2
+            return 1
+        fi
+        assert_contains "$(<"$test_root/daemon.err")" "$expected_error" \
+            'daemon should distinguish the lid observation failure' || return 1
+    else
+        if (( daemon_status != 0 )); then
+            printf 'expected daemon state status 0, got %d:\n%s\n' \
+                "$daemon_status" "$(<"$test_root/daemon.err")" >&2
+            return 1
+        fi
+        if [[ "$daemon_output" != "$expected_state" ]]; then
+            printf 'expected daemon to report %s, got: %s\n' \
+                "$expected_state" "$daemon_output" >&2
+            return 1
+        fi
+    fi
+    if [[ -s "$effect_log" ]]; then
+        printf 'daemon state diagnostic caused external effects:\n%s\n' \
+            "$(<"$effect_log")" >&2
+        return 1
+    fi
+)
+
+installed_lid0_state_drives_cli_and_daemon() {
+    installed_lid_state_matches_expected_behavior lid0 open
+}
+
+installed_lid1_state_drives_cli_and_daemon() {
+    installed_lid_state_matches_expected_behavior lid1 closed
+}
+
+installed_agreeing_lid_states_drive_cli_and_daemon() {
+    installed_lid_state_matches_expected_behavior multiple-agreeing open
+}
+
+installed_conflicting_lid_states_are_refused() {
+    installed_lid_state_matches_expected_behavior \
+        multiple-conflicting unknown 'Conflicting ACPI lid states'
+}
+
+installed_missing_lid_state_is_refused() {
+    installed_lid_state_matches_expected_behavior \
+        missing unknown 'No ACPI lid state files found'
+}
+
+installed_unreadable_lid_state_is_refused() {
+    installed_lid_state_matches_expected_behavior \
+        unreadable unknown 'Unable to read ACPI lid state'
+}
+
+installed_malformed_lid_state_is_refused() {
+    installed_lid_state_matches_expected_behavior \
+        malformed unknown 'Malformed ACPI lid state'
+}
+
 installer_matches_fixture_expectation() (
     set -euo pipefail
 
@@ -351,6 +573,41 @@ run_test \
     'BUG-004-open-query-failure' \
     'installed CLI refuses display changes when the open monitor query fails' \
     installed_cli_refuses_display_when_open_monitor_query_fails
+
+run_test \
+    'BUG-012-lid0' \
+    'installed CLI and daemon support a LID0 ACPI lid path' \
+    installed_lid0_state_drives_cli_and_daemon
+
+run_test \
+    'BUG-012-lid1' \
+    'installed CLI and daemon support a non-LID0 ACPI lid path' \
+    installed_lid1_state_drives_cli_and_daemon
+
+run_test \
+    'BUG-012-multiple-agreeing' \
+    'installed CLI and daemon accept agreeing ACPI lid paths' \
+    installed_agreeing_lid_states_drive_cli_and_daemon
+
+run_test \
+    'BUG-012-multiple-conflicting' \
+    'installed CLI and daemon refuse conflicting ACPI lid paths' \
+    installed_conflicting_lid_states_are_refused
+
+run_test \
+    'BUG-012-missing' \
+    'installed CLI and daemon refuse a missing ACPI lid state' \
+    installed_missing_lid_state_is_refused
+
+run_test \
+    'BUG-012-unreadable' \
+    'installed CLI and daemon refuse an unreadable ACPI lid state' \
+    installed_unreadable_lid_state_is_refused
+
+run_test \
+    'BUG-012-malformed' \
+    'installed CLI and daemon refuse a malformed ACPI lid state' \
+    installed_malformed_lid_state_is_refused
 
 run_test \
     'BUG-007-laptop-only' \

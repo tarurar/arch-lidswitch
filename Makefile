@@ -9,7 +9,7 @@ check-generated:
 	./scripts/build-installer.sh --check
 
 check-syntax:
-	bash -n install-hyprland-lid-switch.sh src/install-hyprland-lid-switch.sh.in runtime/lid-switch.sh.in runtime/lid-monitor.sh scripts/build-installer.sh tests/run tests/fakes/effect
+	bash -n install-hyprland-lid-switch.sh src/install-hyprland-lid-switch.sh.in runtime/lid-state.sh runtime/lid-switch.sh.in runtime/lid-monitor.sh scripts/build-installer.sh tests/run tests/fakes/effect
 
 test:
 	./tests/run

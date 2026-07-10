@@ -96,6 +96,68 @@ create_directories() {
     log_success "Directories created"
 }
 
+# Install the shared lid state observer
+install_lid_state_script() {
+    log_info "Installing shared lid state observer..."
+
+    cat > "$SCRIPTS_DIR/lid-state.sh" << 'EOF'
+#!/bin/bash
+
+read_lid_state() {
+    local lid_root="${HYPR_LID_STATE_ROOT:-/proc/acpi/button/lid}"
+    local nullglob_was_enabled=0
+    local state_file state_line state observed_state=""
+    local -a state_files
+
+    if shopt -q nullglob; then
+        nullglob_was_enabled=1
+    else
+        shopt -s nullglob
+    fi
+    state_files=("$lid_root"/*/state)
+    if (( ! nullglob_was_enabled )); then
+        shopt -u nullglob
+    fi
+
+    if (( ${#state_files[@]} == 0 )); then
+        printf 'No ACPI lid state files found under %s\n' "$lid_root" >&2
+        printf '%s\n' unknown
+        return 1
+    fi
+
+    for state_file in "${state_files[@]}"; do
+        if [[ ! -f "$state_file" || ! -r "$state_file" ]] || ! state_line=$(<"$state_file"); then
+            printf 'Unable to read ACPI lid state: %s\n' "$state_file" >&2
+            printf '%s\n' unknown
+            return 1
+        fi
+
+        if [[ "$state_line" =~ ^[[:space:]]*(state:[[:space:]]*)?(open|closed)[[:space:]]*$ ]]; then
+            state="${BASH_REMATCH[2]}"
+        else
+            printf 'Malformed ACPI lid state: %s\n' "$state_file" >&2
+            printf '%s\n' unknown
+            return 1
+        fi
+
+        if [[ -z "$observed_state" ]]; then
+            observed_state="$state"
+        elif [[ "$state" != "$observed_state" ]]; then
+            printf 'Conflicting ACPI lid states found under %s\n' "$lid_root" >&2
+            printf '%s\n' unknown
+            return 1
+        fi
+    done
+
+    printf '%s\n' "$observed_state"
+}
+EOF
+
+    chmod +x "$SCRIPTS_DIR/lid-state.sh"
+
+    log_success "Lid state observer installed at $SCRIPTS_DIR/lid-state.sh"
+}
+
 # Install the lid switch script
 install_lid_switch_script() {
     local laptop_monitor="$1"
@@ -105,6 +167,12 @@ install_lid_switch_script() {
     cat > "$SCRIPTS_DIR/lid-switch.sh" << 'EOF'
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! . "$SCRIPT_DIR/lid-state.sh"; then
+    printf 'Unable to load lid state observer\n' >&2
+    exit 1
+fi
+
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 LAPTOP_MODE="2880x1920@120"
 LAPTOP_POSITION="0x0"
@@ -113,10 +181,6 @@ LOG_FILE="${HYPR_LID_SWITCH_LOG_FILE:-/tmp/hypr-lid-switch.log}"
 
 log_message() {
     echo "$(date): $1" >> "$LOG_FILE"
-}
-
-get_lid_state() {
-    cat /proc/acpi/button/lid/*/state 2>/dev/null | grep -q "closed" && echo "closed" || echo "open"
 }
 
 get_external_display() {
@@ -222,7 +286,7 @@ handle_lid_open() {
     fi
 }
 
-case "$1" in
+case "${1:-}" in
     "close")
         handle_lid_close
         ;;
@@ -230,7 +294,10 @@ case "$1" in
         handle_lid_open
         ;;
     *)
-        lid_state=$(get_lid_state)
+        if ! lid_state=$(read_lid_state); then
+            log_message "Unable to determine lid state; refusing automatic transition"
+            exit 1
+        fi
         log_message "Auto-detecting lid state: $lid_state"
         
         if [[ "$lid_state" == "closed" ]]; then
@@ -264,35 +331,26 @@ install_lid_monitor_script() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LID_SWITCH_SCRIPT="$SCRIPT_DIR/lid-switch.sh"
 LOG_FILE="/tmp/hypr-lid-monitor.log"
+if ! . "$SCRIPT_DIR/lid-state.sh"; then
+    printf 'Unable to load lid state observer\n' >&2
+    exit 1
+fi
+
+if [[ "${1:-}" == "--print-state" ]]; then
+    read_lid_state
+    exit $?
+fi
 
 log_message() {
     echo "$(date): $1" >> "$LOG_FILE"
 }
 
-get_lid_state() {
-    if [[ -f /proc/acpi/button/lid/LID0/state ]]; then
-        local state_line=$(cat /proc/acpi/button/lid/LID0/state 2>/dev/null)
-        if [[ "$state_line" =~ closed ]]; then
-            echo "closed"
-        else
-            echo "open"
-        fi
-    else
-        # Fallback for systems without specific LID0
-        if [[ -f /proc/acpi/button/lid/*/state ]]; then
-            cat /proc/acpi/button/lid/*/state 2>/dev/null | grep -q "closed" && echo "closed" || echo "open"
-        else
-            echo "unknown"
-        fi
-    fi
-}
-
 # Initial state
-previous_state=$(get_lid_state)
+previous_state=$(read_lid_state 2>/dev/null) || previous_state="unknown"
 log_message "Lid monitor started, initial state: $previous_state"
 
 while true; do
-    current_state=$(get_lid_state)
+    current_state=$(read_lid_state 2>/dev/null) || current_state="unknown"
     
     if [[ "$current_state" != "$previous_state" && "$current_state" != "unknown" ]]; then
         log_message "Lid state changed from $previous_state to $current_state"
@@ -365,16 +423,14 @@ enable_service() {
 
 # Check if lid detection is working
 test_lid_detection() {
+    local lid_state
+
     log_info "Testing lid state detection..."
-    
-    if [[ -f /proc/acpi/button/lid/LID0/state ]]; then
-        local lid_state=$(cat /proc/acpi/button/lid/LID0/state 2>/dev/null)
-        log_success "Lid state detection working: $lid_state"
-    elif [[ -f /proc/acpi/button/lid/*/state ]]; then
-        local lid_state=$(cat /proc/acpi/button/lid/*/state 2>/dev/null)
+
+    if lid_state=$("$SCRIPTS_DIR/lid-monitor.sh" --print-state); then
         log_success "Lid state detection working: $lid_state"
     else
-        log_warning "Could not find lid state files. The service may not work properly."
+        log_warning "Could not determine lid state. The service may not work properly."
         log_info "Please check if your system supports ACPI lid events."
     fi
 }
@@ -401,6 +457,7 @@ print_final_instructions() {
     log_success "Installation completed successfully!"
     echo
     echo -e "${BLUE}What was installed:${NC}"
+    echo "  • Lid state observer: $SCRIPTS_DIR/lid-state.sh"
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
     echo "  • Systemd user service: lid-monitor.service"
@@ -438,9 +495,6 @@ main() {
     log_info "Detecting Monitors..."
     detect_monitors
     
-    # Test lid detection
-    test_lid_detection
-    
     # Backup existing files
     backup_existing_files
     
@@ -448,9 +502,13 @@ main() {
     create_directories
     
     # Install scripts and service
+    install_lid_state_script
     install_lid_switch_script "$laptop_monitor"
     install_lid_monitor_script
     install_systemd_service
+
+    # Test the same lid observer used by the runtime scripts
+    test_lid_detection
     
     # Enable and start service
     enable_service

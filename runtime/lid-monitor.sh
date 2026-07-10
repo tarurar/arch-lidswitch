@@ -6,35 +6,26 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LID_SWITCH_SCRIPT="$SCRIPT_DIR/lid-switch.sh"
 LOG_FILE="/tmp/hypr-lid-monitor.log"
+if ! . "$SCRIPT_DIR/lid-state.sh"; then
+    printf 'Unable to load lid state observer\n' >&2
+    exit 1
+fi
+
+if [[ "${1:-}" == "--print-state" ]]; then
+    read_lid_state
+    exit $?
+fi
 
 log_message() {
     echo "$(date): $1" >> "$LOG_FILE"
 }
 
-get_lid_state() {
-    if [[ -f /proc/acpi/button/lid/LID0/state ]]; then
-        local state_line=$(cat /proc/acpi/button/lid/LID0/state 2>/dev/null)
-        if [[ "$state_line" =~ closed ]]; then
-            echo "closed"
-        else
-            echo "open"
-        fi
-    else
-        # Fallback for systems without specific LID0
-        if [[ -f /proc/acpi/button/lid/*/state ]]; then
-            cat /proc/acpi/button/lid/*/state 2>/dev/null | grep -q "closed" && echo "closed" || echo "open"
-        else
-            echo "unknown"
-        fi
-    fi
-}
-
 # Initial state
-previous_state=$(get_lid_state)
+previous_state=$(read_lid_state 2>/dev/null) || previous_state="unknown"
 log_message "Lid monitor started, initial state: $previous_state"
 
 while true; do
-    current_state=$(get_lid_state)
+    current_state=$(read_lid_state 2>/dev/null) || current_state="unknown"
     
     if [[ "$current_state" != "$previous_state" && "$current_state" != "unknown" ]]; then
         log_message "Lid state changed from $previous_state to $current_state"

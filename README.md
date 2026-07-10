@@ -69,6 +69,7 @@ The installer creates the following files:
 
 ```
 ~/.config/hypr/scripts/
+├── lid-state.sh       # Shared ACPI lid state observer
 ├── lid-switch.sh      # Core lid switch logic
 └── lid-monitor.sh     # Background monitor daemon
 
@@ -111,6 +112,13 @@ systemctl --user enable lid-monitor.service
 
 # Auto-detect current lid state
 ~/.config/hypr/scripts/lid-switch.sh
+
+# Inspect lid state without changing display or power state
+~/.config/hypr/scripts/lid-monitor.sh --print-state
+
+# Inspect an alternate ACPI lid root
+HYPR_LID_STATE_ROOT=/path/to/button/lid \
+  ~/.config/hypr/scripts/lid-monitor.sh --print-state
 ```
 
 ### Monitoring Logs
@@ -253,6 +261,7 @@ systemctl --user stop lid-monitor.service
 systemctl --user disable lid-monitor.service
 
 # Remove files
+rm -f ~/.config/hypr/scripts/lid-state.sh
 rm -f ~/.config/hypr/scripts/lid-switch.sh
 rm -f ~/.config/hypr/scripts/lid-monitor.sh  
 rm -f ~/.config/systemd/user/lid-monitor.service

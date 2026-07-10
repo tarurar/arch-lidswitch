@@ -96,6 +96,19 @@ create_directories() {
     log_success "Directories created"
 }
 
+# Install the shared lid state observer
+install_lid_state_script() {
+    log_info "Installing shared lid state observer..."
+
+    cat > "$SCRIPTS_DIR/lid-state.sh" << 'EOF'
+@@LID_STATE_SCRIPT@@
+EOF
+
+    chmod +x "$SCRIPTS_DIR/lid-state.sh"
+
+    log_success "Lid state observer installed at $SCRIPTS_DIR/lid-state.sh"
+}
+
 # Install the lid switch script
 install_lid_switch_script() {
     local laptop_monitor="$1"
@@ -165,16 +178,14 @@ enable_service() {
 
 # Check if lid detection is working
 test_lid_detection() {
+    local lid_state
+
     log_info "Testing lid state detection..."
-    
-    if [[ -f /proc/acpi/button/lid/LID0/state ]]; then
-        local lid_state=$(cat /proc/acpi/button/lid/LID0/state 2>/dev/null)
-        log_success "Lid state detection working: $lid_state"
-    elif [[ -f /proc/acpi/button/lid/*/state ]]; then
-        local lid_state=$(cat /proc/acpi/button/lid/*/state 2>/dev/null)
+
+    if lid_state=$("$SCRIPTS_DIR/lid-monitor.sh" --print-state); then
         log_success "Lid state detection working: $lid_state"
     else
-        log_warning "Could not find lid state files. The service may not work properly."
+        log_warning "Could not determine lid state. The service may not work properly."
         log_info "Please check if your system supports ACPI lid events."
     fi
 }
@@ -201,6 +212,7 @@ print_final_instructions() {
     log_success "Installation completed successfully!"
     echo
     echo -e "${BLUE}What was installed:${NC}"
+    echo "  • Lid state observer: $SCRIPTS_DIR/lid-state.sh"
     echo "  • Lid switch handler script: $SCRIPTS_DIR/lid-switch.sh"
     echo "  • Lid monitor daemon: $SCRIPTS_DIR/lid-monitor.sh"
     echo "  • Systemd user service: lid-monitor.service"
@@ -238,9 +250,6 @@ main() {
     log_info "Detecting Monitors..."
     detect_monitors
     
-    # Test lid detection
-    test_lid_detection
-    
     # Backup existing files
     backup_existing_files
     
@@ -248,9 +257,13 @@ main() {
     create_directories
     
     # Install scripts and service
+    install_lid_state_script
     install_lid_switch_script "$laptop_monitor"
     install_lid_monitor_script
     install_systemd_service
+
+    # Test the same lid observer used by the runtime scripts
+    test_lid_detection
     
     # Enable and start service
     enable_service
