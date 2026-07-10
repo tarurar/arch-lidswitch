@@ -68,27 +68,74 @@ across the sleep cycle and coalesces resume requests into the main daemon.
 
 ## Installation
 
-### Quick Install
+### Verified Pinned Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/tarurar/arch-lidswitch/main/install-hyprland-lid-switch.sh | bash
-```
+1. **Confirm the pinned release**:
 
-### Manual Install
+   The commands below pin `v0.1.0`. Before continuing, confirm that this exact
+   version exists on the GitHub Releases page and is marked **Immutable**. If
+   the release does not exist or is not immutable, stop rather than falling
+   back to a branch or piping remote content into a shell.
 
-1. **Download the installer**:
+2. **Download, verify, and install**:
+
+   This verification path requires an authenticated GitHub CLI (`gh`) session.
+   Download the installer and its checksum manifest into a private temporary
+   directory, verify both release provenance and file integrity, then execute
+   the verified local file:
+
    ```bash
-   wget https://raw.githubusercontent.com/tarurar/arch-lidswitch/main/install-hyprland-lid-switch.sh
-   chmod +x install-hyprland-lid-switch.sh
+   (
+     set -euo pipefail
+
+     ARCH_LIDSWITCH_VERSION='v0.1.0'
+     download_dir=$(mktemp -d)
+     trap 'rm -rf -- "$download_dir"' EXIT
+     installer="$download_dir/install-hyprland-lid-switch.sh"
+     checksums="$download_dir/SHA256SUMS"
+     release_url="https://github.com/tarurar/arch-lidswitch/releases/download/${ARCH_LIDSWITCH_VERSION}"
+
+     curl -fL --output "$installer" \
+       "$release_url/install-hyprland-lid-switch.sh"
+     curl -fL --output "$checksums" "$release_url/SHA256SUMS"
+
+     grep -Eq \
+       '^[0-9a-f]{64}  install-hyprland-lid-switch\.sh$' \
+       "$checksums"
+     [[ "$(wc -l < "$checksums")" -eq 1 ]]
+
+     gh release verify "$ARCH_LIDSWITCH_VERSION" \
+       --repo tarurar/arch-lidswitch
+     gh release verify-asset "$ARCH_LIDSWITCH_VERSION" "$installer" \
+       --repo tarurar/arch-lidswitch
+     gh release verify-asset "$ARCH_LIDSWITCH_VERSION" "$checksums" \
+       --repo tarurar/arch-lidswitch
+     (
+       cd "$download_dir"
+       sha256sum --check --strict SHA256SUMS
+     )
+     chmod +x "$installer"
+     "$installer"
+   )
    ```
 
-2. **Run the installer**:
-   ```bash
-   ./install-hyprland-lid-switch.sh
-   ```
+   The `gh release verify` commands verify the immutable release attestation and
+   both downloaded assets. The exact, single-entry `SHA256SUMS` consistency
+   check catches a mismatched or damaged installer.
 
 3. **Test the installation**:
-   Close your laptop lid to verify it works!
+
+   Preview the close decision first. This reads the live topology but does not
+   change display or power state:
+
+   ```bash
+   ~/.config/hypr/scripts/lid-switch.sh --dry-run close
+   ```
+
+   **MAY SUSPEND:** Physically closing the lid delegates the event to
+   systemd-logind. On an undocked laptop with the supported policy, logind will
+   suspend the system. Only perform a physical close after reviewing the
+   dry-run output and saving your work.
 
 By default, installation requires exactly one represented output whose name
 starts with `eDP`. Hardware that uses another internal connector name, or a
@@ -103,6 +150,29 @@ The selected output may be inactive during installation, but it must appear in
 `hyprctl -j monitors all`. The installer records that identity in both runtime
 scripts. Every other represented output is external; connector prefixes are
 not used to classify external displays.
+
+### Publishing Releases (Maintainers)
+
+Before publishing the first release, an administrator must enable immutable
+releases. This setting applies only to releases created after it is enabled:
+
+```bash
+gh api --method PUT repos/tarurar/arch-lidswitch/immutable-releases
+```
+
+Also create an active repository **tag ruleset** targeting `v*` before creating
+the first version tag. Enable **Restrict updates**, **Restrict deletions**, and
+**Block force pushes**, with no bypass for release tags. Creation must remain
+allowed so a new version can be pushed once; afterward the tag cannot move
+during the build-to-publication window. The workflow re-reads and peels the
+remote tag immediately before publication and requires it to identify both the
+triggering ref and the commit whose installer was tested.
+
+The release workflow accepts only stable `vMAJOR.MINOR.PATCH` tags, reruns the
+full test suite, packages the exact generated installer with a one-entry
+`SHA256SUMS`, and publishes both assets from the verified remote tag. After all
+changes intended for the release are committed, publish `v0.1.0` by creating
+and pushing that tag; branch pushes never publish releases.
 
 ## What Gets Installed
 
@@ -188,28 +258,57 @@ static unit and is not enabled independently.
 
 ### Manual Testing
 
+Dry-run mode queries the real lid/topology inputs and reports its intended
+`action`, `decision`, `internal_output`, `internal_enabled`,
+`enabled_external_count`, desired DPMS state, and topology. It does not create
+or consume a layout snapshot, change display or power state, run the
+post-layout hook, or perform postcondition mutations.
+
 ```bash
-# Test lid close behavior
+# Preview explicit close behavior without changing state
+~/.config/hypr/scripts/lid-switch.sh --dry-run close
+
+# Preview explicit open behavior without changing state
+~/.config/hypr/scripts/lid-switch.sh --dry-run open
+
+# Preview the decision for the currently observed lid state
+~/.config/hypr/scripts/lid-switch.sh --dry-run
+```
+
+The normal close, open, auto-detect, `--once`, and `--resume-once` commands
+below may change display state. They do not suspend or hibernate the system;
+physical lid events and their systemd-logind policy are a separate boundary.
+
+```bash
+# Apply explicit lid close behavior
 ~/.config/hypr/scripts/lid-switch.sh close
 
-# Test lid open behavior
+# Apply explicit lid open behavior
 ~/.config/hypr/scripts/lid-switch.sh open
 
-# Auto-detect current lid state
+# Apply behavior for the currently observed lid state
 ~/.config/hypr/scripts/lid-switch.sh
-
-# Inspect lid state without changing display or power state
-~/.config/hypr/scripts/lid-monitor.sh --print-state
 
 # Reconcile the current lid and topology once, then exit
 ~/.config/hypr/scripts/lid-monitor.sh --once
 
 # Exercise the bounded stable resume reconciliation path once
 ~/.config/hypr/scripts/lid-monitor.sh --resume-once
+```
+
+The `--print-state` command and the power-policy doctor are read-only: they do
+not change display or power state.
+
+```bash
+# Inspect lid state
+~/.config/hypr/scripts/lid-monitor.sh --print-state
 
 # Inspect an alternate ACPI lid root
 HYPR_LID_STATE_ROOT=/path/to/button/lid \
   ~/.config/hypr/scripts/lid-monitor.sh --print-state
+
+# Inspect effective power policy and capabilities
+~/.config/hypr/scripts/lid-switch-doctor.sh
 ```
 
 ### Power-Policy Doctor

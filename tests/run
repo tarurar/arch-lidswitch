@@ -92,6 +92,467 @@ installed_cli_handles_documented_open_and_close() {
     installed_cli_round_trips_framework_layout
 }
 
+installed_cli_dry_run_reports_real_decision_without_mutation() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local runtime_dir monitor_json installed_cli output effects
+    local snapshot_dir snapshot_file snapshot_sentinel hook_fake dry_run_count
+    local runtime_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    runtime_dir="$test_root/runtime"
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    snapshot_dir="$runtime_dir/arch-lidswitch"
+    snapshot_file="$snapshot_dir/internal-layout.json"
+    snapshot_sentinel='dry-run must preserve this existing layout snapshot'
+    hook_fake="$fake_bin/post-layout-hook"
+    mkdir -m 0700 -p "$snapshot_dir"
+    printf '%s\n' "$snapshot_sentinel" > "$snapshot_file"
+    chmod 0600 "$snapshot_file"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$installed_cli" --dry-run close \
+        > "$test_root/dry-run.out" 2>&1 || runtime_status=$?
+
+    output=$(<"$test_root/dry-run.out")
+    effects=$(<"$effect_log")
+    if (( runtime_status != 0 )); then
+        printf 'dry-run close exited %d instead of reporting a decision:\n%s\n' \
+            "$runtime_status" "$output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" $'hyprctl\t-j\tmonitors\tall' \
+        'dry-run should derive its decision from the live read-only topology input' \
+        || failures=$((failures + 1))
+    assert_contains "$output" \
+        'level=info component=lid-switch event=dry_run action=close decision=disable_internal' \
+        'dry-run should report the intended docked-close decision' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'internal_output=eDP-1' \
+        'dry-run should report the selected internal-output input' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'internal_enabled=true' \
+        'dry-run should report the observed internal-output state' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'enabled_external_count=1' \
+        'dry-run should report the observed enabled-external count' \
+        || failures=$((failures + 1))
+    dry_run_count=$(grep -Fc 'event=dry_run ' "$test_root/dry-run.out" || true)
+    if (( dry_run_count != 1 )); then
+        printf 'dry-run should emit exactly one decision record, got %d:\n%s\n' \
+            "$dry_run_count" "$output" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$snapshot_file" || "$(<"$snapshot_file")" != "$snapshot_sentinel" ]]; then
+        printf 'dry-run changed or removed the existing layout snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'post-layout-hook\t' \
+        'dry-run must not invoke the configured post-layout hook' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'hyprctl\teval\t' \
+        'dry-run must not enter the compositor mutation boundary' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'dry-run must not mutate display layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\t' \
+        'dry-run must not mutate display power state' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'dry-run must not request suspend, hibernate, or another power action' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=transition_started' \
+        'dry-run output must not claim that execution started' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=reconciliation_attempt' \
+        'dry-run output must not describe a mutation attempt' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=layout_applied' \
+        'dry-run output must not claim a layout was applied' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=reconciliation_verified' \
+        'dry-run output must not claim an unapplied reconciliation was verified' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=power_delegated' \
+        'dry-run output must not claim power handling was delegated' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_cli_dry_run_parser_and_errors_are_safe() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local runtime_dir monitor_json installed_cli lid_root scenario output effects
+    local expected_status expected_record runtime_status failures=0
+    local -a base_environment extra_environment cli_arguments
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/lid"
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    mkdir -p "$lid_root/LID0"
+    printf '%s\n' 'state: closed' > "$lid_root/LID0/state"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    base_environment=(
+        HOME="$home"
+        PATH="$fake_bin:$safe_bin"
+        XDG_RUNTIME_DIR="$runtime_dir"
+        HYPR_LID_STATE_ROOT="$lid_root"
+        TEST_EFFECT_LOG="$effect_log"
+        TEST_MONITORS_FIXTURE="$monitor_fixture"
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json"
+    )
+
+    for scenario in auto dry-preserve preserve-dry duplicate-dry-run \
+        duplicate-preserve unknown extra-operand close-preserve query-failure; do
+        expected_status=0
+        expected_record='event=dry_run action=open decision=enable_internal'
+        extra_environment=()
+        case "$scenario" in
+            auto)
+                cli_arguments=(--dry-run)
+                expected_record='event=dry_run action=close decision=disable_internal'
+                ;;
+            dry-preserve)
+                cli_arguments=(--dry-run --preserve-dpms open)
+                ;;
+            preserve-dry)
+                cli_arguments=(--preserve-dpms --dry-run open)
+                ;;
+            duplicate-dry-run)
+                cli_arguments=(--dry-run --dry-run close)
+                expected_status=1
+                expected_record=''
+                ;;
+            duplicate-preserve)
+                cli_arguments=(--dry-run --preserve-dpms \
+                    --preserve-dpms open)
+                expected_status=1
+                expected_record=''
+                ;;
+            unknown)
+                cli_arguments=(--dry-run --unknown open)
+                expected_status=1
+                expected_record=''
+                ;;
+            extra-operand)
+                cli_arguments=(--dry-run open unexpected)
+                expected_status=1
+                expected_record=''
+                ;;
+            close-preserve)
+                cli_arguments=(--dry-run --preserve-dpms close)
+                expected_status=1
+                expected_record=''
+                ;;
+            query-failure)
+                cli_arguments=(--dry-run close)
+                extra_environment=(TEST_HYPRCTL_MONITORS_JSON_FAIL=1)
+                expected_status=2
+                expected_record=''
+                ;;
+        esac
+
+        : > "$effect_log"
+        runtime_status=0
+        "$ENV_BIN" -i "${base_environment[@]}" \
+            "${extra_environment[@]}" "$installed_cli" "${cli_arguments[@]}" \
+            > "$test_root/$scenario.out" 2>&1 || runtime_status=$?
+        output=$(<"$test_root/$scenario.out")
+        effects=$(<"$effect_log")
+
+        if (( runtime_status != expected_status )); then
+            printf '%s dry-run status=%d expected=%d:\n%s\n' \
+                "$scenario" "$runtime_status" "$expected_status" "$output" >&2
+            failures=$((failures + 1))
+        fi
+        if [[ -n "$expected_record" ]]; then
+            assert_contains "$output" "$expected_record" \
+                "$scenario should report the read-only open decision" \
+                || failures=$((failures + 1))
+            assert_contains "$effects" $'hyprctl\t-j\tmonitors\tall' \
+                "$scenario should query the real topology" \
+                || failures=$((failures + 1))
+            if [[ "$scenario" == auto ]]; then
+                assert_contains "$output" 'event=lid_state_detected state=closed' \
+                    'auto dry-run should use the real observed lid state' \
+                    || failures=$((failures + 1))
+            else
+                assert_contains "$output" 'desired_dpms=preserved' \
+                    "$scenario should preserve DPMS in either option order" \
+                    || failures=$((failures + 1))
+            fi
+        else
+            assert_not_contains "$output" 'event=dry_run ' \
+                "$scenario failure must not emit a successful dry-run decision" \
+                || failures=$((failures + 1))
+            if (( expected_status == 1 )); then
+                assert_contains "$output" 'event=invalid_arguments status=1' \
+                    "$scenario should be rejected at the CLI boundary" \
+                    || failures=$((failures + 1))
+                if [[ -n "$effects" ]]; then
+                    printf '%s invalid arguments caused external effects:\n%s\n' \
+                        "$scenario" "$effects" >&2
+                    failures=$((failures + 1))
+                fi
+            else
+                assert_contains "$output" \
+                    'event=monitor_query_failed action=close' \
+                    'query failure should retain its diagnostic status boundary' \
+                    || failures=$((failures + 1))
+                assert_contains "$effects" $'hyprctl\t-j\tmonitors\tall' \
+                    'query failure should reach only the read-only topology boundary' \
+                    || failures=$((failures + 1))
+            fi
+        fi
+        assert_not_contains "$effects" $'hyprctl\teval\t' \
+            "$scenario must not enter the compositor mutation boundary" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'monitor\t' \
+            "$scenario must not mutate display layout" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'dpms\t' \
+            "$scenario must not mutate display power state" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'systemctl\t' \
+            "$scenario must not request a power action" \
+            || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+)
+
+readme_documents_pinned_checked_install_and_sleep_warnings() (
+    set -euo pipefail
+
+    local readme installation physical_lid_test manual_testing failures=0
+
+    readme=$(<"$ROOT_DIR/README.md")
+    installation=$(sed -n '/^## Installation$/,/^## /p' <<< "$readme")
+    manual_testing=$(sed -n '/^### Manual Testing$/,/^### /p' <<< "$readme")
+
+    assert_contains "$installation" "ARCH_LIDSWITCH_VERSION='v0.1.0'" \
+        'installation docs should pin a concrete versioned release' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" \
+        'releases/download/${ARCH_LIDSWITCH_VERSION}' \
+        'release URL should use the pinned version' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" '$release_url/install-hyprland-lid-switch.sh' \
+        'installer download should use the pinned release asset' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" '$release_url/SHA256SUMS' \
+        'checksum download should use the same pinned release' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" 'sha256sum --check' \
+        'installation docs should verify the pinned installer before execution' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" 'private temporary' \
+        'verified download should not overwrite or follow a caller-owned path' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" 'mktemp -d' \
+        'verified download should use a private temporary directory' \
+        || failures=$((failures + 1))
+    assert_not_contains "$installation" 'raw.githubusercontent.com' \
+        'installation docs must not download the installer from a mutable source ref' \
+        || failures=$((failures + 1))
+    assert_contains "$manual_testing" 'lid-switch.sh --dry-run close' \
+        'manual testing should lead with the non-mutating close preview' \
+        || failures=$((failures + 1))
+    physical_lid_test=$(sed -n \
+        '/3\. \*\*Test the installation\*\*:/,/^By default/p' \
+        <<< "$installation")
+    assert_contains "$physical_lid_test" 'MAY SUSPEND' \
+        'the physical lid-close test should explicitly warn that logind may suspend' \
+        || failures=$((failures + 1))
+    assert_contains "$manual_testing" 'may change display state' \
+        'normal close open auto and one-shot commands should disclose display mutations' \
+        || failures=$((failures + 1))
+    assert_contains "$manual_testing" 'do not suspend' \
+        'normal CLI and one-shot commands should not be described as sleeping commands' \
+        || failures=$((failures + 1))
+    assert_not_contains "$manual_testing" 'MAY SUSPEND' \
+        'only the physical lid-close test should carry a sleeping-command warning' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+release_package_contains_verified_installer_and_refuses_overwrite() (
+    set -euo pipefail
+
+    local test_root destination artifacts installer_digest checksums_digest
+    local overwrite_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    destination="$test_root/release"
+
+    if ! "$ROOT_DIR/scripts/package-release.sh" "$destination"; then
+        printf 'release packaging command failed for an absent destination\n' >&2
+        return 1
+    fi
+
+    artifacts=$(find "$destination" -mindepth 1 -maxdepth 1 \
+        -printf '%f\n' | sort)
+    if [[ "$artifacts" != $'SHA256SUMS\ninstall-hyprland-lid-switch.sh' ]]; then
+        printf 'release package contains unexpected artifacts:\n%s\n' \
+            "$artifacts" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -x "$destination/install-hyprland-lid-switch.sh" ]]; then
+        printf 'packaged installer is not executable\n' >&2
+        failures=$((failures + 1))
+    elif ! cmp -s "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        "$destination/install-hyprland-lid-switch.sh"; then
+        printf 'packaged installer differs from the generated installer\n' >&2
+        failures=$((failures + 1))
+    fi
+    if ! (cd "$destination" && sha256sum --check SHA256SUMS); then
+        printf 'release package checksum verification failed\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    installer_digest=$(sha256sum \
+        "$destination/install-hyprland-lid-switch.sh")
+    checksums_digest=$(sha256sum "$destination/SHA256SUMS")
+    "$ROOT_DIR/scripts/package-release.sh" "$destination" \
+        > "$test_root/overwrite.out" 2>&1 || overwrite_status=$?
+    if (( overwrite_status == 0 )); then
+        printf 'release packaging overwrote an existing destination\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$(sha256sum "$destination/install-hyprland-lid-switch.sh")" != \
+        "$installer_digest" || \
+        "$(sha256sum "$destination/SHA256SUMS")" != "$checksums_digest" ]]; then
+        printf 'failed overwrite attempt changed packaged artifacts\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+release_workflow_publishes_pinned_verified_assets() (
+    set -euo pipefail
+
+    local workflow_path workflow readme installation failures=0
+
+    workflow_path="$ROOT_DIR/.github/workflows/release.yml"
+    if [[ ! -r "$workflow_path" ]]; then
+        printf 'release workflow is missing: %s\n' "$workflow_path" >&2
+        return 1
+    fi
+    workflow=$(<"$workflow_path")
+    readme=$(<"$ROOT_DIR/README.md")
+    installation=$(sed -n '/^## Installation$/,/^## /p' <<< "$readme")
+
+    assert_contains "$workflow" 'tags:' \
+        'release publication should be triggered only by version tags' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" "'v[0-9]+.[0-9]+.[0-9]+'" \
+        'release publication should filter semantic-version tag candidates' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'contents: write' \
+        'release publication needs only repository-content write permission' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'make check' \
+        'tagged source should pass the full suite before publication' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" './scripts/package-release.sh' \
+        'release publication should use the locally verified package seam' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'gh release create' \
+        'release publication should create a GitHub release' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'git ls-remote --exit-code origin' \
+        'release publication should re-read the remote tag before publishing' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'remote_commit' \
+        'release publication should compare the peeled tag commit' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'GITHUB_SHA' \
+        'release publication should bind the remote tag to the triggering ref' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" '--verify-tag' \
+        'release publication must refuse a tag absent from the remote' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'release/install-hyprland-lid-switch.sh' \
+        'release publication should attach the generated installer' \
+        || failures=$((failures + 1))
+    assert_contains "$workflow" 'release/SHA256SUMS' \
+        'release publication should attach the checksum manifest' \
+        || failures=$((failures + 1))
+
+    assert_contains "$installation" 'gh release verify' \
+        'installation should document immutable-release verification' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" 'gh release verify-asset' \
+        'installation should document release-asset attestation verification' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" 'Restrict updates' \
+        'release procedure should require immovable version tags' \
+        || failures=$((failures + 1))
+    assert_contains "$installation" 'Block force pushes' \
+        'release procedure should prohibit force-moving version tags' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 installed_cli_round_trips_internal_layout_profile() (
     set -euo pipefail
 
@@ -7193,6 +7654,31 @@ run_test \
     'installed-cli-transitions' \
     'installed CLI handles documented docked close and open transitions' \
     installed_cli_handles_documented_open_and_close
+
+run_test \
+    'BUG-019-dry-run' \
+    'installed CLI dry-run reports real inputs and decision without mutations' \
+    installed_cli_dry_run_reports_real_decision_without_mutation
+
+run_test \
+    'BUG-019-dry-run-parser' \
+    'installed CLI dry-run accepts safe modes and rejects invalid inputs' \
+    installed_cli_dry_run_parser_and_errors_are_safe
+
+run_test \
+    'BUG-019-documentation-safety' \
+    'README pins and checks installation and marks sleeping commands' \
+    readme_documents_pinned_checked_install_and_sleep_warnings
+
+run_test \
+    'BUG-019-release-package' \
+    'release package contains a verified installer and refuses overwrite' \
+    release_package_contains_verified_installer_and_refuses_overwrite
+
+run_test \
+    'BUG-019-release-publication' \
+    'release workflow publishes pinned verified assets from version tags' \
+    release_workflow_publishes_pinned_verified_assets
 
 run_test \
     'BUG-011-framework-round-trip' \

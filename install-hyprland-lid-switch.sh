@@ -1426,14 +1426,17 @@ verify_expected_generation() {
 reconcile_lid_state() {
     local action=$1
     local preserve_dpms=$2
+    local dry_run=$3
     local internal_enabled enabled_external_count desired_internal
     local post_external_count post_desired_internal snapshot_status
     local wake_required=false desired_dpms=preserved
     local mutation_status=0 mutation_reason=none
     local layout_changed=false snapshot_involved=false noop_reason=""
-    local verified_internal verified_dpms topology_snapshot
+    local verified_internal verified_dpms topology_snapshot decision
 
-    log_info transition_started action="$action"
+    if [[ "$dry_run" != true ]]; then
+        log_info transition_started action="$action"
+    fi
     if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
         log_error monitor_query_failed action="$action" reason="$MONITOR_STATE_ERROR"
         log_error reconciliation_failed action="$action" phase=observe \
@@ -1460,6 +1463,20 @@ reconcile_lid_state() {
             wake_required=true
             desired_dpms=true
         fi
+    fi
+
+    if [[ "$dry_run" == true ]]; then
+        if [[ "$desired_internal" == disabled ]]; then
+            decision=disable_internal
+        else
+            decision=enable_internal
+        fi
+        log_info dry_run action="$action" decision="$decision" \
+            internal_output="$LAPTOP_DISPLAY" \
+            internal_enabled="$internal_enabled" \
+            enabled_external_count="$enabled_external_count" \
+            desired_dpms="$desired_dpms" topology="$topology_snapshot"
+        return 0
     fi
 
     log_info reconciliation_attempt action="$action" \
@@ -1660,10 +1677,36 @@ reconcile_lid_state() {
 }
 
 preserve_dpms=false
-if [[ "${1:-}" == --preserve-dpms ]]; then
-    preserve_dpms=true
-    shift
-fi
+dry_run=false
+while (( $# > 0 )); do
+    case "$1" in
+        --dry-run)
+            if [[ "$dry_run" == true ]]; then
+                log_error invalid_arguments status=1 reason=duplicate_option \
+                    option=--dry-run
+                exit 1
+            fi
+            dry_run=true
+            shift
+            ;;
+        --preserve-dpms)
+            if [[ "$preserve_dpms" == true ]]; then
+                log_error invalid_arguments status=1 reason=duplicate_option \
+                    option=--preserve-dpms
+                exit 1
+            fi
+            preserve_dpms=true
+            shift
+            ;;
+        --*)
+            log_error invalid_arguments status=1 action="$1"
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 if (( $# > 1 )); then
     log_error invalid_arguments status=1
@@ -1677,11 +1720,11 @@ case "${1:-}" in
             exit 1
         fi
         validate_expected_generation_contract close || exit $?
-        reconcile_lid_state close false
+        reconcile_lid_state close false "$dry_run"
         ;;
     open)
         validate_expected_generation_contract open || exit $?
-        reconcile_lid_state open "$preserve_dpms"
+        reconcile_lid_state open "$preserve_dpms" "$dry_run"
         ;;
     "")
         if [[ "$preserve_dpms" == true ]]; then
@@ -1695,10 +1738,10 @@ case "${1:-}" in
         log_info lid_state_detected state="$lid_state"
         if [[ "$lid_state" == closed ]]; then
             validate_expected_generation_contract close || exit $?
-            reconcile_lid_state close false
+            reconcile_lid_state close false "$dry_run"
         else
             validate_expected_generation_contract open || exit $?
-            reconcile_lid_state open false
+            reconcile_lid_state open false "$dry_run"
         fi
         ;;
     *)
