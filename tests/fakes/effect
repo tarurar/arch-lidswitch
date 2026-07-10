@@ -81,6 +81,67 @@ configured_failure_pending() {
     (( failure_count < failure_limit ))
 }
 
+systemctl_state_directory() {
+    printf '%s\n' "${TEST_SYSTEMCTL_STATE_DIR:-$TEST_EFFECT_LOG.systemctl-state}"
+}
+
+systemctl_state_file() {
+    local state_kind=$1
+    local unit=$2
+    local state_dir safe_unit
+
+    state_dir=$(systemctl_state_directory)
+    safe_unit=${unit//[^A-Za-z0-9_.-]/_}
+    printf '%s/%s.%s\n' "$state_dir" "$safe_unit" "$state_kind"
+}
+
+initialize_systemctl_state() {
+    local state_dir marker
+
+    state_dir=$(systemctl_state_directory)
+    marker="$state_dir/.initialized"
+    mkdir -p "$state_dir"
+    if [[ -e "$marker" ]]; then
+        return 0
+    fi
+    : > "$marker"
+    if [[ "${TEST_SYSTEMCTL_MAIN_ENABLED:-0}" == 1 ]]; then
+        : > "$(systemctl_state_file enabled lid-monitor.service)"
+    fi
+    if [[ "${TEST_SYSTEMCTL_RESUME_ENABLED:-0}" == 1 ]]; then
+        : > "$(systemctl_state_file enabled lid-resume-monitor.service)"
+    fi
+    if [[ "${TEST_SYSTEMCTL_MAIN_ACTIVE:-0}" == 1 ]]; then
+        : > "$(systemctl_state_file active lid-monitor.service)"
+    fi
+    if [[ "${TEST_SYSTEMCTL_RESUME_ACTIVE:-0}" == 1 ]]; then
+        : > "$(systemctl_state_file active lid-resume-monitor.service)"
+    fi
+}
+
+systemctl_set_state() {
+    local state_kind=$1
+    local unit=$2
+    local value=$3
+    local state_file
+
+    initialize_systemctl_state
+    state_file=$(systemctl_state_file "$state_kind" "$unit")
+    if [[ "$value" == true ]]; then
+        : > "$state_file"
+    else
+        rm -f "$state_file"
+    fi
+}
+
+systemctl_has_state() {
+    local state_kind=$1
+    local unit=$2
+
+    initialize_systemctl_state
+    [[ -e "$(systemctl_state_file "$state_kind" "$unit")" ]]
+}
+
 structured_monitor_state_file() {
     printf '%s\n' "${TEST_HYPRCTL_MONITORS_STATE_FILE:-$TEST_EFFECT_LOG.monitors-state.json}"
 }
@@ -367,6 +428,49 @@ case "$command_name" in
         ;;
     systemctl)
         log_command "$@"
+        initialize_systemctl_state
+        deferred_systemctl_failure=false
+        failure_operation=${2:-}
+        if [[ "$failure_operation" == is-active && \
+            "${TEST_SYSTEMCTL_FAIL_OPERATION:-}" == health && \
+            -e "$(systemctl_state_directory)/.candidate-started" ]]; then
+            failure_operation=health
+        fi
+        if [[ "$failure_operation" == daemon-reload && \
+            -n "${TEST_SYSTEMCTL_FAIL_DAEMON_RELOAD_CALL:-}" ]]; then
+            exact_failure_count=0
+            if [[ -r "${TEST_SYSTEMCTL_FAILURE_COUNTER:?}" ]]; then
+                read -r exact_failure_count < "$TEST_SYSTEMCTL_FAILURE_COUNTER"
+            fi
+            exact_failure_count=$((exact_failure_count + 1))
+            printf '%s\n' "$exact_failure_count" \
+                > "$TEST_SYSTEMCTL_FAILURE_COUNTER"
+            if (( exact_failure_count == TEST_SYSTEMCTL_FAIL_DAEMON_RELOAD_CALL )); then
+                printf 'Configured systemctl daemon-reload call %d failure\n' \
+                    "$exact_failure_count" >&2
+                exit 94
+            fi
+        fi
+        if [[ -n "${TEST_SYSTEMCTL_FAIL_OPERATION:-}" && \
+            "$failure_operation" == "$TEST_SYSTEMCTL_FAIL_OPERATION" ]]; then
+            if configured_failure_pending \
+                "${TEST_SYSTEMCTL_FAILURES:-1}" \
+                "${TEST_SYSTEMCTL_FAILURE_COUNTER:?}" systemctl-operation; then
+                if [[ "${TEST_SYSTEMCTL_MUTATE_THEN_FAIL_OPERATION:-}" == \
+                    "$failure_operation" ]]; then
+                    deferred_systemctl_failure=true
+                else
+                    printf 'Configured systemctl %s failure\n' \
+                        "$failure_operation" >&2
+                    exit 94
+                fi
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
+            fi
+        fi
         if [[ "${1:-}" == --user && "${2:-}" == kill ]]; then
             if configured_failure_pending \
                 "${TEST_SYSTEMCTL_KILL_FAILURES:-0}" \
@@ -391,6 +495,69 @@ case "$command_name" in
                 fi
             done
         fi
+        if [[ "${1:-}" == --user ]]; then
+            case "${2:-}" in
+                is-enabled)
+                    if [[ "${3:-}" == lid-monitor.service && \
+                        -n "${TEST_SYSTEMCTL_MAIN_ENABLEMENT:-}" ]]; then
+                        printf '%s\n' "$TEST_SYSTEMCTL_MAIN_ENABLEMENT"
+                        [[ "$TEST_SYSTEMCTL_MAIN_ENABLEMENT" == enabled ]]
+                        exit $?
+                    fi
+                    if [[ "${3:-}" == lid-resume-monitor.service && \
+                        -n "${TEST_SYSTEMCTL_RESUME_ENABLEMENT:-}" ]]; then
+                        printf '%s\n' "$TEST_SYSTEMCTL_RESUME_ENABLEMENT"
+                        [[ "$TEST_SYSTEMCTL_RESUME_ENABLEMENT" == enabled ]]
+                        exit $?
+                    fi
+                    if systemctl_has_state enabled "${3:-}"; then
+                        printf 'enabled\n'
+                        exit 0
+                    fi
+                    if [[ "${3:-}" == lid-resume-monitor.service && \
+                        -f "${HOME:?}/.config/systemd/user/lid-resume-monitor.service" ]]; then
+                        printf 'static\n'
+                    elif [[ "${3:-}" == lid-monitor.service && \
+                        -f "${HOME:?}/.config/systemd/user/lid-monitor.service" ]]; then
+                        printf 'disabled\n'
+                    else
+                        printf 'not-found\n'
+                    fi
+                    exit 1
+                    ;;
+                is-active)
+                    unit=${4:-${3:-}}
+                    if systemctl_has_state active "$unit"; then
+                        exit 0
+                    fi
+                    exit 3
+                    ;;
+                enable)
+                    systemctl_set_state enabled "${3:-}" true
+                    ;;
+                disable)
+                    if [[ "${3:-}" == --now ]]; then
+                        unit=${4:-}
+                        systemctl_set_state enabled "$unit" false
+                        systemctl_set_state active "$unit" false
+                    else
+                        systemctl_set_state enabled "${3:-}" false
+                    fi
+                    ;;
+                start)
+                    systemctl_set_state active "${3:-}" true
+                    : > "$(systemctl_state_directory)/.candidate-started"
+                    ;;
+                stop)
+                    systemctl_set_state active "${3:-}" false
+                    ;;
+            esac
+        fi
+        if [[ "$deferred_systemctl_failure" == true ]]; then
+            printf 'Configured post-mutation systemctl %s failure\n' \
+                "$failure_operation" >&2
+            exit 94
+        fi
         for argument in "$@"; do
             case "$argument" in
                 hibernate|hybrid-sleep|poweroff|reboot|suspend|suspend-then-hibernate)
@@ -399,6 +566,216 @@ case "$command_name" in
                     ;;
             esac
         done
+        ;;
+    systemd-analyze)
+        log_command "$@"
+        if [[ "${TEST_SYSTEMD_ANALYZE_FAIL:-0}" == 1 ]]; then
+            printf 'Configured staged unit verification failure\n' >&2
+            exit 94
+        fi
+        if [[ "${SYSTEMD_UNIT_PATH:-}" != *: || \
+            -z "${XDG_RUNTIME_DIR:-}" || ! -d "$XDG_RUNTIME_DIR" || \
+            "${1:-}" != --user || "${2:-}" != --generators=no || \
+            "${3:-}" != --man=no || "${4:-}" != --recursive-errors=yes || \
+            "${5:-}" != verify ]]; then
+            printf 'Malformed staged systemd-analyze invocation\n' >&2
+            exit 98
+        fi
+        for unit_file in "${@:6}"; do
+            if [[ ! -r "$unit_file" ]]; then
+                printf 'Unreadable staged unit: %s\n' "$unit_file" >&2
+                exit 98
+            fi
+        done
+        ;;
+    luac)
+        log_command "$@"
+        if [[ "${TEST_LUAC_ACTIVATE_UNITS:-0}" == 1 && \
+            ! -e "${TEST_LUAC_ACTIVATE_MARKER:?}" ]]; then
+            systemctl_set_state active lid-monitor.service true
+            systemctl_set_state active lid-resume-monitor.service true
+            : > "$TEST_LUAC_ACTIVATE_MARKER"
+        fi
+        if [[ -n "${TEST_LUAC_MUTATE_CONFIG:-}" && \
+            ! -e "${TEST_LUAC_MUTATE_MARKER:?}" ]]; then
+            printf '%s\n' '-- concurrent user edit during installation' \
+                >> "$TEST_LUAC_MUTATE_CONFIG"
+            : > "$TEST_LUAC_MUTATE_MARKER"
+        fi
+        ;;
+    cp)
+        log_command "$@"
+        arguments=("$@")
+        argument_count=${#arguments[@]}
+        if (( argument_count < 2 )); then
+            exit 98
+        fi
+        source_path=${arguments[$((argument_count - 2))]}
+        destination_path=${arguments[$((argument_count - 1))]}
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == rollback-* && \
+            "${TEST_ROLLBACK_FILE_FAILURE:-}" == cp ]]; then
+            printf 'Configured rollback cp failure\n' >&2
+            exit 94
+        fi
+        "${TEST_REAL_CP_BIN:?}" "$@" || exit $?
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == rollback-* && \
+            -n "${TEST_ROLLBACK_FILE_MARKER:-}" ]]; then
+            : > "$TEST_ROLLBACK_FILE_MARKER"
+        fi
+        if [[ -n "${TEST_CP_MUTATE_SOURCE_AFTER_COPY:-}" && \
+            "$source_path" == "$TEST_CP_MUTATE_SOURCE_AFTER_COPY" && \
+            ! -e "${TEST_CP_MUTATE_MARKER:?}" ]]; then
+            printf '%s\n' '-- concurrent edit after snapshot copy' >> "$source_path"
+            : > "$TEST_CP_MUTATE_MARKER"
+        fi
+        ;;
+    chmod)
+        log_command "$@"
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == rollback-* && \
+            "${TEST_ROLLBACK_FILE_FAILURE:-}" == chmod && \
+            -e "${TEST_ROLLBACK_FILE_MARKER:?}" ]]; then
+            printf 'Configured rollback chmod failure\n' >&2
+            exit 94
+        fi
+        exec "${TEST_REAL_CHMOD_BIN:?}" "$@"
+        ;;
+    mv)
+        log_command "$@"
+        if [[ -n "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" ]]; then
+            printf 'mv-context\t%s\n' "$ARCH_LIDSWITCH_ATOMIC_CONTEXT" \
+                >> "$TEST_EFFECT_LOG"
+        fi
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == install-config && \
+            -n "${TEST_MV_EDIT_CONFIG_BEFORE_EXCHANGE:-}" && \
+            ! -e "${TEST_MV_EDIT_CONFIG_MARKER:?}" ]]; then
+            printf '%s\n' '-- concurrent edit immediately before exchange' \
+                >> "$TEST_MV_EDIT_CONFIG_BEFORE_EXCHANGE"
+            : > "$TEST_MV_EDIT_CONFIG_MARKER"
+        fi
+        if [[ -n "${TEST_MV_RACE_CONTEXT:-}" && \
+            "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+                "$TEST_MV_RACE_CONTEXT" && \
+            ! -e "${TEST_MV_RACE_MARKER:?}" ]]; then
+            case "${TEST_MV_RACE_MODE:?}" in
+                append)
+                    printf '%s\n' "${TEST_MV_RACE_CONTENT:?}" \
+                        >> "${TEST_MV_RACE_DESTINATION:?}"
+                    ;;
+                create)
+                    printf '%s\n' "${TEST_MV_RACE_CONTENT:?}" \
+                        > "${TEST_MV_RACE_DESTINATION:?}"
+                    chmod "${TEST_MV_RACE_MODE_BITS:-0640}" \
+                        "${TEST_MV_RACE_DESTINATION:?}"
+                    ;;
+                symlink)
+                    rm -f -- "${TEST_MV_RACE_DESTINATION:?}"
+                    "${TEST_REAL_LN_BIN:?}" -s -- "${TEST_MV_RACE_CONTENT:?}" \
+                        "$TEST_MV_RACE_DESTINATION"
+                    ;;
+                directory)
+                    rm -f -- "${TEST_MV_RACE_DESTINATION:?}"
+                    mkdir -- "$TEST_MV_RACE_DESTINATION"
+                    printf '%s\n' "${TEST_MV_RACE_CONTENT:?}" \
+                        > "$TEST_MV_RACE_DESTINATION/concurrent-entry"
+                    ;;
+                *)
+                    printf 'Unknown configured mv race mode: %s\n' \
+                        "$TEST_MV_RACE_MODE" >&2
+                    exit 98
+                    ;;
+            esac
+            : > "$TEST_MV_RACE_MARKER"
+        fi
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+            "${TEST_MV_REMOVE_SOURCE_BEFORE_CONTEXT:-__not-configured__}" ]]; then
+            arguments=("$@")
+            argument_count=${#arguments[@]}
+            source_path=${arguments[$((argument_count - 2))]}
+            rm -f -- "$source_path"
+        fi
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+            "${TEST_MV_MUTATE_BACKUP_CHILD_AFTER_CONTEXT:-__not-configured__}" ]]; then
+            arguments=("$@")
+            argument_count=${#arguments[@]}
+            destination_path=${arguments[$((argument_count - 1))]}
+            "${TEST_REAL_MV_BIN:?}" "$@" || exit $?
+            case "${TEST_MV_BACKUP_CHILD_MUTATION:?}" in
+                append)
+                    printf '%s\n' 'post-promotion child corruption' \
+                        >> "$destination_path/${TEST_MV_BACKUP_CHILD_RELATIVE:?}"
+                    ;;
+                delete)
+                    rm -f -- \
+                        "$destination_path/${TEST_MV_BACKUP_CHILD_RELATIVE:?}"
+                    ;;
+                directory-symlink)
+                    child_path="$destination_path/${TEST_MV_BACKUP_CHILD_RELATIVE:?}"
+                    "${TEST_REAL_MV_BIN:?}" -T -- "$child_path" \
+                        "${TEST_MV_BACKUP_DIRECTORY_CAPTURE:?}" || exit $?
+                    "${TEST_REAL_LN_BIN:?}" -s -- \
+                        "$TEST_MV_BACKUP_DIRECTORY_CAPTURE" "$child_path" \
+                        || exit $?
+                    ;;
+                *)
+                    printf 'Unknown backup child mutation: %s\n' \
+                        "$TEST_MV_BACKUP_CHILD_MUTATION" >&2
+                    exit 98
+                    ;;
+            esac
+            printf 'Configured post-promotion backup child %s\n' \
+                "$TEST_MV_BACKUP_CHILD_MUTATION" >&2
+            exit 94
+        fi
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+            "${TEST_MV_REPLACE_DESTINATION_AFTER_CONTEXT:-__not-configured__}" ]]; then
+            arguments=("$@")
+            argument_count=${#arguments[@]}
+            destination_path=${arguments[$((argument_count - 1))]}
+            "${TEST_REAL_MV_BIN:?}" "$@" || exit $?
+            "${TEST_REAL_MV_BIN:?}" -T -- "$destination_path" \
+                "${TEST_MV_REPLACED_DESTINATION_CAPTURE:?}" || exit $?
+            mkdir -- "$destination_path" || exit $?
+            chmod 0700 -- "$destination_path" || exit $?
+            printf 'Configured replaced post-mutation destination: %s\n' \
+                "$ARCH_LIDSWITCH_ATOMIC_CONTEXT" >&2
+            exit 94
+        fi
+        if [[ -n "${TEST_MV_MUTATE_THEN_FAIL_CONTEXT:-}" && \
+            "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+                "$TEST_MV_MUTATE_THEN_FAIL_CONTEXT" ]]; then
+            "${TEST_REAL_MV_BIN:?}" "$@" || exit $?
+            printf 'Configured post-mutation mv failure: %s\n' \
+                "$ARCH_LIDSWITCH_ATOMIC_CONTEXT" >&2
+            exit 94
+        fi
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == rollback-* && \
+            "${TEST_ROLLBACK_FILE_FAILURE:-}" == mv && \
+            -e "${TEST_ROLLBACK_FILE_MARKER:?}" ]]; then
+            printf 'Configured rollback mv failure\n' >&2
+            exit 94
+        fi
+        if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+            "${TEST_MV_REMOVE_SOURCE_AFTER_CONTEXT:-__not-configured__}" || \
+            "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+            "${TEST_MV_ACTIVATE_UNITS_AFTER_CONTEXT:-__not-configured__}" ]]; then
+            arguments=("$@")
+            argument_count=${#arguments[@]}
+            source_path=${arguments[$((argument_count - 2))]}
+            "${TEST_REAL_MV_BIN:?}" "$@" || exit $?
+            if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+                "${TEST_MV_REMOVE_SOURCE_AFTER_CONTEXT:-__not-configured__}" ]]; then
+                rm -f -- "$source_path"
+            fi
+            if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
+                "${TEST_MV_ACTIVATE_UNITS_AFTER_CONTEXT:-__not-configured__}" ]]; then
+                systemctl_set_state active lid-monitor.service true
+                systemctl_set_state active lid-resume-monitor.service true
+                printf 'external-activation\t%s\n' \
+                    "$ARCH_LIDSWITCH_ATOMIC_CONTEXT" >> "$TEST_EFFECT_LOG"
+            fi
+            exit 0
+        fi
+        exec "${TEST_REAL_MV_BIN:?}" "$@"
         ;;
     pgrep)
         log_command "$@"

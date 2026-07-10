@@ -46,13 +46,13 @@ install_safe_path() {
 
     mkdir -p "$fake_bin" "$safe_bin"
 
-    for command_name in busctl hyprctl systemctl systemd-inhibit pgrep pkill sleep; do
+    for command_name in busctl hyprctl systemctl systemd-analyze systemd-inhibit pgrep pkill sleep; do
         ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/$command_name"
     done
 
     # Only ordinary utilities needed inside the isolated HOME are exposed.
     # Power, compositor, process-signal, and timing commands exist solely as fakes.
-    for command_name in awk cat chmod cp cut date dirname grep head jq mkdir mktemp mv rm sed stdbuf timeout; do
+    for command_name in awk cat chmod cmp cp cut date dirname flock grep head jq luac mkdir mktemp mv rm rmdir sed sha256sum stat stdbuf systemd-analyze timeout; do
         command_path=$(command -v "$command_name")
         ln -s "$command_path" "$safe_bin/$command_name"
     done
@@ -2945,7 +2945,6 @@ installer_migrates_only_the_legacy_default_target_service() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        TEST_REQUIRED_PATHS_BEFORE_DISABLE="$home/.config/hypr/scripts/lid-state.sh:$home/.config/hypr/scripts/monitor-state.sh:$home/.config/hypr/scripts/lid-switch.sh:$home/.config/hypr/scripts/lid-switch-doctor.sh:$home/.config/hypr/scripts/lid-monitor.sh:$home/.config/hypr/scripts/lid-resume-monitor.sh:$home/.config/hypr/scripts/lid-session-bridge.sh:$home/.config/hypr/arch_lidswitch/session.lua:$home/.config/systemd/user/hyprland-session.target" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1
 
@@ -4905,6 +4904,1764 @@ readme_defines_workspace_assignment_scope() (
     (( failures == 0 ))
 )
 
+installer_commits_a_complete_private_transaction() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture state_root
+    local manifest backup_dir manifest_count backup_count line hash mode relative
+    local destination actual_hash failures=0
+    local -a relative_paths destinations
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    state_root="$home/.local/state/arch-lidswitch"
+    mkdir -p "$home"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    manifest="$state_root/current.manifest"
+    relative_paths=(
+        scripts/lid-state.sh scripts/monitor-state.sh scripts/lid-switch.sh
+        scripts/lid-switch-doctor.sh scripts/lid-monitor.sh
+        scripts/lid-resume-monitor.sh scripts/lid-session-bridge.sh
+        arch_lidswitch/session.lua systemd/user/hyprland-session.target
+        systemd/user/lid-monitor.service systemd/user/lid-resume-monitor.service
+    )
+    destinations=(
+        "$home/.config/hypr/scripts/lid-state.sh"
+        "$home/.config/hypr/scripts/monitor-state.sh"
+        "$home/.config/hypr/scripts/lid-switch.sh"
+        "$home/.config/hypr/scripts/lid-switch-doctor.sh"
+        "$home/.config/hypr/scripts/lid-monitor.sh"
+        "$home/.config/hypr/scripts/lid-resume-monitor.sh"
+        "$home/.config/hypr/scripts/lid-session-bridge.sh"
+        "$home/.config/hypr/arch_lidswitch/session.lua"
+        "$home/.config/systemd/user/hyprland-session.target"
+        "$home/.config/systemd/user/lid-monitor.service"
+        "$home/.config/systemd/user/lid-resume-monitor.service"
+    )
+    if [[ ! -f "$manifest" ]]; then
+        printf 'installer did not commit a current artifact manifest\n' >&2
+        return 1
+    fi
+    manifest_count=$(wc -l < "$manifest")
+    if (( manifest_count != 11 )); then
+        printf 'expected 11 managed artifacts, manifest has %d:\n%s\n' \
+            "$manifest_count" "$(<"$manifest")" >&2
+        failures=$((failures + 1))
+    fi
+    while IFS=$'\t' read -r hash mode relative; do
+        destination=""
+        for (( manifest_count=0; manifest_count<${#relative_paths[@]}; manifest_count++ )); do
+            if [[ "$relative" == "${relative_paths[$manifest_count]}" ]]; then
+                destination=${destinations[$manifest_count]}
+                break
+            fi
+        done
+        if [[ -z "$destination" || ! -f "$destination" ]]; then
+            printf 'manifest contains an unknown artifact: %s\n' "$relative" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+        actual_hash=$(sha256sum "$destination")
+        actual_hash=${actual_hash%% *}
+        if [[ "$hash" != "$actual_hash" || \
+            "$mode" != "0$(stat -c %a "$destination")" ]]; then
+            printf 'manifest does not match installed artifact: %s\n' "$relative" >&2
+            failures=$((failures + 1))
+        fi
+    done < "$manifest"
+    if [[ "$(stat -c %a "$state_root")" != 700 || \
+        "$(stat -c %a "$manifest")" != 600 ]]; then
+        printf 'transaction state or manifest is not private\n' >&2
+        failures=$((failures + 1))
+    fi
+    backup_dir=$(find "$state_root/backups" -mindepth 1 -maxdepth 1 \
+        -type d -print -quit)
+    if [[ -z "$backup_dir" || ! -f "$backup_dir/snapshot.tsv" || \
+        ! -f "$backup_dir/hyprland.lua" || \
+        ! -f "$backup_dir/service-state" ]]; then
+        printf 'installer did not retain one complete pre-install snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/reinstaller.out" 2>&1
+    backup_count=$(find "$state_root/backups" -mindepth 1 -maxdepth 1 \
+        -type d | wc -l)
+    backup_dir=$(find "$state_root/backups" -mindepth 1 -maxdepth 1 \
+        -type d -print -quit)
+    if (( backup_count != 1 )); then
+        printf 'expected exactly one retained rollback set, got %d\n' \
+            "$backup_count" >&2
+        failures=$((failures + 1))
+    fi
+    for relative in "${relative_paths[@]}"; do
+        if [[ ! -f "$backup_dir/files/$relative" ]]; then
+            printf 'rollback set omitted prior artifact: %s\n' "$relative" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    (( failures == 0 ))
+)
+
+installer_fault_checkpoint_restores_profile() (
+    set -euo pipefail
+
+    local profile=$1
+    local checkpoint=$2
+    local test_root home fake_bin safe_bin effect_log monitor_fixture state_root
+    local config original_config installer_status=0 failures=0 index path
+    local state_dir transaction_entry backup_entry
+    local -a paths expected_contents expected_modes
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    state_root="$home/.local/state/arch-lidswitch"
+    state_dir="$effect_log.systemctl-state"
+    config="$home/.config/hypr/hyprland.lua"
+    original_config='-- user config before transactional failure'
+    paths=(
+        "$home/.config/hypr/scripts/lid-state.sh"
+        "$home/.config/hypr/scripts/monitor-state.sh"
+        "$home/.config/hypr/scripts/lid-switch.sh"
+        "$home/.config/hypr/scripts/lid-switch-doctor.sh"
+        "$home/.config/hypr/scripts/lid-monitor.sh"
+        "$home/.config/hypr/scripts/lid-resume-monitor.sh"
+        "$home/.config/hypr/scripts/lid-session-bridge.sh"
+        "$home/.config/hypr/arch_lidswitch/session.lua"
+        "$home/.config/systemd/user/hyprland-session.target"
+        "$home/.config/systemd/user/lid-monitor.service"
+        "$home/.config/systemd/user/lid-resume-monitor.service"
+    )
+    expected_modes=(711 712 713 714 715 716 717 640 641 642 643)
+    expected_contents=(
+        old-lid-state old-monitor-state old-lid-switch old-doctor
+        old-lid-monitor old-resume-monitor old-session-bridge
+        old-session-module old-session-target
+        $'old-main-service\n[Install]\nWantedBy=default.target'
+        old-resume-service
+    )
+
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$original_config" > "$config"
+    chmod 0640 "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    if [[ "$profile" == existing ]]; then
+        for (( index=0; index<${#paths[@]}; index++ )); do
+            path=${paths[$index]}
+            mkdir -p "$(dirname "$path")"
+            printf '%s\n' "${expected_contents[$index]}" > "$path"
+            chmod "${expected_modes[$index]}" "$path"
+        done
+        mkdir -p "$state_root"
+        printf '%s\n' old-current-manifest > "$state_root/current.manifest"
+        chmod 0640 "$state_root/current.manifest"
+    fi
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        ARCH_LIDSWITCH_TEST_FAIL_AFTER="$checkpoint" \
+        TEST_SYSTEMCTL_MAIN_ENABLED="$([[ "$profile" == existing ]] && printf 1 || printf 0)" \
+        TEST_SYSTEMCTL_MAIN_ACTIVE="$([[ "$profile" == existing ]] && printf 1 || printf 0)" \
+        TEST_SYSTEMCTL_RESUME_ACTIVE="$([[ "$profile" == existing ]] && printf 1 || printf 0)" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf '%s checkpoint unexpectedly succeeded: %s\n%s\n' \
+            "$profile" "$checkpoint" "$(<"$test_root/installer.out")" >&2
+        return 1
+    fi
+    if [[ "$(<"$config")" != "$original_config" || \
+        "$(stat -c %a "$config")" != 640 ]]; then
+        printf '%s checkpoint changed user config: %s\n' \
+            "$checkpoint" "$(<"$config")" >&2
+        failures=$((failures + 1))
+    fi
+
+    for (( index=0; index<${#paths[@]}; index++ )); do
+        path=${paths[$index]}
+        if [[ "$profile" == existing ]]; then
+            if [[ ! -f "$path" || -L "$path" || \
+                "$(<"$path")" != "${expected_contents[$index]}" || \
+                "$(stat -c %a "$path")" != "${expected_modes[$index]}" ]]; then
+                printf '%s checkpoint did not restore %s\n' "$checkpoint" "$path" >&2
+                failures=$((failures + 1))
+            fi
+        elif [[ -e "$path" || -L "$path" ]]; then
+            printf '%s checkpoint left fresh artifact %s\n' "$checkpoint" "$path" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    if [[ "$profile" == existing ]]; then
+        if [[ ! -f "$state_root/current.manifest" || \
+            "$(<"$state_root/current.manifest")" != old-current-manifest || \
+            "$(stat -c %a "$state_root/current.manifest")" != 640 ]]; then
+            printf '%s checkpoint did not restore the prior manifest\n' "$checkpoint" >&2
+            failures=$((failures + 1))
+        fi
+        for path in \
+            "$state_dir/lid-monitor.service.enabled" \
+            "$state_dir/lid-monitor.service.active" \
+            "$state_dir/lid-resume-monitor.service.active"; do
+            if [[ ! -e "$path" ]]; then
+                printf '%s checkpoint did not restore service state: %s\n' \
+                    "$checkpoint" "$path" >&2
+                failures=$((failures + 1))
+            fi
+        done
+    else
+        if [[ -e "$state_root/current.manifest" || \
+            -e "$state_dir/lid-monitor.service.enabled" || \
+            -e "$state_dir/lid-monitor.service.active" || \
+            -e "$state_dir/lid-resume-monitor.service.active" ]]; then
+            printf '%s checkpoint changed fresh manifest/service state\n' \
+                "$checkpoint" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
+    transaction_entry=$(find "$state_root/transactions" -mindepth 1 \
+        -maxdepth 1 -print -quit 2>/dev/null || true)
+    backup_entry=$(find "$state_root/backups" -mindepth 1 \
+        -maxdepth 1 -print -quit 2>/dev/null || true)
+    if [[ -n "$transaction_entry" || -n "$backup_entry" ]]; then
+        printf '%s checkpoint retained a completed rollback/backup unexpectedly\n' \
+            "$checkpoint" >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installer_rolls_back_every_fault_checkpoint() {
+    local checkpoint failures=0
+    local -a checkpoints=(
+        prepared services-quiesced legacy-stopped
+        installed-lid-state installed-monitor-state installed-lid-switch
+        installed-lid-switch-doctor installed-lid-monitor
+        installed-lid-resume-monitor installed-lid-session-bridge
+        installed-session-module installed-session-target
+        installed-main-service installed-resume-service manifest-installed
+        config-integrated daemon-reloaded main-enabled session-imported
+        main-started resume-started health-checked
+    )
+
+    for checkpoint in "${checkpoints[@]}"; do
+        installer_fault_checkpoint_restores_profile existing "$checkpoint" \
+            || failures=$((failures + 1))
+        if [[ "$checkpoint" != legacy-stopped ]]; then
+            installer_fault_checkpoint_restores_profile fresh "$checkpoint" \
+                || failures=$((failures + 1))
+        fi
+    done
+
+    (( failures == 0 ))
+}
+
+installer_preserves_a_concurrent_user_config_edit() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config marker
+    local installer_status=0 expected failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    marker="$test_root/config-mutated"
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' '-- original user config' > "$config"
+    chmod 0640 "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/luac"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_LUAC_MUTATE_CONFIG="$config" TEST_LUAC_MUTATE_MARKER="$marker" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    expected=$'-- original user config\n-- concurrent user edit during installation'
+    if (( installer_status == 0 )); then
+        printf 'installer committed over a concurrent user config edit\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$(<"$config")" != "$expected" || \
+        "$(stat -c %a "$config")" != 640 ]]; then
+        printf 'installer did not preserve concurrent config bytes/mode:\n%s\n' \
+            "$(<"$config")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$home/.config/hypr/scripts/lid-switch.sh" || \
+        -e "$home/.local/state/arch-lidswitch/current.manifest" ]]; then
+        printf 'config CAS rejection left a partial installation\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'Hyprland config changed during installation' \
+        'CAS rejection should explain the concurrent user edit' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_rejects_an_independently_enabled_resume_listener() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture resume_unit
+    local original installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    resume_unit="$home/.config/systemd/user/lid-resume-monitor.service"
+    original='old independently enabled resume unit'
+    prepare_hyprland_config "$home"
+    mkdir -p "$(dirname "$resume_unit")"
+    printf '%s\n' "$original" > "$resume_unit"
+    chmod 0640 "$resume_unit"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_SYSTEMCTL_RESUME_ENABLED=1 \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'installer accepted an independently enabled static listener\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$(<"$resume_unit")" != "$original" || \
+        "$(stat -c %a "$resume_unit")" != 640 ]]; then
+        printf 'enablement rejection changed the prior resume unit\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'Static resume listener is unexpectedly enabled' \
+        'resume enablement conflict should be explicit' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_restores_a_pre_resume_main_only_install() {
+    local checkpoint failures=0
+
+    for checkpoint in services-quiesced health-checked; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local main_unit original installer_status=0 effects
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            main_unit="$home/.config/systemd/user/lid-monitor.service"
+            original=$'[Install]\nWantedBy=default.target\n# pre-resume-listener unit'
+            prepare_hyprland_config "$home"
+            mkdir -p "$(dirname "$main_unit")"
+            printf '%s\n' "$original" > "$main_unit"
+            chmod 0640 "$main_unit"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_SYSTEMCTL_MAIN_ENABLED=1 TEST_SYSTEMCTL_MAIN_ACTIVE=1 \
+                ARCH_LIDSWITCH_TEST_FAIL_AFTER="$checkpoint" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )); then
+                printf 'main-only checkpoint unexpectedly succeeded: %s\n' \
+                    "$checkpoint" >&2
+                exit 1
+            fi
+            if [[ "$(<"$main_unit")" != "$original" || \
+                "$(stat -c %a "$main_unit")" != 640 || \
+                ! -e "$effect_log.systemctl-state/lid-monitor.service.enabled" || \
+                ! -e "$effect_log.systemctl-state/lid-monitor.service.active" ]]; then
+                printf 'main-only checkpoint did not restore prior main state: %s\n' \
+                    "$checkpoint" >&2
+                exit 1
+            fi
+            if [[ -e "$home/.config/systemd/user/lid-resume-monitor.service" || \
+                -e "$effect_log.systemctl-state/lid-resume-monitor.service.active" ]]; then
+                printf 'main-only checkpoint invented a prior resume listener: %s\n' \
+                    "$checkpoint" >&2
+                exit 1
+            fi
+            effects=$(<"$effect_log")
+            assert_not_contains "$effects" \
+                $'systemctl\t--user\tdisable\tlid-resume-monitor.service' \
+                'rollback must not disable a previously absent static listener'
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_retains_recovery_after_rollback_publish_failure() {
+    local operation failures=0
+
+    for operation in cp chmod mv; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local managed_file marker installer_status=0 recovery_snapshot temp_file
+            local main_unit resume_unit effects
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            managed_file="$home/.config/hypr/scripts/lid-state.sh"
+            main_unit="$home/.config/systemd/user/lid-monitor.service"
+            resume_unit="$home/.config/systemd/user/lid-resume-monitor.service"
+            marker="$test_root/rollback-copy-started"
+            prepare_hyprland_config "$home"
+            mkdir -p "$(dirname "$managed_file")"
+            printf '%s\n' old-lid-state > "$managed_file"
+            chmod 0711 "$managed_file"
+            mkdir -p "$(dirname "$main_unit")"
+            printf '%s\n' '[Install]' 'WantedBy=graphical-session.target' \
+                > "$main_unit"
+            printf '%s\n' '[Service]' 'Type=exec' > "$resume_unit"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/cp"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/chmod"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                ARCH_LIDSWITCH_TEST_FAIL_AFTER=installed-lid-state \
+                TEST_ROLLBACK_FILE_FAILURE="$operation" \
+                TEST_ROLLBACK_FILE_MARKER="$marker" \
+                TEST_MV_REMOVE_SOURCE_BEFORE_CONTEXT=rollback-lid-state \
+                TEST_SYSTEMCTL_MAIN_ENABLED=1 TEST_SYSTEMCTL_MAIN_ACTIVE=1 \
+                TEST_SYSTEMCTL_RESUME_ACTIVE=1 \
+                TEST_REAL_CP_BIN="$(command -v cp)" \
+                TEST_REAL_CHMOD_BIN="$(command -v chmod)" \
+                TEST_REAL_MV_BIN="$(command -v mv)" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )); then
+                printf 'rollback %s failure unexpectedly succeeded\n' "$operation" >&2
+                exit 1
+            fi
+            if [[ ! -f "$managed_file" || -L "$managed_file" || \
+                "$(<"$managed_file")" != "$(<"$ROOT_DIR/runtime/lid-state.sh")" || \
+                "$(stat -c %a "$managed_file")" != 755 ]]; then
+                printf 'rollback %s failure changed the complete candidate content/mode\n' \
+                    "$operation" >&2
+                exit 1
+            fi
+            recovery_snapshot=$(find \
+                "$home/.local/state/arch-lidswitch/transactions" \
+                -path '*/before/files/scripts/lid-state.sh' -type f \
+                -print -quit 2>/dev/null || true)
+            if [[ -z "$recovery_snapshot" || \
+                "$(<"$recovery_snapshot")" != old-lid-state || \
+                "$(stat -c %a "$recovery_snapshot")" != 711 ]]; then
+                printf 'rollback %s failure did not retain the exact snapshot\n' \
+                    "$operation" >&2
+                exit 1
+            fi
+            assert_contains "$(<"$test_root/installer.out")" \
+                'Rollback incomplete; recovery snapshot retained at' \
+                "rollback $operation failure should report retained recovery" \
+                || exit 1
+            effects=$(<"$effect_log")
+            assert_contains "$(<"$test_root/installer.out")" \
+                'Services remain stopped because installation content could not be restored coherently' \
+                "rollback $operation failure should keep services stopped" \
+                || exit 1
+            if [[ -e "$effect_log.systemctl-state/lid-monitor.service.active" || \
+                -e "$effect_log.systemctl-state/lid-resume-monitor.service.active" ]]; then
+                printf 'rollback %s failure restarted a service against mixed files\n' \
+                    "$operation" >&2
+                exit 1
+            fi
+            assert_not_contains "$effects" \
+                $'systemctl\t--user\tstart\tlid-monitor.service' \
+                "rollback $operation failure must not restart the main service" \
+                || exit 1
+            temp_file=$(find "$(dirname "$managed_file")" -maxdepth 1 \
+                -name '.arch-lidswitch.*' -print -quit)
+            if [[ -n "$temp_file" && \
+                ( ! -f "$temp_file" || -L "$temp_file" || \
+                "$(<"$temp_file")" != old-lid-state || \
+                "$(stat -c %a "$temp_file")" != 711 ) ]]; then
+                printf 'rollback %s failure retained an invalid recovery sibling: %s\n' \
+                    "$operation" "$temp_file" >&2
+                exit 1
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_handles_signals_after_transaction_mutations() {
+    local signal_point failures=0
+    local -a rollback_points=(
+        artifact-lid-state manifest config
+    )
+
+    for signal_point in "${rollback_points[@]}" backup-promotion; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local config installer_status=0 transaction_entry backup_entry
+            local original='-- config before deterministic signal'
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            config="$home/.config/hypr/hyprland.lua"
+            mkdir -p "$(dirname "$config")"
+            printf '%s\n' "$original" > "$config"
+            chmod 0640 "$config"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                ARCH_LIDSWITCH_TEST_SIGNAL_AFTER_PUBLISH="$signal_point" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            if (( installer_status != 143 )); then
+                printf 'expected TERM status 143 after %s, got %d\n%s\n' \
+                    "$signal_point" "$installer_status" \
+                    "$(<"$test_root/installer.out")" >&2
+                exit 1
+            fi
+            transaction_entry=$(find \
+                "$home/.local/state/arch-lidswitch/transactions" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            backup_entry=$(find "$home/.local/state/arch-lidswitch/backups" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            if [[ "$signal_point" == backup-promotion ]]; then
+                if [[ ! -f "$home/.local/state/arch-lidswitch/current.manifest" || \
+                    -z "$backup_entry" || -n "$transaction_entry" || \
+                    "$(grep -Fxc -- '-- BEGIN arch-lidswitch managed session integration' "$config")" != 1 ]]; then
+                    printf 'backup-promotion signal did not leave one committed installation\n' >&2
+                    exit 1
+                fi
+            else
+                if [[ "$(<"$config")" != "$original" || \
+                    "$(stat -c %a "$config")" != 640 || \
+                    -e "$home/.config/hypr/scripts/lid-state.sh" || \
+                    -e "$home/.local/state/arch-lidswitch/current.manifest" || \
+                    -n "$backup_entry" || -n "$transaction_entry" ]]; then
+                    printf 'signal after %s did not restore exact fresh state\n' \
+                        "$signal_point" >&2
+                    exit 1
+                fi
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_rejects_snapshot_copy_races() {
+    local raced_kind failures=0
+
+    for raced_kind in managed manifest; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local config raced_file marker initial expected installer_status=0
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            config="$home/.config/hypr/hyprland.lua"
+            marker="$test_root/copy-race-fired"
+            prepare_hyprland_config "$home"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/cp"
+
+            case "$raced_kind" in
+                managed)
+                    raced_file="$home/.config/hypr/scripts/lid-state.sh"
+                    initial='old managed file'
+                    ;;
+                manifest)
+                    raced_file="$home/.local/state/arch-lidswitch/current.manifest"
+                    initial='old current manifest'
+                    ;;
+            esac
+            mkdir -p "$(dirname "$raced_file")"
+            printf '%s\n' "$initial" > "$raced_file"
+            chmod 0640 "$raced_file"
+            expected="$initial"$'\n-- concurrent edit after snapshot copy'
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_CP_MUTATE_SOURCE_AFTER_COPY="$raced_file" \
+                TEST_CP_MUTATE_MARKER="$marker" \
+                TEST_REAL_CP_BIN="$(command -v cp)" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )); then
+                printf '%s snapshot copy race unexpectedly committed\n' \
+                    "$raced_kind" >&2
+                exit 1
+            fi
+            if [[ "$(<"$raced_file")" != "$expected" || \
+                "$(stat -c %a "$raced_file")" != 640 ]]; then
+                printf '%s snapshot race did not preserve concurrent bytes/mode\n' \
+                    "$raced_kind" >&2
+                exit 1
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_cas_checks_an_existing_managed_config_block() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config marker
+    local installer_status=0 original expected failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    marker="$test_root/config-edit-fired"
+    original=$'-- user config\n-- BEGIN arch-lidswitch managed session integration\ndo\n    local ok, err = pcall(require, "arch_lidswitch.session")\n    if not ok then\n        print("arch-lidswitch: failed to load session integration: " .. tostring(err))\n    end\nend\n-- END arch-lidswitch managed session integration'
+    expected="$original"$'\n-- concurrent user edit during installation'
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$original" > "$config"
+    chmod 0640 "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/luac"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_LUAC_MUTATE_CONFIG="$config" TEST_LUAC_MUTATE_MARKER="$marker" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'installer ignored a concurrent edit to an existing managed block\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$(<"$config")" != "$expected" || \
+        "$(stat -c %a "$config")" != 640 ]]; then
+        printf 'existing-block CAS did not preserve concurrent config\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installer_quiesces_units_activated_after_snapshot() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture marker
+    local main_unit resume_unit effects failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    marker="$test_root/post-snapshot-activation"
+    main_unit="$home/.config/systemd/user/lid-monitor.service"
+    resume_unit="$home/.config/systemd/user/lid-resume-monitor.service"
+    prepare_hyprland_config "$home"
+    mkdir -p "$(dirname "$main_unit")"
+    printf '%s\n' '[Install]' 'WantedBy=graphical-session.target' > "$main_unit"
+    printf '%s\n' '[Service]' 'Type=exec' > "$resume_unit"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/luac"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_LUAC_ACTIVATE_UNITS=1 TEST_LUAC_ACTIVATE_MARKER="$marker" \
+        TEST_REAL_MV_BIN="$(command -v mv)" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    effects=$(<"$effect_log")
+    assert_contains "$effects" \
+        $'systemctl\t--user\tstop\tlid-resume-monitor.service' \
+        'post-snapshot resume activation must be stopped' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" \
+        $'systemctl\t--user\tstop\tlid-monitor.service' \
+        'post-snapshot main activation must be stopped' \
+        || failures=$((failures + 1))
+    assert_before "$effects" \
+        $'systemctl\t--user\tis-active\t--quiet\tlid-monitor.service' \
+        $'mv-context\tinstall-lid-state' \
+        'main inactivity must be verified before first live publication' \
+        || failures=$((failures + 1))
+    assert_before "$effects" \
+        $'systemctl\t--user\tis-active\t--quiet\tlid-resume-monitor.service' \
+        $'mv-context\tinstall-lid-state' \
+        'resume inactivity must be verified before first live publication' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_validates_staged_systemd_units_before_mutation() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local effects installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_SYSTEMD_ANALYZE_FAIL=1 \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    effects=$(<"$effect_log")
+    if (( installer_status == 0 )); then
+        printf 'installer accepted failed staged unit verification\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" \
+        $'systemd-analyze\t--user\t--generators=no\t--man=no\t--recursive-errors=yes\tverify' \
+        'installer should verify all staged units through systemd-analyze' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t--user\tstop\t' \
+        'unit validation failure must precede service quiescence' \
+        || failures=$((failures + 1))
+    if [[ -e "$home/.config/hypr/scripts/lid-state.sh" || \
+        -e "$home/.config/systemd/user/lid-monitor.service" || \
+        -e "$home/.local/state/arch-lidswitch/current.manifest" ]]; then
+        printf 'unit validation failure published installation artifacts\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installer_rejects_relative_xdg_state_home() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    (
+        cd "$test_root"
+        "$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            XDG_STATE_HOME=relative-state \
+            WAYLAND_DISPLAY=wayland-test \
+            HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+            XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+            > "$test_root/installer.out" 2>&1
+    ) || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'installer accepted relative XDG_STATE_HOME\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$test_root/relative-state" || \
+        -e "$home/.config/hypr/scripts/lid-state.sh" ]]; then
+        printf 'relative state path rejection occurred after installation writes\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'XDG_STATE_HOME must be an absolute path' \
+        'relative state path should receive an explicit diagnostic' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_rolls_back_systemctl_operation_failures() {
+    local scenario failures=0
+
+    for scenario in stop daemon-reload start health stop-mutating start-mutating; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local config manifest baseline_config baseline_manifest counter
+            local installer_status=0 transaction_entry
+            local operation mutate_then_fail=""
+
+            operation=${scenario%-mutating}
+            if [[ "$operation" != "$scenario" ]]; then
+                mutate_then_fail=$operation
+            fi
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            counter="$test_root/systemctl-failure-count"
+            config="$home/.config/hypr/hyprland.lua"
+            manifest="$home/.local/state/arch-lidswitch/current.manifest"
+            prepare_hyprland_config "$home"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/initial-install.out" 2>&1
+            baseline_config=$(<"$config")
+            baseline_manifest=$(<"$manifest")
+            : > "$effect_log"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_SYSTEMCTL_FAIL_OPERATION="$operation" \
+                TEST_SYSTEMCTL_MUTATE_THEN_FAIL_OPERATION="$mutate_then_fail" \
+                TEST_SYSTEMCTL_FAILURES=1 \
+                TEST_SYSTEMCTL_FAILURE_COUNTER="$counter" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/failing-install.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )); then
+                printf 'systemctl %s failure unexpectedly committed\n' \
+                    "$scenario" >&2
+                exit 1
+            fi
+            if [[ "$(<"$config")" != "$baseline_config" || \
+                "$(<"$manifest")" != "$baseline_manifest" || \
+                ! -e "$effect_log.systemctl-state/lid-monitor.service.enabled" || \
+                ! -e "$effect_log.systemctl-state/lid-monitor.service.active" || \
+                ! -e "$effect_log.systemctl-state/lid-resume-monitor.service.active" ]]; then
+                printf 'systemctl %s failure did not restore prior state\n' \
+                    "$scenario" >&2
+                exit 1
+            fi
+            transaction_entry=$(find \
+                "$home/.local/state/arch-lidswitch/transactions" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            if [[ -n "$transaction_entry" ]]; then
+                printf 'systemctl %s failure retained a completed rollback\n' \
+                    "$scenario" >&2
+                exit 1
+            fi
+            assert_contains "$(<"$test_root/failing-install.out")" \
+                'Previous installation state restored' \
+                "systemctl $scenario failure should report rollback success"
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_reconciles_post_mutation_mv_failures() {
+    local scenario failures=0
+
+    for scenario in config-exchange backup-promotion; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local config marker installer_status=0 expected transaction_entry
+            local context effects
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            config="$home/.config/hypr/hyprland.lua"
+            marker="$test_root/pre-exchange-edit"
+            prepare_hyprland_config "$home"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+            case "$scenario" in
+                config-exchange)
+                    context=install-config
+                    expected=$'-- isolated Hyprland Lua test config\n-- concurrent edit immediately before exchange'
+                    ;;
+                backup-promotion)
+                    context=commit-backup
+                    expected='-- unused'
+                    ;;
+            esac
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_REAL_MV_BIN="$(command -v mv)" \
+                TEST_MV_MUTATE_THEN_FAIL_CONTEXT="$context" \
+                TEST_MV_EDIT_CONFIG_BEFORE_EXCHANGE="$([[ "$scenario" == config-exchange ]] && printf %s "$config" || true)" \
+                TEST_MV_EDIT_CONFIG_MARKER="$marker" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            effects=$(<"$effect_log")
+            assert_contains "$effects" "mv-context"$'\t'"$context" \
+                "test must reach post-mutation mv context $context" || exit 1
+            assert_contains "$(<"$test_root/installer.out")" \
+                "Configured post-mutation mv failure: $context" \
+                "test must inject post-mutation mv failure $context" || exit 1
+            transaction_entry=$(find \
+                "$home/.local/state/arch-lidswitch/transactions" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            if [[ "$scenario" == config-exchange ]]; then
+                if (( installer_status == 0 )); then
+                    printf 'post-mutation config exchange failure committed\n' >&2
+                    exit 1
+                fi
+                if [[ "$(<"$config")" != "$expected" || \
+                    "$(stat -c %a "$config")" != 644 || \
+                    -e "$home/.config/hypr/scripts/lid-state.sh" || \
+                    -n "$transaction_entry" ]]; then
+                    printf 'config exchange failure lost displaced concurrent bytes\n' >&2
+                    exit 1
+                fi
+            else
+                if (( installer_status != 0 )); then
+                    printf 'reconciled backup promotion returned %d\n%s\n' \
+                        "$installer_status" "$(<"$test_root/installer.out")" >&2
+                    exit 1
+                fi
+                if [[ ! -f "$home/.local/state/arch-lidswitch/current.manifest" || \
+                    -z "$(find "$home/.local/state/arch-lidswitch/backups" \
+                        -mindepth 1 -maxdepth 1 -type d -print -quit)" || \
+                    -n "$transaction_entry" ]]; then
+                    printf 'backup promotion failure was not reconciled as committed\n' >&2
+                    exit 1
+                fi
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_preserves_atomic_publication_races() {
+    local kind prior_state failures=0
+
+    for kind in managed manifest; do
+        for prior_state in present absent; do
+            (
+                set -euo pipefail
+
+                local test_root home fake_bin safe_bin effect_log monitor_fixture
+                local raced_file context marker initial concurrent expected mode
+                local installer_status=0 transaction_entry sibling_entry
+
+                test_root=$(mktemp -d)
+                trap 'rm -rf "$test_root"' EXIT
+                home="$test_root/home"
+                fake_bin="$test_root/fake-bin"
+                safe_bin="$test_root/safe-bin"
+                effect_log="$test_root/effects.log"
+                monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+                marker="$test_root/publication-race-fired"
+                prepare_hyprland_config "$home"
+                : > "$effect_log"
+                install_safe_path "$fake_bin" "$safe_bin"
+                ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+                case "$kind" in
+                    managed)
+                        raced_file="$home/.config/hypr/scripts/lid-state.sh"
+                        context=install-lid-state
+                        ;;
+                    manifest)
+                        raced_file="$home/.local/state/arch-lidswitch/current.manifest"
+                        context=install-manifest
+                        ;;
+                esac
+                initial="old-$kind"
+                concurrent="-- concurrent-$kind-$prior_state"
+                mode=640
+                mkdir -p "$(dirname "$raced_file")"
+                if [[ "$prior_state" == present ]]; then
+                    printf '%s\n' "$initial" > "$raced_file"
+                    chmod 0640 "$raced_file"
+                    expected="$initial"$'\n'"$concurrent"
+                else
+                    expected=$concurrent
+                fi
+
+                "$ENV_BIN" -i \
+                    HOME="$home" PATH="$fake_bin:$safe_bin" \
+                    WAYLAND_DISPLAY=wayland-test \
+                    HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                    XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                    TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                    TEST_MV_RACE_CONTEXT="$context" \
+                    TEST_MV_RACE_MODE="$([[ "$prior_state" == present ]] && printf append || printf create)" \
+                    TEST_MV_RACE_DESTINATION="$raced_file" \
+                    TEST_MV_RACE_CONTENT="$concurrent" \
+                    TEST_MV_RACE_MODE_BITS=0640 \
+                    TEST_MV_RACE_MARKER="$marker" \
+                    TEST_REAL_MV_BIN="$(command -v mv)" \
+                    "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                    > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+                if (( installer_status == 0 )); then
+                    printf '%s %s publication race unexpectedly committed\n' \
+                        "$kind" "$prior_state" >&2
+                    exit 1
+                fi
+                if [[ ! -f "$raced_file" || -L "$raced_file" || \
+                    "$(<"$raced_file")" != "$expected" || \
+                    "$(stat -c %a "$raced_file")" != "$mode" ]]; then
+                    printf '%s %s publication race did not preserve concurrent bytes/mode\n' \
+                        "$kind" "$prior_state" >&2
+                    exit 1
+                fi
+                transaction_entry=$(find \
+                    "$home/.local/state/arch-lidswitch/transactions" \
+                    -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+                sibling_entry=$(find "$(dirname "$raced_file")" -maxdepth 1 \
+                    -name '.arch-lidswitch.*' -print -quit)
+                if [[ -n "$transaction_entry" || -n "$sibling_entry" ]]; then
+                    printf '%s %s publication race left completed rollback state\n' \
+                        "$kind" "$prior_state" >&2
+                    exit 1
+                fi
+            ) || failures=$((failures + 1))
+        done
+    done
+
+    (( failures == 0 ))
+}
+
+installer_delivers_signal_during_trap_restoration() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture config
+    local installer_status=0 original transaction_entry
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    config="$home/.config/hypr/hyprland.lua"
+    original='-- config before trap restoration signal'
+    prepare_hyprland_config "$home"
+    printf '%s\n' "$original" > "$config"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        ARCH_LIDSWITCH_TEST_SIGNAL_DURING_TRAP_RESTORE=1 \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status != 143 )); then
+        printf 'trap-restoration TERM expected 143, got %d\n%s\n' \
+            "$installer_status" "$(<"$test_root/installer.out")" >&2
+        exit 1
+    fi
+    transaction_entry=$(find \
+        "$home/.local/state/arch-lidswitch/transactions" \
+        -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+    if [[ "$(<"$config")" != "$original" || \
+        -e "$home/.config/hypr/scripts/lid-state.sh" || \
+        -e "$home/.local/state/arch-lidswitch/current.manifest" || \
+        -n "$transaction_entry" ]]; then
+        printf 'trap-restoration TERM was lost or left a partial installation\n' >&2
+        exit 1
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'Delivering deferred installation signal status=143' \
+        'trap-restoration TERM should be delivered after both traps are restored'
+)
+
+installer_stops_externally_activated_published_units_on_rollback() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local installer_status=0 effects transaction_entry
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_MV_ACTIVATE_UNITS_AFTER_CONTEXT=install-resume-service \
+        TEST_REAL_MV_BIN="$(command -v mv)" \
+        ARCH_LIDSWITCH_TEST_FAIL_AFTER=installed-resume-service \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'externally activated unit rollback unexpectedly committed\n' >&2
+        exit 1
+    fi
+    effects=$(<"$effect_log")
+    assert_before "$effects" $'external-activation\tinstall-resume-service' \
+        $'systemctl\t--user\tstop\tlid-resume-monitor.service' \
+        'rollback should stop an externally activated published resume unit'
+    assert_before "$effects" $'external-activation\tinstall-resume-service' \
+        $'systemctl\t--user\tstop\tlid-monitor.service' \
+        'rollback should stop an externally activated published main unit'
+    if [[ -e "$effect_log.systemctl-state/lid-monitor.service.active" || \
+        -e "$effect_log.systemctl-state/lid-resume-monitor.service.active" || \
+        -e "$home/.config/systemd/user/lid-monitor.service" || \
+        -e "$home/.config/systemd/user/lid-resume-monitor.service" ]]; then
+        printf 'rollback left externally activated candidate units or files\n' >&2
+        exit 1
+    fi
+    transaction_entry=$(find \
+        "$home/.local/state/arch-lidswitch/transactions" \
+        -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+    if [[ -n "$transaction_entry" ]]; then
+        printf 'external activation rollback retained completed transaction\n' >&2
+        exit 1
+    fi
+)
+
+installer_preserves_edits_during_rollback_exchange() {
+    local scenario failures=0
+
+    for scenario in artifact artifact-fallback config; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local config managed_file main_unit resume_unit raced_file context
+            local checkpoint remove_context="" marker installer_status=0
+            local transaction_entry concurrent='-- concurrent rollback edit'
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            config="$home/.config/hypr/hyprland.lua"
+            managed_file="$home/.config/hypr/scripts/lid-state.sh"
+            main_unit="$home/.config/systemd/user/lid-monitor.service"
+            resume_unit="$home/.config/systemd/user/lid-resume-monitor.service"
+            marker="$test_root/rollback-race-fired"
+            prepare_hyprland_config "$home"
+            mkdir -p "$(dirname "$managed_file")" "$(dirname "$main_unit")"
+            printf '%s\n' old-lid-state > "$managed_file"
+            chmod 0711 "$managed_file"
+            printf '%s\n' '[Install]' 'WantedBy=graphical-session.target' \
+                > "$main_unit"
+            printf '%s\n' '[Service]' 'Type=exec' > "$resume_unit"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+            case "$scenario" in
+                artifact)
+                    raced_file=$managed_file
+                    context=rollback-lid-state
+                    checkpoint=installed-lid-state
+                    ;;
+                artifact-fallback)
+                    raced_file=$managed_file
+                    context=rollback-lid-state-fallback
+                    checkpoint=installed-lid-state
+                    remove_context=rollback-lid-state
+                    ;;
+                config)
+                    raced_file=$config
+                    context=rollback-config
+                    checkpoint=config-integrated
+                    ;;
+            esac
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_SYSTEMCTL_MAIN_ENABLED=1 TEST_SYSTEMCTL_MAIN_ACTIVE=1 \
+                TEST_SYSTEMCTL_RESUME_ACTIVE=1 \
+                ARCH_LIDSWITCH_TEST_FAIL_AFTER="$checkpoint" \
+                TEST_MV_RACE_CONTEXT="$context" TEST_MV_RACE_MODE=append \
+                TEST_MV_RACE_DESTINATION="$raced_file" \
+                TEST_MV_RACE_CONTENT="$concurrent" \
+                TEST_MV_RACE_MARKER="$marker" \
+                TEST_MV_REMOVE_SOURCE_BEFORE_CONTEXT="$remove_context" \
+                TEST_REAL_MV_BIN="$(command -v mv)" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )); then
+                printf '%s rollback race unexpectedly committed\n' \
+                    "$scenario" >&2
+                exit 1
+            fi
+            assert_contains "$(<"$raced_file")" "$concurrent" \
+                "$scenario rollback should keep the concurrent edit live" \
+                || exit 1
+            assert_contains "$(<"$test_root/installer.out")" \
+                'concurrent content restored' \
+                "$scenario rollback should report exchange-back preservation" \
+                || exit 1
+            if [[ -e "$effect_log.systemctl-state/lid-monitor.service.active" || \
+                -e "$effect_log.systemctl-state/lid-resume-monitor.service.active" ]]; then
+                printf '%s rollback race restarted services\n' "$scenario" >&2
+                exit 1
+            fi
+            transaction_entry=$(find \
+                "$home/.local/state/arch-lidswitch/transactions" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            if [[ -z "$transaction_entry" ]]; then
+                printf '%s rollback race discarded recovery state\n' \
+                    "$scenario" >&2
+                exit 1
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_restores_nonregular_publication_races() {
+    local kind failures=0
+
+    for kind in artifact config artifact-directory; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local config managed_file raced_file context marker target
+            local race_mode=symlink
+            local installer_status=0 transaction_entry
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            config="$home/.config/hypr/hyprland.lua"
+            managed_file="$home/.config/hypr/scripts/lid-state.sh"
+            marker="$test_root/nonregular-race-fired"
+            target="$test_root/concurrent-symlink-target"
+            prepare_hyprland_config "$home"
+            mkdir -p "$(dirname "$managed_file")"
+            printf '%s\n' old-lid-state > "$managed_file"
+            chmod 0711 "$managed_file"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+            case "$kind" in
+                artifact)
+                    raced_file=$managed_file
+                    context=install-lid-state
+                    ;;
+                config)
+                    raced_file=$config
+                    context=install-config
+                    ;;
+                artifact-directory)
+                    raced_file=$managed_file
+                    context=install-lid-state
+                    race_mode=directory
+                    ;;
+            esac
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_MV_RACE_CONTEXT="$context" TEST_MV_RACE_MODE="$race_mode" \
+                TEST_MV_RACE_DESTINATION="$raced_file" \
+                TEST_MV_RACE_CONTENT="$target" \
+                TEST_MV_RACE_MARKER="$marker" \
+                TEST_REAL_LN_BIN="$(command -v ln)" \
+                TEST_REAL_MV_BIN="$(command -v mv)" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )); then
+                printf '%s non-regular publication race unexpectedly committed\n' \
+                    "$kind" >&2
+                exit 1
+            fi
+            if [[ "$race_mode" == symlink && \
+                ( ! -L "$raced_file" || \
+                "$(readlink "$raced_file")" != "$target" ) ]] || \
+                [[ "$race_mode" == directory && \
+                ( -L "$raced_file" || ! -d "$raced_file" || \
+                ! -f "$raced_file/concurrent-entry" || \
+                "$(<"$raced_file/concurrent-entry")" != "$target" ) ]]; then
+                printf '%s non-regular publication race was not restored exactly\n' \
+                    "$kind" >&2
+                ls -ld -- "$raced_file" >&2 || true
+                printf '%s\n' "$(<"$test_root/installer.out")" >&2
+                exit 1
+            fi
+            transaction_entry=$(find \
+                "$home/.local/state/arch-lidswitch/transactions" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            if [[ -n "$transaction_entry" ]]; then
+                printf '%s non-regular publication race retained completed rollback\n' \
+                    "$kind" >&2
+                exit 1
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_does_not_restart_after_rollback_reload_failure() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local main_unit resume_unit counter installer_status=0 transaction_entry
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    main_unit="$home/.config/systemd/user/lid-monitor.service"
+    resume_unit="$home/.config/systemd/user/lid-resume-monitor.service"
+    counter="$test_root/daemon-reload-count"
+    prepare_hyprland_config "$home"
+    mkdir -p "$(dirname "$main_unit")"
+    printf '%s\n' '[Install]' 'WantedBy=graphical-session.target' '# old main' \
+        > "$main_unit"
+    printf '%s\n' '[Service]' 'Type=exec' '# old resume' > "$resume_unit"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_SYSTEMCTL_MAIN_ENABLED=1 TEST_SYSTEMCTL_MAIN_ACTIVE=1 \
+        TEST_SYSTEMCTL_RESUME_ACTIVE=1 \
+        TEST_SYSTEMCTL_FAIL_DAEMON_RELOAD_CALL=2 \
+        TEST_SYSTEMCTL_FAILURE_COUNTER="$counter" \
+        ARCH_LIDSWITCH_TEST_FAIL_AFTER=health-checked \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'rollback daemon-reload failure unexpectedly committed\n' >&2
+        exit 1
+    fi
+    if [[ "$(<"$counter")" != 2 || \
+        -e "$effect_log.systemctl-state/lid-monitor.service.active" || \
+        -e "$effect_log.systemctl-state/lid-resume-monitor.service.active" ]]; then
+        printf 'rollback daemon-reload failure did not leave both services stopped\n' >&2
+        exit 1
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'Could not reload restored user-systemd unit definitions' \
+        'rollback reload failure should explain why restart was skipped'
+    assert_contains "$(<"$test_root/installer.out")" \
+        'Services remain stopped because restored service state could not be verified' \
+        'rollback reload failure should retain a safe stopped state'
+    transaction_entry=$(find \
+        "$home/.local/state/arch-lidswitch/transactions" \
+        -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+    if [[ -z "$transaction_entry" ]]; then
+        printf 'rollback reload failure discarded recovery state\n' >&2
+        exit 1
+    fi
+    if [[ "$(awk -F '\t' '$1 == "systemctl" && $3 == "daemon-reload" { n++ } \
+        $1 == "systemctl" && $3 == "start" && n >= 2 { print; exit }' \
+        "$effect_log")" != "" ]]; then
+        printf 'rollback reload failure started a service after failed reload\n' >&2
+        exit 1
+    fi
+)
+
+installer_rejects_replaced_backup_promotion() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture capture
+    local installer_status=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    capture="$test_root/promoted-snapshot-capture"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_MV_REPLACE_DESTINATION_AFTER_CONTEXT=commit-backup \
+        TEST_MV_REPLACED_DESTINATION_CAPTURE="$capture" \
+        TEST_REAL_MV_BIN="$(command -v mv)" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'replaced backup promotion was accepted as committed\n' >&2
+        exit 1
+    fi
+    if [[ ! -f "$capture/snapshot.tsv" || \
+        ! -f "$capture/service-state" || ! -f "$capture/hyprland.lua" ]]; then
+        printf 'replaced backup promotion lost the original rollback snapshot\n' >&2
+        exit 1
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'Could not verify promoted rollback snapshot identity' \
+        'backup promotion must verify the moved source identity'
+    assert_not_contains "$(<"$test_root/installer.out")" \
+        'Committed artifact transaction' \
+        'a replaced backup destination must never be reported committed'
+)
+
+installer_rejects_corrupted_promoted_backup_children() {
+    local mutation relative failures=0
+
+    for mutation in append delete directory-symlink; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local config managed_file original installer_status=0 backup_entry
+            local directory_capture
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            config="$home/.config/hypr/hyprland.lua"
+            managed_file="$home/.config/hypr/scripts/lid-state.sh"
+            directory_capture="$test_root/promoted-files-scripts-capture"
+            original='-- config before backup integrity failure'
+            case "$mutation" in
+                append)
+                    relative=hyprland.lua
+                    ;;
+                delete)
+                    relative=service-state
+                    ;;
+                directory-symlink)
+                    relative=files/scripts
+                    ;;
+            esac
+            prepare_hyprland_config "$home"
+            printf '%s\n' "$original" > "$config"
+            mkdir -p "$(dirname "$managed_file")"
+            printf '%s\n' old-lid-state > "$managed_file"
+            chmod 0711 "$managed_file"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+            ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_MV_MUTATE_BACKUP_CHILD_AFTER_CONTEXT=commit-backup \
+                TEST_MV_BACKUP_CHILD_MUTATION="$mutation" \
+                TEST_MV_BACKUP_CHILD_RELATIVE="$relative" \
+                TEST_MV_BACKUP_DIRECTORY_CAPTURE="$directory_capture" \
+                TEST_REAL_LN_BIN="$(command -v ln)" \
+                TEST_REAL_MV_BIN="$(command -v mv)" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )); then
+                printf 'promoted backup child %s was accepted\n' "$mutation" >&2
+                exit 1
+            fi
+            assert_contains "$(<"$test_root/installer.out")" \
+                'Promoted rollback snapshot failed complete integrity verification' \
+                "backup child $mutation should fail complete verification" \
+                || exit 1
+            assert_not_contains "$(<"$test_root/installer.out")" \
+                'Committed artifact transaction' \
+                "backup child $mutation must not be reported committed" \
+                || exit 1
+            if [[ "$(<"$config")" != "$original" || \
+                ! -f "$managed_file" || -L "$managed_file" || \
+                "$(<"$managed_file")" != old-lid-state || \
+                "$(stat -c %a "$managed_file")" != 711 || \
+                -e "$home/.local/state/arch-lidswitch/current.manifest" ]]; then
+                printf 'backup child %s failure did not restore prior state\n' \
+                    "$mutation" >&2
+                exit 1
+            fi
+            backup_entry=$(find "$home/.local/state/arch-lidswitch/backups" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            if [[ -n "$backup_entry" ]]; then
+                printf 'backup child %s failure retained rejected promotion\n' \
+                    "$mutation" >&2
+                exit 1
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_requires_systemd_analyze_before_transaction_writes() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    rm -f "$fake_bin/systemd-analyze" "$safe_bin/systemd-analyze"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'installer accepted missing systemd-analyze\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$home/.local/state/arch-lidswitch" || \
+        -e "$home/.config/hypr/scripts/lid-state.sh" ]]; then
+        printf 'missing systemd-analyze caused transaction writes\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$(<"$test_root/installer.out")" \
+        'requires systemd-analyze for transactional installation' \
+        'missing systemd-analyze should receive an explicit diagnostic' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+readme_documents_complete_transaction_uninstall() {
+    local readme_contents failures=0 path
+    local -a managed_paths=(
+        lid-state.sh monitor-state.sh lid-switch.sh lid-switch-doctor.sh
+        lid-monitor.sh lid-resume-monitor.sh lid-session-bridge.sh session.lua
+        hyprland-session.target lid-monitor.service lid-resume-monitor.service
+    )
+
+    readme_contents=$(<"$ROOT_DIR/README.md")
+    for path in "${managed_paths[@]}"; do
+        if [[ "$readme_contents" != *"rm -f "*"$path"* ]]; then
+            printf 'uninstall docs omit managed artifact: %s\n' "$path" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    assert_contains "$readme_contents" \
+        'rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/arch-lidswitch"' \
+        'uninstall docs should remove manifest and retained rollback state' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" \
+        'BEGIN arch-lidswitch managed session integration' \
+        'uninstall docs should identify the owned config block' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" \
+        'best-effort attempt to prune older complete rollback sets' \
+        'backup pruning policy should distinguish cleanup from commit' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
 tests_run=0
 tests_failed=0
 tests_selected=0
@@ -5156,6 +6913,126 @@ run_test \
     'BUG-002-installer' \
     'installer packages the resume listener and requires systemd 257' \
     installer_packages_resume_monitor_and_requires_systemd_257
+
+run_test \
+    'BUG-018-transaction-commit' \
+    'installer commits one complete private artifact transaction' \
+    installer_commits_a_complete_private_transaction
+
+run_test \
+    'BUG-018-transaction-fault-matrix' \
+    'every installation checkpoint restores an exact old or fresh state' \
+    installer_rolls_back_every_fault_checkpoint
+
+run_test \
+    'BUG-018-transaction-config-cas' \
+    'transaction preserves a concurrent user-owned config edit' \
+    installer_preserves_a_concurrent_user_config_edit
+
+run_test \
+    'BUG-018-transaction-static-listener' \
+    'transaction refuses independently enabled static listener state' \
+    installer_rejects_an_independently_enabled_resume_listener
+
+run_test \
+    'BUG-018-transaction-pre-resume-upgrade' \
+    'rollback restores an active main-only pre-resume-listener installation' \
+    installer_restores_a_pre_resume_main_only_install
+
+run_test \
+    'BUG-018-transaction-rollback-publish-failure' \
+    'rollback publication failures retain exact recovery without corrupting live files' \
+    installer_retains_recovery_after_rollback_publish_failure
+
+run_test \
+    'BUG-018-transaction-signal-bookkeeping' \
+    'signals after mutations observe recorded intent or committed backup state' \
+    installer_handles_signals_after_transaction_mutations
+
+run_test \
+    'BUG-018-transaction-snapshot-race' \
+    'snapshot copy races preserve managed and manifest concurrent edits' \
+    installer_rejects_snapshot_copy_races
+
+run_test \
+    'BUG-018-transaction-existing-config-cas' \
+    'existing managed config blocks are still checked with compare-and-swap' \
+    installer_cas_checks_an_existing_managed_config_block
+
+run_test \
+    'BUG-018-transaction-post-snapshot-activation' \
+    'post-snapshot unit activation is quiesced and verified before publication' \
+    installer_quiesces_units_activated_after_snapshot
+
+run_test \
+    'BUG-018-transaction-staged-unit-validation' \
+    'staged target and services are verified before any live mutation' \
+    installer_validates_staged_systemd_units_before_mutation
+
+run_test \
+    'BUG-018-transaction-relative-state-path' \
+    'installer rejects relative XDG_STATE_HOME before writes' \
+    installer_rejects_relative_xdg_state_home
+
+run_test \
+    'BUG-018-transaction-systemctl-failures' \
+    'stop reload start and health failures restore prior service state' \
+    installer_rolls_back_systemctl_operation_failures
+
+run_test \
+    'BUG-018-transaction-post-mutation-mv-failure' \
+    'config exchange and backup promotion reconcile post-mutation failures' \
+    installer_reconciles_post_mutation_mv_failures
+
+run_test \
+    'BUG-018-transaction-publication-cas-race' \
+    'atomic artifact and manifest publication preserves raced destinations' \
+    installer_preserves_atomic_publication_races
+
+run_test \
+    'BUG-018-transaction-trap-restoration-signal' \
+    'signals during trap restoration are delivered without partial state' \
+    installer_delivers_signal_during_trap_restoration
+
+run_test \
+    'BUG-018-transaction-published-unit-activation' \
+    'rollback stops externally activated published unit generations' \
+    installer_stops_externally_activated_published_units_on_rollback
+
+run_test \
+    'BUG-018-transaction-rollback-exchange-race' \
+    'rollback exchanges preserve concurrent artifact and config edits' \
+    installer_preserves_edits_during_rollback_exchange
+
+run_test \
+    'BUG-018-transaction-nonregular-publication-race' \
+    'rollback restores concurrent non-regular artifact and config paths' \
+    installer_restores_nonregular_publication_races
+
+run_test \
+    'BUG-018-transaction-rollback-reload-failure' \
+    'rollback reload failure leaves restored services stopped' \
+    installer_does_not_restart_after_rollback_reload_failure
+
+run_test \
+    'BUG-018-transaction-backup-promotion-identity' \
+    'backup promotion verifies the moved rollback snapshot identity' \
+    installer_rejects_replaced_backup_promotion
+
+run_test \
+    'BUG-018-transaction-backup-promotion-integrity' \
+    'backup promotion verifies every retained rollback snapshot child' \
+    installer_rejects_corrupted_promoted_backup_children
+
+run_test \
+    'BUG-018-transaction-systemd-analyze-dependency' \
+    'systemd-analyze is required before transaction writes' \
+    installer_requires_systemd_analyze_before_transaction_writes
+
+run_test \
+    'BUG-018-transaction-uninstall-docs' \
+    'uninstall docs cover all managed artifacts config and state' \
+    readme_documents_complete_transaction_uninstall
 
 run_test \
     'BUG-016-jq-dependency' \

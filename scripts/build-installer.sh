@@ -31,6 +31,30 @@ fi
 temporary_installer=$(mktemp)
 trap 'rm -f "$temporary_installer"' EXIT
 
+EMBED_MARKERS=(
+    '@@LID_STATE_SCRIPT@@'
+    '@@MONITOR_STATE_SCRIPT@@'
+    '@@LID_SWITCH_SCRIPT@@'
+    '@@LID_SWITCH_DOCTOR_PREFLIGHT@@'
+    '@@LID_SWITCH_DOCTOR@@'
+    '@@LID_MONITOR_SCRIPT@@'
+    '@@LID_RESUME_MONITOR_SCRIPT@@'
+    '@@LID_MONITOR_SERVICE@@'
+    '@@LID_RESUME_MONITOR_SERVICE@@'
+    '@@HYPRLAND_SESSION_TARGET@@'
+    '@@LID_SESSION_BRIDGE@@'
+    '@@HYPRLAND_SESSION_MODULE@@'
+)
+
+for marker in "${EMBED_MARKERS[@]}"; do
+    marker_count=$(grep -Fxc -- "$marker" "$INSTALLER_TEMPLATE" || true)
+    if (( marker_count != 1 )); then
+        printf 'Installer template must contain exactly one %s marker; found %d.\n' \
+            "$marker" "$marker_count" >&2
+        exit 1
+    fi
+done
+
 while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
         '@@LID_STATE_SCRIPT@@')
@@ -43,6 +67,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
             sed -n 'p' "$ROOT_DIR/runtime/lid-switch.sh.in"
             ;;
         '@@LID_SWITCH_DOCTOR@@')
+            sed -n 'p' "$ROOT_DIR/runtime/lid-switch-doctor.sh"
+            ;;
+        '@@LID_SWITCH_DOCTOR_PREFLIGHT@@')
             sed -n 'p' "$ROOT_DIR/runtime/lid-switch-doctor.sh"
             ;;
         '@@LID_MONITOR_SCRIPT@@')
@@ -71,6 +98,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
             ;;
     esac
 done < "$INSTALLER_TEMPLATE" > "$temporary_installer"
+
+if grep -Eq '^@@[A-Z0-9_]+@@$' "$temporary_installer"; then
+    echo "Generated installer contains an unresolved embed marker." >&2
+    exit 1
+fi
 
 if [[ "$mode" == "check" ]]; then
     if ! cmp -s "$temporary_installer" "$INSTALLER"; then

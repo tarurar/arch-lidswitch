@@ -35,6 +35,10 @@ RESUME_SERVICE_FILE="$SYSTEMD_USER_DIR/lid-resume-monitor.service"
 DOCTOR_FILE="$SCRIPTS_DIR/lid-switch-doctor.sh"
 MONITOR_STATE_FILE="$SCRIPTS_DIR/monitor-state.sh"
 RESUME_MONITOR_FILE="$SCRIPTS_DIR/lid-resume-monitor.sh"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/arch-lidswitch"
+TRANSACTIONS_DIR="$STATE_ROOT/transactions"
+BACKUPS_DIR="$STATE_ROOT/backups"
+CURRENT_MANIFEST="$STATE_ROOT/current.manifest"
 
 SESSION_CONFIG_BEGIN='-- BEGIN arch-lidswitch managed session integration'
 SESSION_CONFIG_END='-- END arch-lidswitch managed session integration'
@@ -44,9 +48,128 @@ laptop_monitor=""
 HYPRCTL_BIN=""
 JQ_BIN=""
 TIMEOUT_BIN=""
+SYSTEMD_ANALYZE_BIN=""
 HYPRLAND_MONITORS_JSON=""
 session_config_state=""
 legacy_default_target_service=false
+transaction_active=false
+transaction_committed=false
+backup_promoted_uncommitted=false
+transaction_lock_fd=""
+transaction_id=""
+transaction_dir=""
+transaction_stage_dir=""
+transaction_before_dir=""
+transaction_manifest=""
+config_candidate=""
+config_snapshot_mode=""
+config_publish_intent=false
+config_exchange_sibling=""
+config_candidate_identity=""
+config_displaced_validated=false
+manifest_publish_intent=false
+manifest_exchange_sibling=""
+manifest_candidate_identity=""
+manifest_displaced_validated=false
+manifest_was_present=false
+manifest_was_mode=""
+manifest_was_hash=""
+service_state_changed=false
+main_enablement_state=""
+resume_enablement_state=""
+main_was_active=false
+resume_was_active=false
+deferred_transaction_signal=""
+trap_restore_signal_injected=false
+scripts_dir_existed=false
+session_module_dir_existed=false
+systemd_user_dir_existed=false
+
+ARTIFACT_IDS=(
+    lid-state
+    monitor-state
+    lid-switch
+    lid-switch-doctor
+    lid-monitor
+    lid-resume-monitor
+    lid-session-bridge
+    session-module
+    session-target
+    main-service
+    resume-service
+)
+declare -A ARTIFACT_RELATIVE_PATH=(
+    [lid-state]=scripts/lid-state.sh
+    [monitor-state]=scripts/monitor-state.sh
+    [lid-switch]=scripts/lid-switch.sh
+    [lid-switch-doctor]=scripts/lid-switch-doctor.sh
+    [lid-monitor]=scripts/lid-monitor.sh
+    [lid-resume-monitor]=scripts/lid-resume-monitor.sh
+    [lid-session-bridge]=scripts/lid-session-bridge.sh
+    [session-module]=arch_lidswitch/session.lua
+    [session-target]=systemd/user/hyprland-session.target
+    [main-service]=systemd/user/lid-monitor.service
+    [resume-service]=systemd/user/lid-resume-monitor.service
+)
+declare -A ARTIFACT_DESTINATION=(
+    [lid-state]="$SCRIPTS_DIR/lid-state.sh"
+    [monitor-state]="$MONITOR_STATE_FILE"
+    [lid-switch]="$SCRIPTS_DIR/lid-switch.sh"
+    [lid-switch-doctor]="$DOCTOR_FILE"
+    [lid-monitor]="$SCRIPTS_DIR/lid-monitor.sh"
+    [lid-resume-monitor]="$RESUME_MONITOR_FILE"
+    [lid-session-bridge]="$SESSION_BRIDGE"
+    [session-module]="$SESSION_MODULE"
+    [session-target]="$SESSION_TARGET_FILE"
+    [main-service]="$SERVICE_FILE"
+    [resume-service]="$RESUME_SERVICE_FILE"
+)
+declare -A ARTIFACT_MODE=(
+    [lid-state]=0755
+    [monitor-state]=0755
+    [lid-switch]=0755
+    [lid-switch-doctor]=0755
+    [lid-monitor]=0755
+    [lid-resume-monitor]=0755
+    [lid-session-bridge]=0755
+    [session-module]=0644
+    [session-target]=0644
+    [main-service]=0644
+    [resume-service]=0644
+)
+declare -A ARTIFACT_WAS_PRESENT=()
+declare -A ARTIFACT_WAS_MODE=()
+declare -A ARTIFACT_WAS_HASH=()
+declare -A ARTIFACT_PUBLISH_INTENT=()
+declare -A ARTIFACT_EXCHANGE_SIBLING=()
+declare -A ARTIFACT_CANDIDATE_IDENTITY=()
+declare -A ARTIFACT_DISPLACED_VALIDATED=()
+TEMPORARY_DESTINATIONS=()
+
+FAULT_CHECKPOINTS=(
+    prepared
+    services-quiesced
+    legacy-stopped
+    installed-lid-state
+    installed-monitor-state
+    installed-lid-switch
+    installed-lid-switch-doctor
+    installed-lid-monitor
+    installed-lid-resume-monitor
+    installed-lid-session-bridge
+    installed-session-module
+    installed-session-target
+    installed-main-service
+    installed-resume-service
+    manifest-installed
+    config-integrated
+    daemon-reloaded
+    main-enabled
+    session-imported
+    main-started
+    resume-started
+    health-checked
+)
 
 ################################################################################
 # Utility Functions
@@ -233,9 +356,25 @@ check_resume_runtime_dependencies() {
     log_success "systemd/busctl $version_major supports the resume event stream"
 }
 
+check_transaction_dependencies() {
+    local dependency
+
+    if [[ -n "${XDG_STATE_HOME:-}" && "$XDG_STATE_HOME" != /* ]]; then
+        log_error "XDG_STATE_HOME must be an absolute path"
+        return 1
+    fi
+    for dependency in cmp flock sha256sum stat luac systemd-analyze; do
+        if ! command_exists "$dependency"; then
+            log_error "This installer requires $dependency for transactional installation"
+            return 1
+        fi
+    done
+    SYSTEMD_ANALYZE_BIN=$(command -v systemd-analyze)
+}
+
 run_lid_switch_doctor() {
     /bin/bash -s -- --policy-only <<'EOF'
-@@LID_SWITCH_DOCTOR@@
+@@LID_SWITCH_DOCTOR_PREFLIGHT@@
 EOF
 }
 
@@ -310,30 +449,6 @@ inspect_session_config() {
     session_config_state="present"
 }
 
-integrate_session_config() {
-    local candidate
-
-    if [[ "$session_config_state" == "present" ]]; then
-        log_info "Hyprland session integration is already present"
-        return 0
-    fi
-
-    candidate=$(mktemp "$HYPRLAND_CONFIG_FILE.arch-lidswitch.XXXXXX")
-    if ! cp -p -- "$HYPRLAND_CONFIG_FILE" "$candidate"; then
-        rm -f -- "$candidate"
-        return 1
-    fi
-
-    {
-        printf '\n'
-        write_session_config_block
-    } >> "$candidate"
-
-    mv -- "$candidate" "$HYPRLAND_CONFIG_FILE"
-    session_config_state="present"
-    log_success "Hyprland session integration added to $HYPRLAND_CONFIG_FILE"
-}
-
 # Detect laptop and external monitors
 detect_monitors() {
     local configured_internal=${HYPR_LID_INTERNAL_OUTPUT:-}
@@ -404,202 +519,602 @@ detect_monitors() {
     fi
 }
 
-# Create directories if they don't exist
-create_directories() {
-    log_info "Creating necessary directories..."
-    
-    mkdir -p "$SCRIPTS_DIR"
-    mkdir -p "$SESSION_MODULE_DIR"
-    mkdir -p "$SYSTEMD_USER_DIR"
-    
-    log_success "Directories created"
-}
+# Render the helper that orders environment import before session activation.
+render_session_bridge() {
+    local destination=$1
 
-# Install the helper that orders environment import before session activation
-install_session_bridge() {
-    log_info "Installing Hyprland session bridge..."
-
-    cat > "$SESSION_BRIDGE" << 'EOF'
+    cat > "$destination" << 'EOF'
 @@LID_SESSION_BRIDGE@@
 EOF
-
-    chmod +x "$SESSION_BRIDGE"
-    log_success "Hyprland session bridge installed at $SESSION_BRIDGE"
 }
 
-# Install the isolated Lua event handlers next to hyprland.lua
-install_session_module() {
-    log_info "Installing Hyprland session module..."
+render_session_module() {
+    local destination=$1
 
-    cat > "$SESSION_MODULE" << 'EOF'
+    cat > "$destination" << 'EOF'
 @@HYPRLAND_SESSION_MODULE@@
 EOF
-
-    log_success "Hyprland session module installed at $SESSION_MODULE"
 }
 
-# Install the compositor-specific target that owns graphical-session.target
-install_session_target() {
-    log_info "Installing Hyprland session target..."
+render_session_target() {
+    local destination=$1
 
-    cat > "$SESSION_TARGET_FILE" << 'EOF'
+    cat > "$destination" << 'EOF'
 @@HYPRLAND_SESSION_TARGET@@
 EOF
-
-    log_success "Hyprland session target installed at $SESSION_TARGET_FILE"
 }
 
-# Install the shared lid state observer
-install_lid_state_script() {
-    log_info "Installing shared lid state observer..."
+render_lid_state_script() {
+    local destination=$1
 
-    cat > "$SCRIPTS_DIR/lid-state.sh" << 'EOF'
+    cat > "$destination" << 'EOF'
 @@LID_STATE_SCRIPT@@
 EOF
-
-    chmod +x "$SCRIPTS_DIR/lid-state.sh"
-
-    log_success "Lid state observer installed at $SCRIPTS_DIR/lid-state.sh"
 }
 
-install_monitor_state_script() {
-    log_info "Installing monitor state module..."
+render_monitor_state_script() {
+    local destination=$1
 
-    cat > "$MONITOR_STATE_FILE" << 'EOF'
+    cat > "$destination" << 'EOF'
 @@MONITOR_STATE_SCRIPT@@
 EOF
-
-    chmod +x "$MONITOR_STATE_FILE"
-    log_success "Monitor state module installed at $MONITOR_STATE_FILE"
 }
 
-# Install the lid switch script
-install_lid_switch_script() {
-    local laptop_monitor="$1"
-    
-    log_info "Installing lid switch script..."
-    
-    cat > "$SCRIPTS_DIR/lid-switch.sh" << 'EOF'
+render_lid_switch_script() {
+    local destination=$1
+    local internal_output=$2
+
+    cat > "$destination" << 'EOF'
 @@LID_SWITCH_SCRIPT@@
 EOF
 
-    # Replace placeholder with actual laptop monitor
-    sed -i "s/LAPTOP_MONITOR_PLACEHOLDER/$laptop_monitor/g" "$SCRIPTS_DIR/lid-switch.sh"
-    
-    # Make script executable
-    chmod +x "$SCRIPTS_DIR/lid-switch.sh"
-    
-    log_success "Lid switch script installed at $SCRIPTS_DIR/lid-switch.sh"
+    sed -i "s/LAPTOP_MONITOR_PLACEHOLDER/$internal_output/g" "$destination"
 }
 
-install_lid_switch_doctor() {
-    log_info "Installing lid switch doctor..."
+render_lid_switch_doctor() {
+    local destination=$1
 
-    cat > "$DOCTOR_FILE" << 'EOF'
+    cat > "$destination" << 'EOF'
 @@LID_SWITCH_DOCTOR@@
 EOF
-
-    chmod +x "$DOCTOR_FILE"
-    log_success "Lid switch doctor installed at $DOCTOR_FILE"
 }
 
-# Install the lid monitor script
-install_lid_monitor_script() {
-    log_info "Installing lid monitor script..."
-    
-    cat > "$SCRIPTS_DIR/lid-monitor.sh" << 'EOF'
+render_lid_monitor_script() {
+    local destination=$1
+    local internal_output=$2
+
+    cat > "$destination" << 'EOF'
 @@LID_MONITOR_SCRIPT@@
 EOF
 
-    sed -i "s/LAPTOP_MONITOR_PLACEHOLDER/$laptop_monitor/g" \
-        "$SCRIPTS_DIR/lid-monitor.sh"
-    
-    # Make script executable
-    chmod +x "$SCRIPTS_DIR/lid-monitor.sh"
-    
-    log_success "Lid monitor script installed at $SCRIPTS_DIR/lid-monitor.sh"
+    sed -i "s/LAPTOP_MONITOR_PLACEHOLDER/$internal_output/g" "$destination"
 }
 
-install_lid_resume_monitor_script() {
-    log_info "Installing lid resume monitor script..."
+render_lid_resume_monitor_script() {
+    local destination=$1
 
-    cat > "$RESUME_MONITOR_FILE" << 'EOF'
+    cat > "$destination" << 'EOF'
 @@LID_RESUME_MONITOR_SCRIPT@@
 EOF
-
-    chmod +x "$RESUME_MONITOR_FILE"
-    log_success "Lid resume monitor installed at $RESUME_MONITOR_FILE"
 }
 
-# Install the systemd service
-install_systemd_service() {
-    log_info "Installing systemd user services..."
-    
-    cat > "$SERVICE_FILE" << EOF
+replace_literal_token() {
+    local file=$1
+    local token=$2
+    local replacement=$3
+    local temporary line prefix suffix
+
+    temporary=$(mktemp "$file.replace.XXXXXX")
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == *"$token"* ]]; then
+            prefix=${line%%"$token"*}
+            suffix=${line#*"$token"}
+            line=$prefix$replacement$suffix
+        fi
+        printf '%s\n' "$line"
+    done < "$file" > "$temporary"
+    mv -f -- "$temporary" "$file"
+}
+
+render_systemd_services() {
+    local main_destination=$1
+    local resume_destination=$2
+
+    cat > "$main_destination" << 'EOF'
 @@LID_MONITOR_SERVICE@@
 EOF
 
-    cat > "$RESUME_SERVICE_FILE" << EOF
+    cat > "$resume_destination" << 'EOF'
 @@LID_RESUME_MONITOR_SERVICE@@
 EOF
-    
-    log_success "Systemd services installed at $SYSTEMD_USER_DIR"
+
+    replace_literal_token "$main_destination" '$TIMEOUT_BIN' "$TIMEOUT_BIN"
+    replace_literal_token "$main_destination" '$HYPRCTL_BIN' "$HYPRCTL_BIN"
+    replace_literal_token "$main_destination" '$SCRIPTS_DIR' "$SCRIPTS_DIR"
+    replace_literal_token "$resume_destination" '$SCRIPTS_DIR' "$SCRIPTS_DIR"
 }
 
-detect_legacy_default_target_service() {
-    if [[ -f "$SERVICE_FILE" ]] && grep -Fqx 'WantedBy=default.target' "$SERVICE_FILE"; then
-        legacy_default_target_service=true
+################################################################################
+# Transaction Module
+################################################################################
+
+artifact_stage_path() {
+    local artifact_id=$1
+    printf '%s/%s\n' "$transaction_stage_dir" \
+        "${ARTIFACT_RELATIVE_PATH[$artifact_id]}"
+}
+
+sha256_file() {
+    local output
+
+    if ! output=$(sha256sum -- "$1"); then
+        log_error "Could not hash file: $1" >&2
+        return 1
+    fi
+    output=${output%% *}
+    if [[ ! "$output" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        log_error "Could not parse file hash: $1" >&2
+        return 1
+    fi
+    printf '%s\n' "$output"
+}
+
+validate_fault_checkpoint() {
+    local configured=${ARCH_LIDSWITCH_TEST_FAIL_AFTER:-}
+    local checkpoint
+
+    if [[ -z "$configured" ]]; then
+        return 0
+    fi
+    for checkpoint in "${FAULT_CHECKPOINTS[@]}"; do
+        if [[ "$configured" == "$checkpoint" ]]; then
+            return 0
+        fi
+    done
+    log_error "Unknown transactional fault checkpoint: $configured"
+    return 1
+}
+
+fault_after() {
+    local checkpoint=$1
+
+    if [[ "${ARCH_LIDSWITCH_TEST_FAIL_AFTER:-}" == "$checkpoint" ]]; then
+        log_error "Injected transactional failure after checkpoint=$checkpoint"
+        return 97
     fi
 }
 
-migrate_legacy_default_target_service() {
-    if [[ "$legacy_default_target_service" == true ]]; then
-        log_info "Stopping the legacy default-target lid monitor service..."
-        systemctl --user disable --now lid-monitor.service
+defer_transaction_signals() {
+    deferred_transaction_signal=""
+    trap 'deferred_transaction_signal=130' INT
+    trap 'deferred_transaction_signal=143' TERM
+}
+
+restore_and_deliver_transaction_signals() {
+    local deferred
+
+    trap 'log_error "Installation interrupted"; exit 130' INT
+    if [[ "${ARCH_LIDSWITCH_TEST_SIGNAL_DURING_TRAP_RESTORE:-0}" == 1 && \
+        "$trap_restore_signal_injected" != true ]]; then
+        trap_restore_signal_injected=true
+        kill -s TERM "$$"
+    fi
+    trap 'log_error "Installation terminated"; exit 143' TERM
+    deferred=$deferred_transaction_signal
+    deferred_transaction_signal=""
+    if [[ -n "$deferred" ]]; then
+        log_warning "Delivering deferred installation signal status=$deferred"
+        exit "$deferred"
     fi
 }
 
-# Enable and start the service
-enable_service() {
-    log_info "Enabling and starting lid monitor service..."
-    
-    # Reload systemd daemon
-    systemctl --user daemon-reload
-    
-    # Enable the daemon as part of the graphical session.
-    systemctl --user enable lid-monitor.service
+ensure_private_directory() {
+    local directory=$1
 
-    # Import the current compositor environment before starting its target.
-    "$SESSION_BRIDGE" start
+    if [[ -L "$directory" ]]; then
+        log_error "Refusing symlinked transaction directory: $directory"
+        return 1
+    fi
+    mkdir -p -- "$directory"
+    chmod 0700 -- "$directory"
+}
 
-    # Ensure the daemon is started even if the session target was already active.
-    systemctl --user start lid-monitor.service
-    systemctl --user start lid-resume-monitor.service
-    
-    # Check if service started successfully
-    if systemctl --user is-active --quiet lid-monitor.service; then
-        log_success "Lid monitor service is running"
+initialize_transaction() {
+    local lock_file
+
+    scripts_dir_existed=$([[ -d "$SCRIPTS_DIR" ]] && printf true || printf false)
+    session_module_dir_existed=$([[ -d "$SESSION_MODULE_DIR" ]] && printf true || printf false)
+    systemd_user_dir_existed=$([[ -d "$SYSTEMD_USER_DIR" ]] && printf true || printf false)
+
+    ensure_private_directory "$STATE_ROOT"
+    ensure_private_directory "$TRANSACTIONS_DIR"
+    ensure_private_directory "$BACKUPS_DIR"
+
+    lock_file="$STATE_ROOT/install.lock"
+    if [[ -L "$lock_file" ]]; then
+        log_error "Refusing symlinked transaction lock: $lock_file"
+        return 1
+    fi
+    exec {transaction_lock_fd}>"$lock_file"
+    chmod 0600 -- "$lock_file"
+    if ! flock -n "$transaction_lock_fd"; then
+        log_error "Another arch-lidswitch installation is already running"
+        return 1
+    fi
+
+    transaction_id="$(date +%Y%m%dT%H%M%S)-$$"
+    transaction_dir="$TRANSACTIONS_DIR/$transaction_id"
+    transaction_stage_dir="$transaction_dir/stage"
+    transaction_before_dir="$transaction_dir/before"
+    transaction_manifest="$transaction_dir/new.manifest"
+    mkdir -- "$transaction_dir"
+    chmod 0700 -- "$transaction_dir"
+    mkdir -p -- "$transaction_stage_dir" "$transaction_before_dir/files"
+    chmod 0700 -- "$transaction_stage_dir" "$transaction_before_dir" \
+        "$transaction_before_dir/files"
+    transaction_active=true
+}
+
+validate_mv_exchange_support() {
+    local first="$transaction_dir/exchange-check-a"
+    local second="$transaction_dir/exchange-check-b"
+    local absent="$transaction_dir/no-replace-check"
+    local no_replace_status=0
+
+    if ! printf '%s\n' first > "$first" || \
+        ! printf '%s\n' second > "$second"; then
+        log_error "Could not prepare the atomic-exchange capability check"
+        return 1
+    fi
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT=exchange-check \
+        mv --exchange --no-copy -T -- "$first" "$second"; then
+        log_error "GNU mv with --exchange --no-copy support is required"
+        rm -f -- "$first" "$second" || true
+        return 1
+    fi
+    if [[ "$(<"$first")" != second || "$(<"$second")" != first ]]; then
+        log_error "GNU mv atomic-exchange capability check failed"
+        rm -f -- "$first" "$second" || true
+        return 1
+    fi
+    ARCH_LIDSWITCH_ATOMIC_CONTEXT=no-replace-collision-check \
+        mv --update=none-fail --no-copy -T -- "$first" "$second" \
+        || no_replace_status=$?
+    if (( no_replace_status == 0 )) || \
+        [[ ! -f "$first" || ! -f "$second" ]] || \
+        [[ "$(<"$first")" != second || "$(<"$second")" != first ]]; then
+        log_error "GNU mv atomic no-replace collision check failed"
+        rm -f -- "$first" "$second" "$absent" || true
+        return 1
+    fi
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT=no-replace-check \
+        mv --update=none-fail --no-copy -T -- "$first" "$absent" || \
+        [[ -e "$first" || -L "$first" || ! -f "$absent" ]] || \
+        [[ "$(<"$absent")" != second ]]; then
+        log_error "GNU mv atomic no-replace capability check failed"
+        rm -f -- "$first" "$second" "$absent" || true
+        return 1
+    fi
+    if ! rm -f -- "$first" "$second" "$absent"; then
+        log_error "Could not clean the atomic-exchange capability check"
+        return 1
+    fi
+}
+
+capture_enablement_state() {
+    local unit=$1
+    local role=$2
+    local output status=0
+
+    output=$(systemctl --user is-enabled "$unit" 2>/dev/null) || status=$?
+    case "$output" in
+        enabled)
+            if [[ "$role" == resume ]]; then
+                log_error "Static resume listener is unexpectedly enabled" >&2
+                return 1
+            fi
+            printf '%s\n' enabled
+            ;;
+        disabled)
+            if [[ "$role" == resume ]]; then
+                log_error "Static resume listener has unexpected enablement state: disabled" >&2
+                return 1
+            fi
+            printf '%s\n' disabled
+            ;;
+        not-found)
+            printf '%s\n' not-found
+            ;;
+        static)
+            if [[ "$role" != resume ]]; then
+                log_error "Main service has unexpected enablement state: static" >&2
+                return 1
+            fi
+            printf '%s\n' static
+            ;;
+        masked|masked-runtime)
+            log_error "Refusing masked user service: $unit" >&2
+            return 1
+            ;;
+        "")
+            if (( status == 0 )); then
+                log_error "Could not parse enablement state for $unit" >&2
+                return 1
+            fi
+            log_error "Could not determine enablement state for $unit" >&2
+            return 1
+            ;;
+        *)
+            log_error "Unsupported enablement state for $unit: $output" >&2
+            return 1
+            ;;
+    esac
+}
+
+capture_active_state() {
+    local unit=$1
+    local status
+
+    if systemctl --user is-active --quiet "$unit"; then
+        printf '%s\n' true
     else
-        log_error "Failed to start lid monitor service"
-        systemctl --user status lid-monitor.service
-        exit 1
-    fi
-    if systemctl --user is-active --quiet lid-resume-monitor.service; then
-        log_success "Lid resume monitor service is running"
-    else
-        log_error "Failed to start lid resume monitor service"
-        systemctl --user status lid-resume-monitor.service
-        exit 1
+        status=$?
+        case "$status" in
+            3|4)
+                printf '%s\n' false
+                ;;
+            *)
+                log_error "Could not determine active state for $unit" >&2
+                return 1
+                ;;
+        esac
     fi
 }
 
-# Check if lid detection is working
-test_lid_detection() {
+consistent_snapshot_mode=""
+consistent_snapshot_hash=""
+
+copy_consistent_snapshot() {
+    local source=$1
+    local snapshot=$2
+    local label=$3
+    local snapshot_mode snapshot_hash live_mode
+
+    if ! mkdir -p -- "$(dirname "$snapshot")"; then
+        log_error "Could not create snapshot directory: $snapshot"
+        return 1
+    fi
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT="snapshot-$label" \
+        cp -p -- "$source" "$snapshot"; then
+        log_error "Could not copy transaction snapshot: $source"
+        return 1
+    fi
+    if [[ -L "$snapshot" || ! -f "$snapshot" ]] || \
+        ! snapshot_mode=$(stat -c %a -- "$snapshot") || \
+        ! snapshot_hash=$(sha256_file "$snapshot"); then
+        log_error "Could not inspect transaction snapshot: $source"
+        return 1
+    fi
+    if [[ -L "$source" || ! -f "$source" ]] || \
+        ! live_mode=$(stat -c %a -- "$source") || \
+        [[ "$live_mode" != "$snapshot_mode" ]] || \
+        ! cmp -s -- "$snapshot" "$source"; then
+        log_error "Source changed while transaction snapshot was copied: $source"
+        return 1
+    fi
+    consistent_snapshot_mode=$snapshot_mode
+    consistent_snapshot_hash=$snapshot_hash
+}
+
+snapshot_managed_file() {
+    local artifact_id=$1
+    local destination=${ARTIFACT_DESTINATION[$artifact_id]}
+    local relative=${ARTIFACT_RELATIVE_PATH[$artifact_id]}
+    local snapshot="$transaction_before_dir/files/$relative"
+    local mode hash
+
+    if [[ -L "$destination" ]] || \
+        { [[ -e "$destination" ]] && [[ ! -f "$destination" ]]; }; then
+        log_error "Refusing non-regular managed destination: $destination"
+        return 1
+    fi
+    if [[ -f "$destination" ]]; then
+        copy_consistent_snapshot "$destination" "$snapshot" "$artifact_id"
+        mode=$consistent_snapshot_mode
+        hash=$consistent_snapshot_hash
+        ARTIFACT_WAS_PRESENT[$artifact_id]=true
+        ARTIFACT_WAS_MODE[$artifact_id]=$mode
+        ARTIFACT_WAS_HASH[$artifact_id]=$hash
+        printf '%s\tpresent\t%s\t%s\t%s\n' \
+            "$artifact_id" "$mode" "$hash" "$destination" \
+            >> "$transaction_before_dir/snapshot.tsv"
+    else
+        ARTIFACT_WAS_PRESENT[$artifact_id]=false
+        ARTIFACT_WAS_MODE[$artifact_id]=""
+        ARTIFACT_WAS_HASH[$artifact_id]=""
+        printf '%s\tabsent\t-\t-\t%s\n' \
+            "$artifact_id" "$destination" \
+            >> "$transaction_before_dir/snapshot.tsv"
+    fi
+    ARTIFACT_PUBLISH_INTENT[$artifact_id]=false
+    ARTIFACT_EXCHANGE_SIBLING[$artifact_id]=""
+    ARTIFACT_CANDIDATE_IDENTITY[$artifact_id]=""
+    ARTIFACT_DISPLACED_VALIDATED[$artifact_id]=false
+}
+
+snapshot_current_manifest() {
+    if [[ -L "$CURRENT_MANIFEST" ]] || \
+        { [[ -e "$CURRENT_MANIFEST" ]] && [[ ! -f "$CURRENT_MANIFEST" ]]; }; then
+        log_error "Refusing non-regular current manifest: $CURRENT_MANIFEST"
+        return 1
+    fi
+    if [[ -f "$CURRENT_MANIFEST" ]]; then
+        copy_consistent_snapshot "$CURRENT_MANIFEST" \
+            "$transaction_before_dir/current.manifest" current-manifest
+        manifest_was_present=true
+        manifest_was_mode=$consistent_snapshot_mode
+        manifest_was_hash=$consistent_snapshot_hash
+    else
+        manifest_was_present=false
+        manifest_was_mode=""
+        manifest_was_hash=""
+    fi
+    printf 'current-manifest\t%s\t%s\t%s\t%s\n' \
+        "$([[ "$manifest_was_present" == true ]] && printf present || printf absent)" \
+        "${manifest_was_mode:--}" "${manifest_was_hash:--}" \
+        "$CURRENT_MANIFEST" >> "$transaction_before_dir/snapshot.tsv"
+}
+
+snapshot_installation_state() {
+    local artifact_id
+
+    : > "$transaction_before_dir/snapshot.tsv"
+    chmod 0600 -- "$transaction_before_dir/snapshot.tsv"
+    for artifact_id in "${ARTIFACT_IDS[@]}"; do
+        snapshot_managed_file "$artifact_id"
+    done
+    snapshot_current_manifest
+
+    copy_consistent_snapshot "$HYPRLAND_CONFIG_FILE" \
+        "$transaction_before_dir/hyprland.lua" hyprland-config
+    config_snapshot_mode=$consistent_snapshot_mode
+
+    main_enablement_state=$(capture_enablement_state lid-monitor.service main)
+    resume_enablement_state=$(capture_enablement_state lid-resume-monitor.service resume)
+    main_was_active=$(capture_active_state lid-monitor.service)
+    resume_was_active=$(capture_active_state lid-resume-monitor.service)
+    {
+        printf 'main_enablement=%s\n' "$main_enablement_state"
+        printf 'resume_enablement=%s\n' "$resume_enablement_state"
+        printf 'main_active=%s\n' "$main_was_active"
+        printf 'resume_active=%s\n' "$resume_was_active"
+    } > "$transaction_before_dir/service-state"
+    chmod 0600 -- "$transaction_before_dir/service-state"
+
+    detect_legacy_default_target_service
+}
+
+render_staged_artifacts() {
+    local artifact_id stage_path
+
+    mkdir -p -- "$transaction_stage_dir/scripts" \
+        "$transaction_stage_dir/arch_lidswitch" \
+        "$transaction_stage_dir/systemd/user"
+
+    render_lid_state_script "$(artifact_stage_path lid-state)"
+    render_monitor_state_script "$(artifact_stage_path monitor-state)"
+    render_lid_switch_script "$(artifact_stage_path lid-switch)" "$laptop_monitor"
+    render_lid_switch_doctor "$(artifact_stage_path lid-switch-doctor)"
+    render_lid_monitor_script "$(artifact_stage_path lid-monitor)" "$laptop_monitor"
+    render_lid_resume_monitor_script "$(artifact_stage_path lid-resume-monitor)"
+    render_session_bridge "$(artifact_stage_path lid-session-bridge)"
+    render_session_module "$(artifact_stage_path session-module)"
+    render_session_target "$(artifact_stage_path session-target)"
+    render_systemd_services "$(artifact_stage_path main-service)" \
+        "$(artifact_stage_path resume-service)"
+
+    for artifact_id in "${ARTIFACT_IDS[@]}"; do
+        stage_path=$(artifact_stage_path "$artifact_id")
+        chmod "${ARTIFACT_MODE[$artifact_id]}" -- "$stage_path"
+    done
+}
+
+render_config_candidate() {
+    config_candidate="$transaction_dir/hyprland.lua.candidate"
+    cp -p -- "$transaction_before_dir/hyprland.lua" "$config_candidate"
+    if [[ "$session_config_state" == missing ]]; then
+        {
+            printf '\n'
+            write_session_config_block
+        } >> "$config_candidate"
+    fi
+    chmod "$config_snapshot_mode" -- "$config_candidate"
+    if ! sha256_file "$config_candidate" >/dev/null; then
+        log_error "Could not validate rendered Hyprland config candidate"
+        return 1
+    fi
+}
+
+validate_staged_systemd_units() {
+    local verify_dir="$transaction_dir/unit-verify"
+    local verify_runtime="$transaction_dir/unit-verify-runtime"
+    local verify_target="$verify_dir/hyprland-session.target"
+    local verify_main="$verify_dir/lid-monitor.service"
+    local verify_resume="$verify_dir/lid-resume-monitor.service"
+    local validation_output
+
+    if ! mkdir -p -- "$verify_dir" "$verify_runtime" || \
+        ! chmod 0700 -- "$verify_dir" "$verify_runtime" || \
+        ! cp -- "$(artifact_stage_path session-target)" "$verify_target" || \
+        ! cp -- "$(artifact_stage_path main-service)" "$verify_main" || \
+        ! cp -- "$(artifact_stage_path resume-service)" "$verify_resume"; then
+        log_error "Could not prepare staged systemd unit validation"
+        return 1
+    fi
+    if ! replace_literal_token "$verify_main" \
+        "ExecStart=$SCRIPTS_DIR/lid-monitor.sh" \
+        "ExecStart=\"$(artifact_stage_path lid-monitor)\"" || \
+        ! replace_literal_token "$verify_resume" \
+        "ExecStart=$SCRIPTS_DIR/lid-resume-monitor.sh" \
+        "ExecStart=\"$(artifact_stage_path lid-resume-monitor)\""; then
+        log_error "Could not prepare staged systemd unit command paths"
+        return 1
+    fi
+
+    if ! validation_output=$(SYSTEMD_UNIT_PATH="$verify_dir:" \
+        XDG_RUNTIME_DIR="$verify_runtime" \
+        "$SYSTEMD_ANALYZE_BIN" --user --generators=no --man=no \
+        --recursive-errors=yes verify \
+        "$verify_target" "$verify_main" "$verify_resume" 2>&1); then
+        log_error "Staged systemd unit validation failed"
+        if [[ -n "$validation_output" ]]; then
+            printf '%s\n' "$validation_output" >&2
+        fi
+        return 1
+    fi
+}
+
+validate_staged_artifacts() {
+    local artifact_id stage_path actual_mode hash
+    local -a shell_artifacts=(
+        lid-state monitor-state lid-switch lid-switch-doctor lid-monitor
+        lid-resume-monitor lid-session-bridge
+    )
+
+    for artifact_id in "${shell_artifacts[@]}"; do
+        /bin/bash -n "$(artifact_stage_path "$artifact_id")"
+    done
+    luac -p "$(artifact_stage_path session-module)"
+    luac -p "$config_candidate"
+    validate_staged_systemd_units
+
+    : > "$transaction_manifest"
+    chmod 0600 -- "$transaction_manifest"
+    for artifact_id in "${ARTIFACT_IDS[@]}"; do
+        stage_path=$(artifact_stage_path "$artifact_id")
+        if grep -Eq '@@[A-Z0-9_]+@@|LAPTOP_MONITOR_PLACEHOLDER|\$(TIMEOUT_BIN|HYPRCTL_BIN|SCRIPTS_DIR)' \
+            "$stage_path"; then
+            log_error "Staged artifact contains an unresolved token: $artifact_id"
+            return 1
+        fi
+        actual_mode=$(stat -c %a -- "$stage_path")
+        if [[ "$actual_mode" != "${ARTIFACT_MODE[$artifact_id]#0}" ]]; then
+            log_error "Staged artifact has an invalid mode: $artifact_id mode=$actual_mode"
+            return 1
+        fi
+        hash=$(sha256_file "$stage_path")
+        printf '%s\t%s\t%s\n' "$hash" \
+            "${ARTIFACT_MODE[$artifact_id]}" \
+            "${ARTIFACT_RELATIVE_PATH[$artifact_id]}" \
+            >> "$transaction_manifest"
+    done
+}
+
+test_staged_lid_detection() {
     local lid_state
 
     log_info "Testing lid state detection..."
-
-    if lid_state=$("$SCRIPTS_DIR/lid-monitor.sh" --print-state); then
+    if lid_state=$("$(artifact_stage_path lid-monitor)" --print-state); then
         log_success "Lid state detection working: $lid_state"
     else
         log_warning "Could not determine lid state. The service may not work properly."
@@ -607,22 +1122,1348 @@ test_lid_detection() {
     fi
 }
 
-# Backup existing files
-backup_existing_files() {
-    log_info "Backing up existing files..."
-    
-    local backup_dir="$HYPR_CONFIG_DIR/scripts/.backup-$(date +%Y%m%d-%H%M%S)"
-    
-    if [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] || \
-        [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]] || \
-        [[ -f "$RESUME_MONITOR_FILE" ]]; then
-        mkdir -p "$backup_dir"
-        
-        [[ -f "$SCRIPTS_DIR/lid-switch.sh" ]] && cp "$SCRIPTS_DIR/lid-switch.sh" "$backup_dir/"
-        [[ -f "$SCRIPTS_DIR/lid-monitor.sh" ]] && cp "$SCRIPTS_DIR/lid-monitor.sh" "$backup_dir/"
-        [[ -f "$RESUME_MONITOR_FILE" ]] && cp "$RESUME_MONITOR_FILE" "$backup_dir/"
-        
-        log_success "Existing files backed up to $backup_dir"
+prepare_transaction() {
+    log_info "Preparing transactional installation..."
+    validate_fault_checkpoint
+    initialize_transaction
+    validate_mv_exchange_support
+    # Revalidate user-owned configuration under the installer lock so the
+    # snapshot and candidate are based on the same ownership state.
+    inspect_session_config
+    snapshot_installation_state
+    render_staged_artifacts
+    render_config_candidate
+    validate_staged_artifacts
+    test_staged_lid_detection
+    log_success "Prepared and validated 11 managed artifacts"
+    fault_after prepared
+}
+
+assert_managed_destination_unchanged() {
+    local artifact_id=$1
+    local destination=${ARTIFACT_DESTINATION[$artifact_id]}
+    local current_hash current_mode
+
+    if [[ "${ARTIFACT_WAS_PRESENT[$artifact_id]}" == true ]]; then
+        if [[ -L "$destination" || ! -f "$destination" ]]; then
+            log_error "Managed destination changed during installation: $destination"
+            return 1
+        fi
+        current_hash=$(sha256_file "$destination")
+        current_mode=$(stat -c %a -- "$destination")
+        if [[ "$current_hash" != "${ARTIFACT_WAS_HASH[$artifact_id]}" || \
+            "$current_mode" != "${ARTIFACT_WAS_MODE[$artifact_id]}" ]]; then
+            log_error "Managed destination changed during installation: $destination"
+            return 1
+        fi
+    elif [[ -e "$destination" || -L "$destination" ]]; then
+        log_error "Managed destination appeared during installation: $destination"
+        return 1
+    fi
+}
+
+maybe_signal_after_publish() {
+    local context=$1
+    local signal_point=""
+
+    case "$context" in
+        install-manifest)
+            signal_point=manifest
+            ;;
+        install-config)
+            signal_point=config
+            ;;
+        install-*)
+            signal_point="artifact-${context#install-}"
+            ;;
+    esac
+    if [[ -n "$signal_point" && \
+        "${ARCH_LIDSWITCH_TEST_SIGNAL_AFTER_PUBLISH:-}" == "$signal_point" ]]; then
+        log_warning "Injecting TERM after publication=$signal_point"
+        kill -s TERM "$$"
+    fi
+}
+
+prepared_publication_sibling=""
+
+prepare_publication_sibling() {
+    local source=$1
+    local destination=$2
+    local mode=$3
+    local context=$4
+    local directory temporary actual_mode
+
+    prepared_publication_sibling=""
+    if ! directory=$(dirname "$destination"); then
+        log_error "Could not resolve publication directory: $destination"
+        return 1
+    fi
+    if ! mkdir -p -- "$directory"; then
+        log_error "Could not create publication directory: $directory"
+        return 1
+    fi
+    if ! temporary=$(mktemp "$directory/.arch-lidswitch.${destination##*/}.XXXXXX"); then
+        log_error "Could not create publication sibling: $destination"
+        return 1
+    fi
+    TEMPORARY_DESTINATIONS+=("$temporary")
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+        cp -- "$source" "$temporary"; then
+        log_error "Could not copy publication content: $destination"
+        rm -f -- "$temporary" || \
+            log_error "Could not remove failed publication sibling: $temporary"
+        return 1
+    fi
+    if ! cmp -s -- "$source" "$temporary"; then
+        log_error "Publication copy verification failed: $destination"
+        rm -f -- "$temporary" || \
+            log_error "Could not remove failed publication sibling: $temporary"
+        return 1
+    fi
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+        chmod "$mode" -- "$temporary"; then
+        log_error "Could not set publication mode: $destination"
+        rm -f -- "$temporary" || \
+            log_error "Could not remove failed publication sibling: $temporary"
+        return 1
+    fi
+    if ! actual_mode=$(stat -c %a -- "$temporary") || \
+        [[ "$actual_mode" != "${mode#0}" ]]; then
+        log_error "Publication mode verification failed: $destination"
+        rm -f -- "$temporary" || \
+            log_error "Could not remove failed publication sibling: $temporary"
+        return 1
+    fi
+    prepared_publication_sibling=$temporary
+}
+
+atomic_publish_file() {
+    local source=$1
+    local destination=$2
+    local mode=$3
+    local context=$4
+    local temporary actual_mode
+
+    if ! prepare_publication_sibling "$source" "$destination" "$mode" \
+        "$context"; then
+        return 1
+    fi
+    temporary=$prepared_publication_sibling
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+        mv -fT -- "$temporary" "$destination"; then
+        log_error "Could not publish prepared sibling: $destination"
+        rm -f -- "$temporary" || \
+            log_error "Could not remove failed publication sibling: $temporary"
+        return 1
+    fi
+    if [[ -L "$destination" || ! -f "$destination" ]] || \
+        ! cmp -s -- "$source" "$destination" || \
+        ! actual_mode=$(stat -c %a -- "$destination") || \
+        [[ "$actual_mode" != "${mode#0}" ]]; then
+        log_error "Published destination verification failed: $destination"
+        return 1
+    fi
+    maybe_signal_after_publish "$context"
+}
+
+record_publication_sibling() {
+    local owner=$1
+    local owner_id=$2
+    local sibling=$3
+    local candidate_identity
+
+    if ! candidate_identity=$(stat -c '%d:%i' -- "$sibling"); then
+        log_error "Could not identify publication sibling: $sibling"
+        return 1
+    fi
+
+    case "$owner" in
+        artifact)
+            ARTIFACT_EXCHANGE_SIBLING[$owner_id]=$sibling
+            ARTIFACT_CANDIDATE_IDENTITY[$owner_id]=$candidate_identity
+            ;;
+        manifest)
+            manifest_exchange_sibling=$sibling
+            manifest_candidate_identity=$candidate_identity
+            ;;
+        *)
+            log_error "Unknown publication owner: $owner"
+            return 1
+            ;;
+    esac
+}
+
+mark_publication_displaced_validated() {
+    local owner=$1
+    local owner_id=$2
+
+    case "$owner" in
+        artifact)
+            ARTIFACT_DISPLACED_VALIDATED[$owner_id]=true
+            ;;
+        manifest)
+            manifest_displaced_validated=true
+            ;;
+        *)
+            log_error "Unknown publication owner: $owner"
+            return 1
+            ;;
+    esac
+}
+
+compare_and_swap_publish_file() {
+    local source=$1
+    local destination=$2
+    local mode=$3
+    local context=$4
+    local was_present=$5
+    local reference=$6
+    local reference_mode=$7
+    local owner=$8
+    local owner_id=$9
+    local temporary actual_mode publish_status=0
+
+    if ! prepare_publication_sibling "$source" "$destination" "$mode" \
+        "$context"; then
+        return 1
+    fi
+    temporary=$prepared_publication_sibling
+    if ! record_publication_sibling "$owner" "$owner_id" "$temporary"; then
+        return 1
+    fi
+
+    defer_transaction_signals
+    if [[ "$was_present" == true ]]; then
+        ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+            mv --exchange --no-copy -T -- "$temporary" "$destination" \
+            || publish_status=$?
+    else
+        ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+            mv --update=none-fail --no-copy -T -- "$temporary" "$destination" \
+            || publish_status=$?
+    fi
+    if (( publish_status != 0 )); then
+        log_error "Atomic compare-and-swap publication failed: $destination"
+        restore_and_deliver_transaction_signals
+        return "$publish_status"
+    fi
+
+    if [[ "$was_present" == true ]]; then
+        if ! regular_file_matches_reference "$temporary" "$reference" \
+            "$reference_mode"; then
+            log_error "Destination changed before atomic publication: $destination"
+            restore_and_deliver_transaction_signals
+            return 1
+        fi
+        if ! mark_publication_displaced_validated "$owner" "$owner_id"; then
+            restore_and_deliver_transaction_signals
+            return 1
+        fi
+    elif [[ -e "$temporary" || -L "$temporary" ]]; then
+        log_error "Destination appeared before atomic publication: $destination"
+        restore_and_deliver_transaction_signals
+        return 1
+    fi
+
+    if [[ -L "$destination" || ! -f "$destination" ]] || \
+        ! cmp -s -- "$source" "$destination" || \
+        ! actual_mode=$(stat -c %a -- "$destination") || \
+        [[ "$actual_mode" != "${mode#0}" ]]; then
+        log_error "Published destination verification failed: $destination"
+        restore_and_deliver_transaction_signals
+        return 1
+    fi
+    maybe_signal_after_publish "$context"
+    restore_and_deliver_transaction_signals
+}
+
+quiesce_services() {
+    local main_preexisting=false resume_preexisting=false
+    local observed_main_active observed_resume_active
+
+    if [[ "$main_enablement_state" != not-found || "$main_was_active" == true ]]; then
+        main_preexisting=true
+    fi
+    if [[ "$resume_enablement_state" != not-found || \
+        "$resume_was_active" == true ]]; then
+        resume_preexisting=true
+    fi
+    if [[ "$resume_preexisting" == true || "$main_preexisting" == true ]]; then
+        service_state_changed=true
+    fi
+    if [[ "$resume_preexisting" == true ]]; then
+        systemctl --user stop lid-resume-monitor.service
+    fi
+    if [[ "$main_preexisting" == true ]]; then
+        systemctl --user stop lid-monitor.service
+    fi
+    observed_main_active=$(capture_active_state lid-monitor.service)
+    observed_resume_active=$(capture_active_state lid-resume-monitor.service)
+    if [[ "$observed_main_active" != false || \
+        "$observed_resume_active" != false ]]; then
+        log_error "Could not quiesce lid services before publication"
+        return 1
+    fi
+    fault_after services-quiesced
+}
+
+verify_live_artifact_set() {
+    local artifact_id destination expected_hash actual_hash actual_mode
+
+    for artifact_id in "${ARTIFACT_IDS[@]}"; do
+        destination=${ARTIFACT_DESTINATION[$artifact_id]}
+        expected_hash=$(sha256_file "$(artifact_stage_path "$artifact_id")")
+        if [[ -L "$destination" || ! -f "$destination" ]]; then
+            log_error "Installed artifact is not a regular file: $destination"
+            return 1
+        fi
+        actual_hash=$(sha256_file "$destination")
+        actual_mode=$(stat -c %a -- "$destination")
+        if [[ "$actual_hash" != "$expected_hash" || \
+            "$actual_mode" != "${ARTIFACT_MODE[$artifact_id]#0}" ]]; then
+            log_error "Installed artifact verification failed: $destination"
+            return 1
+        fi
+    done
+}
+
+assert_manifest_unchanged() {
+    local current_hash current_mode
+
+    if [[ "$manifest_was_present" == true ]]; then
+        if [[ -L "$CURRENT_MANIFEST" || ! -f "$CURRENT_MANIFEST" ]]; then
+            log_error "Current manifest changed during installation"
+            return 1
+        fi
+        current_hash=$(sha256_file "$CURRENT_MANIFEST")
+        current_mode=$(stat -c %a -- "$CURRENT_MANIFEST")
+        if [[ "$current_hash" != "$manifest_was_hash" || \
+            "$current_mode" != "$manifest_was_mode" ]]; then
+            log_error "Current manifest changed during installation"
+            return 1
+        fi
+    elif [[ -e "$CURRENT_MANIFEST" || -L "$CURRENT_MANIFEST" ]]; then
+        log_error "Current manifest appeared during installation"
+        return 1
+    fi
+}
+
+publish_config_candidate() {
+    local directory temporary actual_mode
+
+    if [[ -L "$HYPRLAND_CONFIG_FILE" || ! -f "$HYPRLAND_CONFIG_FILE" ]]; then
+        log_error "Hyprland config changed during installation"
+        return 1
+    fi
+    if ! regular_file_matches_reference "$HYPRLAND_CONFIG_FILE" \
+        "$transaction_before_dir/hyprland.lua" "$config_snapshot_mode"; then
+        log_error "Hyprland config changed during installation"
+        return 1
+    fi
+
+    if [[ "$session_config_state" == present ]]; then
+        log_info "Hyprland session integration is already present"
+        return 0
+    fi
+
+    if ! directory=$(dirname "$HYPRLAND_CONFIG_FILE") || \
+        ! temporary=$(mktemp "$directory/.arch-lidswitch.hyprland.lua.XXXXXX"); then
+        log_error "Could not create Hyprland config exchange sibling"
+        return 1
+    fi
+    config_exchange_sibling=$temporary
+    TEMPORARY_DESTINATIONS+=("$temporary")
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT=prepare-config-exchange \
+        cp -- "$config_candidate" "$temporary" || \
+        ! cmp -s -- "$config_candidate" "$temporary" || \
+        ! ARCH_LIDSWITCH_ATOMIC_CONTEXT=prepare-config-exchange \
+            chmod "$config_snapshot_mode" -- "$temporary" || \
+        ! actual_mode=$(stat -c %a -- "$temporary") || \
+        [[ "$actual_mode" != "${config_snapshot_mode#0}" ]]; then
+        log_error "Could not prepare verified Hyprland config exchange sibling"
+        rm -f -- "$temporary" || true
+        return 1
+    fi
+    if ! config_candidate_identity=$(stat -c '%d:%i' -- "$temporary"); then
+        log_error "Could not identify Hyprland config exchange candidate"
+        rm -f -- "$temporary" || true
+        return 1
+    fi
+
+    config_publish_intent=true
+    defer_transaction_signals
+    if ! ARCH_LIDSWITCH_ATOMIC_CONTEXT=install-config \
+        mv --exchange --no-copy -T -- "$temporary" "$HYPRLAND_CONFIG_FILE"; then
+        log_error "Could not atomically exchange Hyprland config"
+        restore_and_deliver_transaction_signals
+        return 1
+    fi
+    maybe_signal_after_publish install-config
+
+    if ! regular_file_matches_reference "$temporary" \
+        "$transaction_before_dir/hyprland.lua" "$config_snapshot_mode"; then
+        if ! exchange_restore_checked "$HYPRLAND_CONFIG_FILE" "$temporary" \
+            "$config_candidate" "$config_snapshot_mode" \
+            "$config_candidate_identity" revert-config-exchange; then
+            log_error "Could not preserve raced Hyprland config"
+            restore_and_deliver_transaction_signals
+            return 1
+        fi
+        config_publish_intent=false
+        log_error "Hyprland config changed during installation"
+        restore_and_deliver_transaction_signals
+        return 1
+    fi
+
+    config_displaced_validated=true
+    session_config_state=present
+    restore_and_deliver_transaction_signals
+    log_success "Hyprland session integration added to $HYPRLAND_CONFIG_FILE"
+}
+
+import_session_environment() {
+    local variable_name
+    local -a environment_names=(
+        DISPLAY WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE XDG_CURRENT_DESKTOP
+        QT_QPA_PLATFORMTHEME PATH XDG_DATA_DIRS
+    )
+    local -a defined_names=()
+
+    for variable_name in "${environment_names[@]}"; do
+        if [[ -v "$variable_name" ]]; then
+            defined_names+=("$variable_name")
+        fi
+    done
+    systemctl --user import-environment "${defined_names[@]}"
+}
+
+activate_installed_services() {
+    service_state_changed=true
+    systemctl --user daemon-reload
+    fault_after daemon-reloaded
+
+    systemctl --user enable lid-monitor.service
+    fault_after main-enabled
+
+    import_session_environment
+    fault_after session-imported
+
+    systemctl --user start lid-monitor.service
+    fault_after main-started
+    systemctl --user start lid-resume-monitor.service
+    fault_after resume-started
+
+    if ! systemctl --user is-active --quiet lid-monitor.service; then
+        log_error "Failed to start lid monitor service"
+        systemctl --user status lid-monitor.service || true
+        return 1
+    fi
+    if ! systemctl --user is-active --quiet lid-resume-monitor.service; then
+        log_error "Failed to start lid resume monitor service"
+        systemctl --user status lid-resume-monitor.service || true
+        return 1
+    fi
+    log_success "Lid monitor and resume services are running"
+    fault_after health-checked
+}
+
+apply_transaction() {
+    local artifact_id stage_path destination mode was_present
+    local reference reference_mode
+
+    quiesce_services
+    if [[ "$legacy_default_target_service" == true ]]; then
+        service_state_changed=true
+        systemctl --user disable --now lid-monitor.service
+        fault_after legacy-stopped
+    fi
+
+    for artifact_id in "${ARTIFACT_IDS[@]}"; do
+        assert_managed_destination_unchanged "$artifact_id"
+        stage_path=$(artifact_stage_path "$artifact_id")
+        destination=${ARTIFACT_DESTINATION[$artifact_id]}
+        mode=${ARTIFACT_MODE[$artifact_id]}
+        was_present=${ARTIFACT_WAS_PRESENT[$artifact_id]}
+        if [[ "$was_present" == true ]]; then
+            reference="$transaction_before_dir/files/${ARTIFACT_RELATIVE_PATH[$artifact_id]}"
+            reference_mode=${ARTIFACT_WAS_MODE[$artifact_id]}
+        else
+            reference=""
+            reference_mode=""
+        fi
+        ARTIFACT_PUBLISH_INTENT[$artifact_id]=true
+        compare_and_swap_publish_file "$stage_path" "$destination" "$mode" \
+            "install-$artifact_id" "$was_present" "$reference" \
+            "$reference_mode" artifact "$artifact_id"
+        fault_after "installed-$artifact_id"
+    done
+    verify_live_artifact_set
+
+    assert_manifest_unchanged
+    manifest_publish_intent=true
+    compare_and_swap_publish_file "$transaction_manifest" "$CURRENT_MANIFEST" \
+        0600 install-manifest "$manifest_was_present" \
+        "$transaction_before_dir/current.manifest" "$manifest_was_mode" \
+        manifest current-manifest
+    fault_after manifest-installed
+
+    publish_config_candidate
+    fault_after config-integrated
+    activate_installed_services
+}
+
+restore_snapshot_file() {
+    local source=$1
+    local destination=$2
+    local mode=$3
+    local context=$4
+
+    atomic_publish_file "$source" "$destination" "$mode" "$context"
+}
+
+regular_file_matches_reference() {
+    local live_file=$1
+    local reference_file=$2
+    local expected_mode=$3
+    local live_mode
+
+    if [[ -L "$live_file" || ! -f "$live_file" || \
+        -L "$reference_file" || ! -f "$reference_file" ]]; then
+        return 1
+    fi
+    if ! live_mode=$(stat -c %a -- "$live_file") || \
+        [[ "$live_mode" != "${expected_mode#0}" ]]; then
+        return 1
+    fi
+    cmp -s -- "$reference_file" "$live_file"
+}
+
+regular_file_has_identity() {
+    local path=$1
+    local expected_identity=$2
+    local actual_identity
+
+    if [[ -z "$expected_identity" || -L "$path" || ! -f "$path" ]] || \
+        ! actual_identity=$(stat -c '%d:%i' -- "$path"); then
+        return 1
+    fi
+    [[ "$actual_identity" == "$expected_identity" ]]
+}
+
+path_has_lstat_identity() {
+    local path=$1
+    local expected_identity=$2
+    local actual_identity
+
+    if [[ -z "$expected_identity" || \
+        ( ! -e "$path" && ! -L "$path" ) ]] || \
+        ! actual_identity=$(stat -c '%d:%i:%f' -- "$path"); then
+        return 1
+    fi
+    [[ "$actual_identity" == "$expected_identity" ]]
+}
+
+captured_file_hash=""
+captured_file_mode=""
+captured_file_identity=""
+
+capture_regular_file_state() {
+    local path=$1
+
+    captured_file_hash=""
+    captured_file_mode=""
+    captured_file_identity=""
+    if [[ -L "$path" || ! -f "$path" ]] || \
+        ! captured_file_hash=$(sha256_file "$path") || \
+        ! captured_file_mode=$(stat -c %a -- "$path") || \
+        ! captured_file_identity=$(stat -c '%d:%i' -- "$path"); then
+        return 1
+    fi
+}
+
+regular_file_matches_state() {
+    local path=$1
+    local expected_hash=$2
+    local expected_mode=$3
+    local expected_identity=$4
+    local actual_hash actual_mode
+
+    if ! regular_file_has_identity "$path" "$expected_identity" || \
+        ! actual_hash=$(sha256_file "$path") || \
+        ! actual_mode=$(stat -c %a -- "$path"); then
+        return 1
+    fi
+    [[ "$actual_hash" == "$expected_hash" && \
+        "$actual_mode" == "$expected_mode" ]]
+}
+
+exchange_restore_checked() {
+    local destination=$1
+    local replacement=$2
+    local candidate=$3
+    local candidate_mode=$4
+    local candidate_identity=$5
+    local context=$6
+    local replacement_hash replacement_mode replacement_identity
+    local raced_hash raced_mode raced_identity
+    local exchange_status=0 revert_status=0
+
+    if ! capture_regular_file_state "$replacement"; then
+        log_error "Could not identify rollback exchange replacement: $replacement"
+        return 1
+    fi
+    replacement_hash=$captured_file_hash
+    replacement_mode=$captured_file_mode
+    replacement_identity=$captured_file_identity
+    if ! regular_file_matches_reference "$destination" "$candidate" \
+        "$candidate_mode" || \
+        ! regular_file_has_identity "$destination" "$candidate_identity"; then
+        log_error "Rollback destination changed before exchange: $destination"
+        return 1
+    fi
+
+    ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+        mv --exchange --no-copy -T -- "$replacement" "$destination" \
+        || exchange_status=$?
+    if regular_file_matches_state "$destination" "$replacement_hash" \
+        "$replacement_mode" "$replacement_identity" && \
+        regular_file_matches_reference "$replacement" "$candidate" \
+            "$candidate_mode" && \
+        regular_file_has_identity "$replacement" "$candidate_identity"; then
+        if (( exchange_status != 0 )); then
+            log_warning "Rollback exchange reported status=$exchange_status after completing: $destination"
+        fi
+        rm -f -- "$replacement" || \
+            log_warning "Could not remove rolled-back publication candidate: $replacement"
+        return 0
+    fi
+
+    if regular_file_matches_state "$destination" "$replacement_hash" \
+        "$replacement_mode" "$replacement_identity" && \
+        capture_regular_file_state "$replacement"; then
+        raced_hash=$captured_file_hash
+        raced_mode=$captured_file_mode
+        raced_identity=$captured_file_identity
+        ARCH_LIDSWITCH_ATOMIC_CONTEXT="${context}-preserve-concurrent" \
+            mv --exchange --no-copy -T -- "$replacement" "$destination" \
+            || revert_status=$?
+        if regular_file_matches_state "$destination" "$raced_hash" \
+            "$raced_mode" "$raced_identity" && \
+            regular_file_matches_state "$replacement" "$replacement_hash" \
+                "$replacement_mode" "$replacement_identity"; then
+            if (( revert_status != 0 )); then
+                log_warning "Concurrent rollback exchange reported status=$revert_status after completing: $destination"
+            fi
+            log_error "Rollback destination changed during exchange; concurrent content restored"
+            return 1
+        fi
+    fi
+    log_error "Could not atomically restore destination without losing concurrent content: $destination"
+    return 1
+}
+
+exchange_restore_nonregular_checked() {
+    local destination=$1
+    local replacement=$2
+    local candidate=$3
+    local candidate_mode=$4
+    local candidate_identity=$5
+    local context=$6
+    local replacement_identity raced_identity
+    local exchange_status=0 revert_status=0
+
+    if [[ ! -e "$replacement" && ! -L "$replacement" ]] || \
+        ! replacement_identity=$(stat -c '%d:%i:%f' -- "$replacement"); then
+        log_error "Could not identify non-regular rollback replacement: $replacement"
+        return 1
+    fi
+    if ! regular_file_matches_reference "$destination" "$candidate" \
+        "$candidate_mode" || \
+        ! regular_file_has_identity "$destination" "$candidate_identity"; then
+        log_error "Rollback destination changed before non-regular exchange: $destination"
+        return 1
+    fi
+
+    ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+        mv --exchange --no-copy -T -- "$replacement" "$destination" \
+        || exchange_status=$?
+    if path_has_lstat_identity "$destination" "$replacement_identity" && \
+        regular_file_matches_reference "$replacement" "$candidate" \
+            "$candidate_mode" && \
+        regular_file_has_identity "$replacement" "$candidate_identity"; then
+        if (( exchange_status != 0 )); then
+            log_warning "Non-regular rollback exchange reported status=$exchange_status after completing: $destination"
+        fi
+        rm -f -- "$replacement" || \
+            log_warning "Could not remove rolled-back publication candidate: $replacement"
+        return 0
+    fi
+
+    if path_has_lstat_identity "$destination" "$replacement_identity" && \
+        [[ -e "$replacement" || -L "$replacement" ]] && \
+        raced_identity=$(stat -c '%d:%i:%f' -- "$replacement"); then
+        ARCH_LIDSWITCH_ATOMIC_CONTEXT="${context}-preserve-concurrent" \
+            mv --exchange --no-copy -T -- "$replacement" "$destination" \
+            || revert_status=$?
+        if path_has_lstat_identity "$destination" "$raced_identity" && \
+            path_has_lstat_identity "$replacement" "$replacement_identity"; then
+            if (( revert_status != 0 )); then
+                log_warning "Concurrent non-regular exchange reported status=$revert_status after completing: $destination"
+            fi
+            log_error "Rollback destination changed during non-regular exchange; concurrent path restored"
+            return 1
+        fi
+    fi
+    log_error "Could not restore non-regular concurrent destination: $destination"
+    return 1
+}
+
+rollback_present_cas_publish() {
+    local destination=$1
+    local candidate=$2
+    local candidate_mode=$3
+    local snapshot=$4
+    local snapshot_mode=$5
+    local sibling=$6
+    local candidate_identity=$7
+    local displaced_validated=$8
+    local context=$9
+    local fallback_sibling
+
+    if regular_file_matches_reference "$destination" "$snapshot" \
+        "$snapshot_mode"; then
+        return 0
+    fi
+    if ! regular_file_matches_reference "$destination" "$candidate" \
+        "$candidate_mode" || \
+        ! regular_file_has_identity "$destination" "$candidate_identity"; then
+        log_error "Cannot safely restore concurrently changed destination: $destination"
+        return 1
+    fi
+
+    if [[ -n "$sibling" && ( -e "$sibling" || -L "$sibling" ) ]]; then
+        if [[ ! -L "$sibling" && -f "$sibling" ]]; then
+            if exchange_restore_checked "$destination" "$sibling" "$candidate" \
+                "$candidate_mode" "$candidate_identity" "$context"; then
+                return 0
+            fi
+        else
+            if exchange_restore_nonregular_checked "$destination" "$sibling" \
+                "$candidate" "$candidate_mode" "$candidate_identity" \
+                "$context"; then
+                return 0
+            fi
+        fi
+        if [[ -e "$sibling" || -L "$sibling" ]]; then
+            return 1
+        fi
+    fi
+
+    if [[ "$displaced_validated" == true ]] && \
+        regular_file_matches_reference "$destination" "$candidate" \
+            "$candidate_mode" && \
+        regular_file_has_identity "$destination" "$candidate_identity"; then
+        if ! prepare_publication_sibling "$snapshot" "$destination" \
+            "$snapshot_mode" "${context}-fallback"; then
+            return 1
+        fi
+        fallback_sibling=$prepared_publication_sibling
+        exchange_restore_checked "$destination" "$fallback_sibling" \
+            "$candidate" "$candidate_mode" "$candidate_identity" \
+            "${context}-fallback"
+        return $?
+    fi
+    log_error "Displaced destination is unavailable for safe restoration: $destination"
+    return 1
+}
+
+rollback_absent_cas_publish() {
+    local destination=$1
+    local candidate=$2
+    local candidate_mode=$3
+    local sibling=$4
+    local candidate_identity=$5
+    local context=$6
+    local directory quarantine_dir quarantine
+    local move_status=0 restore_status=0 captured_hash captured_mode
+    local captured_identity restored_hash restored_mode
+
+    if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+        return 0
+    fi
+    if ! regular_file_matches_reference "$destination" "$candidate" \
+        "$candidate_mode" || \
+        ! regular_file_has_identity "$destination" "$candidate_identity"; then
+        if [[ -n "$sibling" ]] && \
+            regular_file_matches_reference "$sibling" "$candidate" \
+                "$candidate_mode" && \
+            regular_file_has_identity "$sibling" "$candidate_identity"; then
+            rm -f -- "$sibling" || return 1
+            return 0
+        fi
+        log_error "Cannot safely remove concurrently changed destination: $destination"
+        return 1
+    fi
+
+    if ! directory=$(dirname "$destination") || \
+        ! quarantine_dir=$(mktemp -d \
+            "$directory/.arch-lidswitch.rollback-quarantine.XXXXXX") || \
+        ! chmod 0700 -- "$quarantine_dir"; then
+        log_error "Could not prepare rollback quarantine: $destination"
+        return 1
+    fi
+    quarantine="$quarantine_dir/candidate"
+    ARCH_LIDSWITCH_ATOMIC_CONTEXT="$context" \
+        mv --update=none-fail --no-copy -T -- "$destination" "$quarantine" \
+        || move_status=$?
+
+    if regular_file_has_identity "$quarantine" "$candidate_identity" && \
+        regular_file_matches_reference "$quarantine" "$candidate" \
+            "$candidate_mode" && \
+        [[ ! -e "$destination" && ! -L "$destination" ]]; then
+        if (( move_status != 0 )); then
+            log_warning "Rollback quarantine move reported status=$move_status after completing: $destination"
+        fi
+        rm -f -- "$quarantine" || return 1
+        rmdir -- "$quarantine_dir" || return 1
+        return 0
+    fi
+
+    if [[ ! -L "$quarantine" && -f "$quarantine" ]]; then
+        captured_hash=$(sha256_file "$quarantine") || return 1
+        captured_mode=$(stat -c %a -- "$quarantine") || return 1
+        captured_identity=$(stat -c '%d:%i' -- "$quarantine") || return 1
+        ARCH_LIDSWITCH_ATOMIC_CONTEXT="${context}-restore-concurrent" \
+            mv --update=none-fail --no-copy -T -- "$quarantine" \
+                "$destination" || restore_status=$?
+        restored_hash=$(sha256_file "$destination") || restored_hash=""
+        restored_mode=$(stat -c %a -- "$destination") || restored_mode=""
+        if regular_file_has_identity "$destination" "$captured_identity" && \
+            [[ "$restored_hash" == "$captured_hash" && \
+            "$restored_mode" == "$captured_mode" ]] && \
+            [[ ! -e "$quarantine" && ! -L "$quarantine" ]]; then
+            if (( restore_status != 0 )); then
+                log_warning "Concurrent rollback restoration reported status=$restore_status after completing: $destination"
+            fi
+            rmdir -- "$quarantine_dir" || return 1
+            return 0
+        fi
+        log_error "Concurrent destination retained in rollback quarantine: $quarantine"
+        return 1
+    fi
+
+    if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+        rmdir -- "$quarantine_dir" || return 1
+        return 0
+    fi
+    rmdir -- "$quarantine_dir" 2>/dev/null || true
+    log_error "Could not quarantine newly published destination: $destination"
+    return 1
+}
+
+rollback_managed_publish() {
+    local artifact_id=$1
+    local destination=${ARTIFACT_DESTINATION[$artifact_id]}
+    local candidate snapshot sibling candidate_identity
+
+    if [[ "${ARTIFACT_PUBLISH_INTENT[$artifact_id]:-false}" != true ]]; then
+        return 0
+    fi
+    candidate=$(artifact_stage_path "$artifact_id")
+    sibling=${ARTIFACT_EXCHANGE_SIBLING[$artifact_id]:-}
+    candidate_identity=${ARTIFACT_CANDIDATE_IDENTITY[$artifact_id]:-}
+    if [[ "${ARTIFACT_WAS_PRESENT[$artifact_id]}" == true ]]; then
+        snapshot="$transaction_before_dir/files/${ARTIFACT_RELATIVE_PATH[$artifact_id]}"
+        rollback_present_cas_publish "$destination" "$candidate" \
+            "${ARTIFACT_MODE[$artifact_id]}" "$snapshot" \
+            "${ARTIFACT_WAS_MODE[$artifact_id]}" "$sibling" \
+            "$candidate_identity" \
+            "${ARTIFACT_DISPLACED_VALIDATED[$artifact_id]:-false}" \
+            "rollback-$artifact_id"
+        return $?
+    else
+        rollback_absent_cas_publish "$destination" "$candidate" \
+            "${ARTIFACT_MODE[$artifact_id]}" "$sibling" \
+            "$candidate_identity" "rollback-$artifact_id"
+        return $?
+    fi
+}
+
+rollback_manifest_publish() {
+    if [[ "$manifest_publish_intent" != true ]]; then
+        return 0
+    fi
+    if [[ "$manifest_was_present" == true ]]; then
+        rollback_present_cas_publish "$CURRENT_MANIFEST" \
+            "$transaction_manifest" 0600 \
+            "$transaction_before_dir/current.manifest" "$manifest_was_mode" \
+            "$manifest_exchange_sibling" "$manifest_candidate_identity" \
+            "$manifest_displaced_validated" rollback-manifest
+        return $?
+    else
+        rollback_absent_cas_publish "$CURRENT_MANIFEST" \
+            "$transaction_manifest" 0600 "$manifest_exchange_sibling" \
+            "$manifest_candidate_identity" rollback-manifest
+        return $?
+    fi
+}
+
+rollback_config_publish() {
+    if [[ "$config_publish_intent" != true ]]; then
+        return 0
+    fi
+    rollback_present_cas_publish "$HYPRLAND_CONFIG_FILE" \
+        "$config_candidate" "$config_snapshot_mode" \
+        "$transaction_before_dir/hyprland.lua" "$config_snapshot_mode" \
+        "$config_exchange_sibling" "$config_candidate_identity" \
+        "$config_displaced_validated" rollback-config
+}
+
+rollback_transaction() {
+    local rollback_status=0 content_restore_status=0 service_restore_status=0
+    local service_stop_failed=false
+    local service_recovery_required=false
+    local main_unit_may_exist=false resume_unit_may_exist=false
+    local artifact_id destination
+    local index
+
+    log_warning "Rolling back incomplete installation transaction=$transaction_id"
+
+    if [[ "$service_state_changed" == true || \
+        "${ARTIFACT_PUBLISH_INTENT[main-service]:-false}" == true || \
+        "${ARTIFACT_PUBLISH_INTENT[resume-service]:-false}" == true ]]; then
+        service_recovery_required=true
+    fi
+    if [[ "$main_enablement_state" != not-found || \
+        "$main_was_active" == true || -e "$SERVICE_FILE" || \
+        -L "$SERVICE_FILE" ]]; then
+        main_unit_may_exist=true
+    fi
+    if [[ "$resume_enablement_state" != not-found || \
+        "$resume_was_active" == true || -e "$RESUME_SERVICE_FILE" || \
+        -L "$RESUME_SERVICE_FILE" ]]; then
+        resume_unit_may_exist=true
+    fi
+
+    if [[ "$service_recovery_required" == true ]]; then
+        if [[ "$resume_unit_may_exist" == true ]]; then
+            systemctl --user stop lid-resume-monitor.service >/dev/null 2>&1 \
+                || service_stop_failed=true
+        fi
+        if [[ "$main_unit_may_exist" == true ]]; then
+            systemctl --user stop lid-monitor.service >/dev/null 2>&1 \
+                || service_stop_failed=true
+        fi
+        if [[ "$service_stop_failed" == true ]]; then
+            log_error "Rollback cannot safely replace files while a service may still be running"
+            log_error "Rollback incomplete; recovery snapshot retained at $transaction_before_dir"
+            return 1
+        fi
+        if [[ "$(capture_active_state lid-monitor.service)" != false || \
+            "$(capture_active_state lid-resume-monitor.service)" != false ]]; then
+            log_error "Rollback cannot replace files until both services are inactive"
+            log_error "Rollback incomplete; recovery snapshot retained at $transaction_before_dir"
+            return 1
+        fi
+        if [[ "$main_unit_may_exist" == true ]]; then
+            systemctl --user disable lid-monitor.service >/dev/null 2>&1 \
+                || service_restore_status=1
+        fi
+    fi
+
+    for (( index=${#ARTIFACT_IDS[@]} - 1; index >= 0; index-- )); do
+        artifact_id=${ARTIFACT_IDS[$index]}
+        rollback_managed_publish "$artifact_id" || content_restore_status=1
+    done
+
+    rollback_manifest_publish || content_restore_status=1
+
+    rollback_config_publish || content_restore_status=1
+
+    if (( content_restore_status != 0 )); then
+        if [[ "$service_recovery_required" == true ]]; then
+            systemctl --user stop lid-resume-monitor.service >/dev/null 2>&1 || true
+            systemctl --user stop lid-monitor.service >/dev/null 2>&1 || true
+            if [[ "$(capture_active_state lid-monitor.service)" != false || \
+                "$(capture_active_state lid-resume-monitor.service)" != false ]]; then
+                log_error "Rollback failure left a lid service active"
+            fi
+            log_error "Services remain stopped because installation content could not be restored coherently"
+        fi
+        log_error "Rollback incomplete; recovery snapshot retained at $transaction_before_dir"
+        return 1
+    fi
+
+    if [[ "$service_recovery_required" == true ]]; then
+        if ! systemctl --user daemon-reload >/dev/null 2>&1; then
+            log_error "Could not reload restored user-systemd unit definitions"
+            service_restore_status=1
+        else
+            case "$main_enablement_state" in
+                enabled)
+                    systemctl --user enable lid-monitor.service >/dev/null 2>&1 \
+                        || service_restore_status=1
+                    ;;
+                disabled)
+                    systemctl --user disable lid-monitor.service >/dev/null 2>&1 \
+                        || service_restore_status=1
+                    ;;
+                not-found)
+                    ;;
+                *)
+                    service_restore_status=1
+                    ;;
+            esac
+        fi
+        if (( service_restore_status == 0 )) && \
+            { [[ "$(capture_enablement_state lid-monitor.service main)" != \
+                "$main_enablement_state" ]] || \
+            [[ "$(capture_enablement_state lid-resume-monitor.service resume)" != \
+                "$resume_enablement_state" ]]; }; then
+            log_error "Could not verify prior service enablement state"
+            service_restore_status=1
+        fi
+        if (( service_restore_status == 0 )); then
+            if [[ "$main_was_active" == true ]]; then
+                systemctl --user start lid-monitor.service >/dev/null 2>&1 \
+                    || service_restore_status=1
+            else
+                systemctl --user stop lid-monitor.service >/dev/null 2>&1 || true
+            fi
+            if [[ "$resume_was_active" == true ]]; then
+                systemctl --user start lid-resume-monitor.service >/dev/null 2>&1 \
+                    || service_restore_status=1
+            else
+                systemctl --user stop lid-resume-monitor.service >/dev/null 2>&1 || true
+            fi
+            if [[ "$(capture_active_state lid-monitor.service)" != \
+                "$main_was_active" || \
+                "$(capture_active_state lid-resume-monitor.service)" != \
+                "$resume_was_active" ]]; then
+                log_error "Could not restore prior service active state"
+                service_restore_status=1
+            fi
+        fi
+        if (( service_restore_status != 0 )); then
+            systemctl --user stop lid-resume-monitor.service >/dev/null 2>&1 || true
+            systemctl --user stop lid-monitor.service >/dev/null 2>&1 || true
+            log_error "Services remain stopped because restored service state could not be verified"
+        fi
+    fi
+
+    rollback_status=$service_restore_status
+
+    if (( rollback_status == 0 )); then
+        for destination in "${TEMPORARY_DESTINATIONS[@]}"; do
+            rm -f -- "$destination" || true
+        done
+        if [[ "$scripts_dir_existed" == false ]]; then
+            rmdir -- "$SCRIPTS_DIR" 2>/dev/null || true
+        fi
+        if [[ "$session_module_dir_existed" == false ]]; then
+            rmdir -- "$SESSION_MODULE_DIR" 2>/dev/null || true
+        fi
+        if [[ "$systemd_user_dir_existed" == false ]]; then
+            rmdir -- "$SYSTEMD_USER_DIR" 2>/dev/null || true
+        fi
+        if [[ "$backup_promoted_uncommitted" == true ]]; then
+            if ! rm -rf -- "$transaction_before_dir" || \
+                [[ -e "$transaction_before_dir" || \
+                -L "$transaction_before_dir" ]]; then
+                log_error "Could not remove rejected promoted rollback snapshot: $transaction_before_dir"
+                rollback_status=1
+            else
+                backup_promoted_uncommitted=false
+            fi
+        fi
+        if (( rollback_status == 0 )); then
+            if ! rm -rf -- "$transaction_dir" || \
+                [[ -e "$transaction_dir" || -L "$transaction_dir" ]]; then
+                log_error "Could not remove completed rollback transaction: $transaction_dir"
+                rollback_status=1
+            else
+                transaction_active=false
+                log_success "Previous installation state restored"
+            fi
+        fi
+    fi
+    if (( rollback_status != 0 )); then
+        log_error "Rollback incomplete; recovery snapshot retained at $transaction_before_dir"
+    fi
+    return "$rollback_status"
+}
+
+append_backup_integrity_entry() {
+    local root=$1
+    local relative=$2
+    local manifest=$3
+    local path="$root/$relative"
+    local hash mode
+
+    if [[ -L "$path" || ! -f "$path" ]] || \
+        ! hash=$(sha256_file "$path") || \
+        ! mode=$(stat -c %a -- "$path"); then
+        log_error "Rollback snapshot entry is unavailable: $relative"
+        return 1
+    fi
+    printf 'file\t%s\t%s\t%s\n' "$hash" "$mode" "$relative" \
+        >> "$manifest"
+}
+
+append_backup_integrity_directory() {
+    local root=$1
+    local relative=$2
+    local manifest=$3
+    local path identity mode
+
+    if [[ "$relative" == . ]]; then
+        path=$root
+    else
+        path="$root/$relative"
+    fi
+    if [[ -L "$path" || ! -d "$path" ]] || \
+        ! identity=$(stat -c '%d:%i' -- "$path") || \
+        ! mode=$(stat -c %a -- "$path"); then
+        log_error "Rollback snapshot directory is unavailable: $relative"
+        return 1
+    fi
+    printf 'directory\t%s\t%s\t%s\n' "$identity" "$mode" "$relative" \
+        >> "$manifest"
+}
+
+write_backup_integrity_manifest() {
+    local root=$1
+    local manifest=$2
+    local artifact_id relative parent
+    local -A required_directories=([.]=true [files]=true)
+
+    if [[ -L "$root" || ! -d "$root" || \
+        -L "$root/files" || ! -d "$root/files" ]]; then
+        log_error "Rollback snapshot directories are incomplete"
+        return 1
+    fi
+    if ! : > "$manifest" || ! chmod 0600 -- "$manifest"; then
+        log_error "Could not create rollback snapshot integrity manifest"
+        return 1
+    fi
+    for artifact_id in "${ARTIFACT_IDS[@]}"; do
+        if [[ "${ARTIFACT_WAS_PRESENT[$artifact_id]}" == true ]]; then
+            relative="files/${ARTIFACT_RELATIVE_PATH[$artifact_id]}"
+            parent=${relative%/*}
+            while [[ -n "$parent" && "$parent" != "$relative" ]]; do
+                required_directories[$parent]=true
+                if [[ "$parent" != */* ]]; then
+                    break
+                fi
+                parent=${parent%/*}
+            done
+        fi
+    done
+    for relative in "${!required_directories[@]}"; do
+        append_backup_integrity_directory "$root" "$relative" "$manifest" \
+            || return 1
+    done
+
+    for relative in snapshot.tsv service-state hyprland.lua; do
+        append_backup_integrity_entry "$root" "$relative" "$manifest" \
+            || return 1
+    done
+    if [[ "$manifest_was_present" == true ]]; then
+        append_backup_integrity_entry "$root" current.manifest "$manifest" \
+            || return 1
+    fi
+    for artifact_id in "${ARTIFACT_IDS[@]}"; do
+        if [[ "${ARTIFACT_WAS_PRESENT[$artifact_id]}" == true ]]; then
+            relative="files/${ARTIFACT_RELATIVE_PATH[$artifact_id]}"
+            append_backup_integrity_entry "$root" "$relative" "$manifest" \
+                || return 1
+        fi
+    done
+}
+
+verify_backup_integrity_manifest() {
+    local root=$1
+    local manifest=$2
+    local kind expected_fingerprint expected_mode relative path
+    local actual_fingerprint actual_mode
+    local entries=0
+
+    if [[ -L "$root" || ! -d "$root" || \
+        -L "$root/files" || ! -d "$root/files" ]]; then
+        return 1
+    fi
+    while IFS=$'\t' read -r kind expected_fingerprint expected_mode relative; do
+        entries=$((entries + 1))
+        if [[ -z "$relative" || "$relative" == /* || \
+            "$relative" == *'..'* ]]; then
+            return 1
+        fi
+        if [[ "$relative" == . ]]; then
+            path=$root
+        else
+            path="$root/$relative"
+        fi
+        case "$kind" in
+            directory)
+                if [[ -L "$path" || ! -d "$path" ]] || \
+                    ! actual_fingerprint=$(stat -c '%d:%i' -- "$path"); then
+                    return 1
+                fi
+                ;;
+            file)
+                if [[ -L "$path" || ! -f "$path" ]] || \
+                    ! actual_fingerprint=$(sha256_file "$path"); then
+                    return 1
+                fi
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+        if ! actual_mode=$(stat -c %a -- "$path") || \
+            [[ "$actual_fingerprint" != "$expected_fingerprint" || \
+            "$actual_mode" != "$expected_mode" ]]; then
+            return 1
+        fi
+    done < "$manifest"
+    (( entries >= 5 ))
+}
+
+commit_transaction() {
+    local backup_destination old_backup destination
+    local promotion_status=0
+    local backup_source_identity backup_destination_identity backup_mode
+    local backup_integrity_manifest backup_integrity_hash actual_integrity_hash
+    local -a backups=()
+
+    backup_destination="$BACKUPS_DIR/$transaction_id"
+    backup_integrity_manifest="$transaction_dir/backup.integrity"
+    if ! write_backup_integrity_manifest "$transaction_before_dir" \
+        "$backup_integrity_manifest" || \
+        ! backup_integrity_hash=$(sha256_file "$backup_integrity_manifest"); then
+        log_error "Could not fingerprint the complete rollback snapshot"
+        return 1
+    fi
+    if [[ -L "$transaction_before_dir" || ! -d "$transaction_before_dir" ]] || \
+        ! backup_source_identity=$(stat -c '%d:%i' -- "$transaction_before_dir") || \
+        ! backup_mode=$(stat -c %a -- "$transaction_before_dir") || \
+        [[ "$backup_mode" != 700 ]] || \
+        [[ -L "$transaction_before_dir/snapshot.tsv" || \
+        ! -f "$transaction_before_dir/snapshot.tsv" || \
+        -L "$transaction_before_dir/service-state" || \
+        ! -f "$transaction_before_dir/service-state" || \
+        -L "$transaction_before_dir/hyprland.lua" || \
+        ! -f "$transaction_before_dir/hyprland.lua" || \
+        -L "$transaction_before_dir/files" || \
+        ! -d "$transaction_before_dir/files" ]]; then
+        log_error "Pre-install rollback snapshot is incomplete before promotion"
+        return 1
+    fi
+    defer_transaction_signals
+    ARCH_LIDSWITCH_ATOMIC_CONTEXT=commit-backup \
+        mv -T -- "$transaction_before_dir" "$backup_destination" \
+        || promotion_status=$?
+    backup_destination_identity=$(stat -c '%d:%i' -- "$backup_destination" 2>/dev/null) \
+        || backup_destination_identity=""
+    backup_mode=$(stat -c %a -- "$backup_destination" 2>/dev/null) \
+        || backup_mode=""
+    if [[ ! -e "$transaction_before_dir" && \
+        ! -L "$transaction_before_dir" && \
+        -d "$backup_destination" && ! -L "$backup_destination" && \
+        "$backup_destination_identity" == "$backup_source_identity" && \
+        "$backup_mode" == 700 ]]; then
+        transaction_before_dir="$backup_destination"
+        backup_promoted_uncommitted=true
+    else
+        log_error "Could not verify promoted rollback snapshot identity"
+        restore_and_deliver_transaction_signals
+        if (( promotion_status != 0 )); then
+            return "$promotion_status"
+        fi
+        return 1
+    fi
+    actual_integrity_hash=$(sha256_file "$backup_integrity_manifest") \
+        || actual_integrity_hash=""
+    if [[ "$actual_integrity_hash" != "$backup_integrity_hash" ]] || \
+        ! verify_backup_integrity_manifest "$backup_destination" \
+            "$backup_integrity_manifest"; then
+        log_error "Promoted rollback snapshot failed complete integrity verification"
+        restore_and_deliver_transaction_signals
+        return 1
+    fi
+    if (( promotion_status != 0 )); then
+        log_warning "Backup promotion reported status=$promotion_status after completing; reconciled committed destination"
+    fi
+    if [[ "${ARCH_LIDSWITCH_TEST_SIGNAL_AFTER_PUBLISH:-}" == \
+        backup-promotion ]]; then
+        log_warning "Injecting TERM after backup promotion"
+        kill -s TERM "$$"
+    fi
+    transaction_committed=true
+    transaction_active=false
+    backup_promoted_uncommitted=false
+
+    for destination in "${TEMPORARY_DESTINATIONS[@]}"; do
+        rm -f -- "$destination" || \
+            log_warning "Could not remove committed publication sibling: $destination"
+    done
+    rm -rf -- "$transaction_stage_dir" "$transaction_manifest" \
+        "$config_candidate" "$config_exchange_sibling" || \
+        log_warning "Could not remove committed transaction staging files"
+    rm -rf -- "$transaction_dir" || \
+        log_warning "Could not remove committed transaction directory"
+
+    shopt -s nullglob
+    backups=("$BACKUPS_DIR"/*)
+    shopt -u nullglob
+    for old_backup in "${backups[@]}"; do
+        if [[ "$old_backup" != "$backup_destination" ]]; then
+            rm -rf -- "$old_backup" || \
+                log_warning "Could not prune old rollback set: $old_backup"
+        fi
+    done
+    chmod 0700 -- "$backup_destination" || \
+        log_warning "Could not reaffirm rollback-set permissions"
+    if [[ -n "$transaction_lock_fd" ]]; then
+        flock -u "$transaction_lock_fd" || true
+        exec {transaction_lock_fd}>&-
+        transaction_lock_fd=""
+    fi
+    log_success "Committed artifact transaction; rollback set: $backup_destination"
+    restore_and_deliver_transaction_signals
+}
+
+activate_session_target_after_commit() {
+    if ! "$SESSION_BRIDGE" start; then
+        log_warning "Installed services are healthy, but current-session target activation failed"
+        log_info "The Hyprland session hook will retry target activation on the next session"
+    fi
+}
+
+handle_installer_exit() {
+    local status=$?
+
+    trap - EXIT
+    trap '' INT TERM
+    if [[ "$transaction_active" == true && "$transaction_committed" != true ]]; then
+        set +e
+        set +u
+        if ! rollback_transaction; then
+            status=1
+        elif (( status == 0 )); then
+            status=1
+        fi
+    fi
+    if [[ -n "$transaction_lock_fd" ]]; then
+        flock -u "$transaction_lock_fd" >/dev/null 2>&1 || true
+        exec {transaction_lock_fd}>&-
+    fi
+    exit "$status"
+}
+
+detect_legacy_default_target_service() {
+    if [[ -f "$SERVICE_FILE" ]] && grep -Fqx 'WantedBy=default.target' "$SERVICE_FILE"; then
+        legacy_default_target_service=true
     fi
 }
 
@@ -672,58 +2513,36 @@ main() {
     echo "Hyprland Lid Switch Installer"
     echo "=================================="
     echo
-    
+
     # Pre-installation checks
     log_info "Performing pre-installation checks..."
     check_hyprland
     inspect_session_config
     check_resume_runtime_dependencies
+    check_transaction_dependencies
     check_lid_power_policy
     check_hyprland_capabilities
-    
+
     # Detect monitors
     log_info "Detecting Monitors..."
     detect_monitors
     
-    # Backup existing files
-    backup_existing_files
+    prepare_transaction
+    apply_transaction
+    commit_transaction
 
-    # Detect the previous default-target unit before replacing it.
-    detect_legacy_default_target_service
-    
-    # Create directories
-    create_directories
-    
-    # Prepare every non-service artifact before stopping a legacy service.
-    install_lid_state_script
-    install_monitor_state_script
-    install_lid_switch_script "$laptop_monitor"
-    install_lid_switch_doctor
-    install_lid_monitor_script
-    install_lid_resume_monitor_script
-    install_session_bridge
-    install_session_module
-    install_session_target
-
-    # Test the same lid observer used by the runtime scripts
-    test_lid_detection
-
-    # Replace the legacy lifecycle only after all preparation succeeded.
-    migrate_legacy_default_target_service
-    install_systemd_service
-    
-    # Enable and start service
-    enable_service
-
-    # Make future compositor sessions start and stop the target.
-    integrate_session_config
+    # Target activation can affect the wider graphical session, so it occurs
+    # only after the file/service transaction is durably committed.
+    activate_session_target_after_commit
     
     # Print final instructions
     print_final_instructions
 }
 
-# Handle script interruption
-trap 'log_error "Installation interrupted"; exit 1' INT TERM
+# Handle interruption and every incomplete transaction through one rollback path.
+trap handle_installer_exit EXIT
+trap 'log_error "Installation interrupted"; exit 130' INT
+trap 'log_error "Installation terminated"; exit 143' TERM
 
 # Run main function
 main "$@"

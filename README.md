@@ -59,8 +59,8 @@ across the sleep cycle and coalesces resume requests into the main daemon.
 - **Desktop**: Hyprland 0.55.0 or newer, using the Lua configuration provider
 - **Hardware**: Laptop with ACPI lid switch support
 - **Session**: Wayland session
-- **Tools**: `hyprctl`, `jq`, and GNU coreutils `stdbuf` and `timeout`
-- **System manager**: systemd 257 or newer; the resume listener uses typed `busctl wait` output
+- **Tools**: `hyprctl`, `jq`, Lua's `luac`, util-linux `flock`, GNU diffutils `cmp`, and GNU coreutils 9.11 or newer (`mv`, `sha256sum`, `stat`, `stdbuf`, and `timeout`); transactional publication requires `mv --exchange --no-copy` and `mv --update=none-fail --no-copy`
+- **System manager**: systemd 257 or newer with `systemd-analyze`; the resume listener uses typed `busctl wait` output
 - **Lua APIs**: `hl.monitor`, `hl.dispatch`, and `hl.dsp.dpms`; the installer probes all three without changing display state
 - **Instances**: Exactly one running Hyprland instance matching `HYPRLAND_INSTANCE_SIGNATURE` and the active Wayland socket; automatic instance selection is not supported
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
@@ -129,6 +129,34 @@ The installer creates the following files:
 
 The installer also appends one clearly marked, idempotent `pcall(require, ...)`
 block to `hyprland.lua`. Existing Lua callbacks and configuration are preserved.
+
+Installation is transactional. All eleven managed artifacts and the config
+candidate are staged and validated before the running services are stopped.
+Each destination is then published through a temporary file in the same
+directory. Existing files use an atomic exchange whose displaced bytes are
+validated against the snapshot; initially absent files use an atomic
+no-replace operation. The previous regular-file contents, modes, config,
+manifest, and service state are restored if any later step fails. Config
+publication uses the same exchange-and-validate rule. The installer lock and
+private state live under:
+
+```text
+${XDG_STATE_HOME:-$HOME/.local/state}/arch-lidswitch/
+├── current.manifest  # SHA-256 and mode for all eleven managed artifacts
+├── transactions/     # Transaction work; normally empty after completion
+└── backups/          # Complete pre-install rollback sets
+```
+
+When `XDG_STATE_HOME` is set, it must be an absolute path.
+
+The state and backup directories are mode `0700`; the current manifest and
+transaction metadata are mode `0600`. After committing the new installation,
+the installer makes a best-effort attempt to prune older complete rollback sets
+and normally retains only the newest one. A stale complete set can remain when
+cleanup is denied; this does not roll back an already validated, running
+installation, and uninstallation removes the whole private state root. This
+rollback handles ordinary installer errors and termination; it does not claim
+recovery from `SIGKILL`, power loss, or storage failure during publication.
 
 ## Usage
 
@@ -475,10 +503,13 @@ rm -f ~/.config/systemd/user/lid-resume-monitor.service
 
 # Reload systemd
 systemctl --user daemon-reload
+
+# Remove the installer manifest and retained rollback set
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/arch-lidswitch"
 ```
 
-Remove the exact block between `BEGIN arch-lidswitch managed session
-integration` and `END arch-lidswitch managed session integration` from
+Remove the exact block between `BEGIN arch-lidswitch managed session integration`
+and `END arch-lidswitch managed session integration` from
 `~/.config/hypr/hyprland.lua` as well. Do not remove surrounding user-owned Lua.
 
 No separate runtime log files need removal. Existing journal records expire
