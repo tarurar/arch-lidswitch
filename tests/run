@@ -4882,6 +4882,29 @@ installer_preserves_post_layout_hook_configuration_and_docs() (
     (( failures == 0 ))
 )
 
+readme_defines_workspace_assignment_scope() (
+    set -euo pipefail
+
+    local readme_contents failures=0
+
+    readme_contents=$(<"$ROOT_DIR/README.md")
+    assert_contains "$readme_contents" \
+        'does not capture or restore workspace-to-monitor assignments' \
+        'README should bound layout preservation to monitor geometry' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" 'Hyprland workspace rules' \
+        'README should point deterministic workspace placement to Hyprland' \
+        || failures=$((failures + 1))
+    assert_not_contains "$readme_contents" 'All workspaces remain accessible' \
+        'README must not promise workspace behavior it does not implement' \
+        || failures=$((failures + 1))
+    assert_not_contains "$readme_contents" 'Maintains your workspace layout' \
+        'README must not promise workspace restoration it does not implement' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 tests_run=0
 tests_failed=0
 tests_selected=0
@@ -4983,6 +5006,11 @@ run_test \
     'BUG-015-packaging-docs' \
     'installer and docs preserve the user-owned post-layout hook contract' \
     installer_preserves_post_layout_hook_configuration_and_docs
+
+run_test \
+    'BUG-014-workspace-scope' \
+    'README defines workspace assignment behavior as outside layout restoration' \
+    readme_defines_workspace_assignment_scope
 
 run_test \
     'BUG-012-lid0' \

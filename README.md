@@ -12,7 +12,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 📝 **Journal Logging**: Structured service and transition records for troubleshooting
 - 🔁 **Session-Bound Startup**: Systemd user service starts after Hyprland is reachable and stops with the graphical session
 - 💤 **Single Power-Policy Owner**: Leaves every lid-triggered power decision to systemd-logind
-- 📐 **Layout Preservation**: Restores the internal panel's captured mode, position, scale, transform, and mirror without rewriting external outputs
+- 📐 **Display Geometry Preservation**: Restores the internal panel's captured mode, position, scale, transform, and mirror without rewriting external outputs
 - 🧩 **Optional Post-Layout Hook**: Runs one bounded user command after a verified internal-display layout change
 
 ## How It Works
@@ -23,7 +23,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Captures the active internal panel layout in the private runtime directory
 - Disables laptop internal display
 - Leaves every external monitor's mode, position, scale, transform, and mirror untouched
-- All workspaces remain accessible
+- Leaves workspace migration and window placement to Hyprland
 - Runs the optional post-layout hook once with the verified `disabled` outcome
 
 ### Lid Opened
@@ -31,7 +31,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Makes no display change if the internal display is already enabled
 - Restores its exact mode, position, scale, transform, and mirror settings
 - Leaves the external monitor arrangement untouched
-- Maintains your workspace layout
+- Does not attempt to restore workspace-to-monitor assignments
 - Runs the optional post-layout hook once with the verified `enabled` outcome
 
 ### Lid Closed + No Enabled External Output
@@ -400,6 +400,19 @@ failed transition, or a DPMS-only wake. Runtime is limited to two seconds, with
 a one-second forced-termination grace period. Invalid hooks, failures, and
 timeouts are logged but advisory: they do not fail or retry display
 reconciliation.
+
+### Workspace Assignment Scope
+
+Display geometry and workspace placement are separate responsibilities.
+arch-lidswitch preserves only the internal output's geometry.
+It does not capture or restore workspace-to-monitor assignments. When an output
+is disabled, Hyprland may move its workspaces and windows to another output;
+reopening the lid does not move them back automatically, including in
+multi-external-monitor setups.
+
+Use Hyprland workspace rules when assignments must be deterministic. The
+optional post-layout hook can run additional user-specific placement logic, but
+workspace restoration is not part of the built-in contract.
 
 ### Monitor Resolution and Positioning
 
