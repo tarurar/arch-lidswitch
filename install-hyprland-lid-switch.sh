@@ -122,14 +122,14 @@ read_lid_state() {
     if (( ${#state_files[@]} == 0 )); then
         printf 'No ACPI lid state files found under %s\n' "$lid_root" >&2
         printf '%s\n' unknown
-        return 1
+        return 2
     fi
 
     for state_file in "${state_files[@]}"; do
         if [[ ! -f "$state_file" || ! -r "$state_file" ]] || ! state_line=$(<"$state_file"); then
             printf 'Unable to read ACPI lid state: %s\n' "$state_file" >&2
             printf '%s\n' unknown
-            return 1
+            return 3
         fi
 
         if [[ "$state_line" =~ ^[[:space:]]*(state:[[:space:]]*)?(open|closed)[[:space:]]*$ ]]; then
@@ -137,7 +137,7 @@ read_lid_state() {
         else
             printf 'Malformed ACPI lid state: %s\n' "$state_file" >&2
             printf '%s\n' unknown
-            return 1
+            return 4
         fi
 
         if [[ -z "$observed_state" ]]; then
@@ -145,7 +145,7 @@ read_lid_state() {
         elif [[ "$state" != "$observed_state" ]]; then
             printf 'Conflicting ACPI lid states found under %s\n' "$lid_root" >&2
             printf '%s\n' unknown
-            return 1
+            return 5
         fi
     done
 
@@ -168,8 +168,29 @@ install_lid_switch_script() {
 #!/bin/bash
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+log_record() {
+    local level=$1
+    local event=$2
+    shift 2
+
+    printf 'level=%s component=lid-switch event=%s' "$level" "$event"
+    if (( $# > 0 )); then
+        printf ' %s' "$@"
+    fi
+    printf '\n'
+}
+
+log_info() {
+    log_record info "$@"
+}
+
+log_error() {
+    log_record error "$@" >&2
+}
+
 if ! . "$SCRIPT_DIR/lid-state.sh"; then
-    printf 'Unable to load lid state observer\n' >&2
+    log_error lid_state_observer_load_failed
     exit 1
 fi
 
@@ -177,11 +198,6 @@ LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 LAPTOP_MODE="2880x1920@120"
 LAPTOP_POSITION="0x0"
 LAPTOP_SCALE="2"
-LOG_FILE="${HYPR_LID_SWITCH_LOG_FILE:-/tmp/hypr-lid-switch.log}"
-
-log_message() {
-    echo "$(date): $1" >> "$LOG_FILE"
-}
 
 get_external_display() {
     local monitor_output external_display
@@ -217,18 +233,18 @@ configure_dual_layout() {
 refresh_waybar_layout() {
     if pgrep -x waybar >/dev/null 2>&1; then
         pkill -x -SIGUSR1 waybar || {
-            log_message "Failed to hide Waybar"
+            log_error waybar_refresh_failed phase=hide
             return 1
         }
         sleep 0.1
-        pkill -x -SIGUSR1 waybar || log_message "Failed to show Waybar"
+        pkill -x -SIGUSR1 waybar || log_error waybar_refresh_failed phase=show
     fi
 }
 
 handle_lid_close() {
     local discovery_status=0
 
-    log_message "Lid closed - checking for external monitor"
+    log_info transition_started action=close
 
     if CURRENT_EXTERNAL=$(get_external_display); then
         discovery_status=0
@@ -237,18 +253,18 @@ handle_lid_close() {
     fi
 
     if (( discovery_status == 0 )); then
-        log_message "External monitor detected: $CURRENT_EXTERNAL, disabling laptop display"
+        log_info external_monitor_detected action=close output="$CURRENT_EXTERNAL"
         if configure_clamshell_layout "$CURRENT_EXTERNAL"; then
             refresh_waybar_layout
-            log_message "Laptop display disabled, $CURRENT_EXTERNAL remains as primary"
+            log_info layout_applied action=close laptop=disabled external="$CURRENT_EXTERNAL"
         else
-            log_message "Failed to disable laptop display"
+            log_error layout_apply_failed action=close
         fi
     elif (( discovery_status == 1 )); then
-        log_message "No external monitor detected, hibernating system"
+        log_info power_action_requested action=hibernate reason=no_external_monitor
         systemctl hibernate
     else
-        log_message "Failed to query Hyprland monitors; refusing lid close transition"
+        log_error monitor_query_failed action=close
         return 2
     fi
 }
@@ -256,7 +272,7 @@ handle_lid_close() {
 handle_lid_open() {
     local discovery_status=0
 
-    log_message "Lid opened - re-enabling laptop display"
+    log_info transition_started action=open
 
     if CURRENT_EXTERNAL=$(get_external_display); then
         discovery_status=0
@@ -265,23 +281,23 @@ handle_lid_open() {
     fi
 
     if (( discovery_status == 0 )); then
-        log_message "External monitor detected: $CURRENT_EXTERNAL, setting up dual monitor configuration"
+        log_info external_monitor_detected action=open output="$CURRENT_EXTERNAL"
         if configure_dual_layout "$CURRENT_EXTERNAL"; then
             refresh_waybar_layout
-            log_message "Dual monitor setup restored with $CURRENT_EXTERNAL"
+            log_info layout_applied action=open layout=dual external="$CURRENT_EXTERNAL"
         else
-            log_message "Failed to enable laptop display"
+            log_error layout_apply_failed action=open layout=dual
         fi
     elif (( discovery_status == 1 )); then
-        log_message "No external monitor, enabling laptop display only"
+        log_info external_monitor_absent action=open
         if enable_laptop_display; then
             refresh_waybar_layout
-            log_message "Laptop display enabled"
+            log_info layout_applied action=open layout=laptop_only
         else
-            log_message "Failed to enable laptop display"
+            log_error layout_apply_failed action=open layout=laptop_only
         fi
     else
-        log_message "Failed to query Hyprland monitors; refusing lid open transition"
+        log_error monitor_query_failed action=open
         return 2
     fi
 }
@@ -295,10 +311,10 @@ case "${1:-}" in
         ;;
     *)
         if ! lid_state=$(read_lid_state); then
-            log_message "Unable to determine lid state; refusing automatic transition"
+            log_error lid_state_unknown action=auto
             exit 1
         fi
-        log_message "Auto-detecting lid state: $lid_state"
+        log_info lid_state_detected state="$lid_state"
         
         if [[ "$lid_state" == "closed" ]]; then
             handle_lid_close
@@ -330,9 +346,60 @@ install_lid_monitor_script() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LID_SWITCH_SCRIPT="$SCRIPT_DIR/lid-switch.sh"
-LOG_FILE="/tmp/hypr-lid-monitor.log"
+
+log_record() {
+    local level=$1
+    local event=$2
+    shift 2
+
+    printf 'level=%s component=lid-monitor event=%s' "$level" "$event"
+    if (( $# > 0 )); then
+        printf ' %s' "$@"
+    fi
+    printf '\n'
+}
+
+log_info() {
+    log_record info "$@"
+}
+
+log_error() {
+    log_record error "$@" >&2
+}
+
+observe_lid_state() {
+    local observation_status
+
+    if observed_state=$(read_lid_state 2>/dev/null); then
+        observed_error=""
+        return 0
+    else
+        observation_status=$?
+    fi
+
+    observed_state="unknown"
+    case "$observation_status" in
+        2)
+            observed_error="missing"
+            ;;
+        3)
+            observed_error="unreadable"
+            ;;
+        4)
+            observed_error="malformed"
+            ;;
+        5)
+            observed_error="conflicting"
+            ;;
+        *)
+            observed_error="unknown"
+            ;;
+    esac
+    return "$observation_status"
+}
+
 if ! . "$SCRIPT_DIR/lid-state.sh"; then
-    printf 'Unable to load lid state observer\n' >&2
+    log_error lid_state_observer_load_failed
     exit 1
 fi
 
@@ -341,19 +408,33 @@ if [[ "${1:-}" == "--print-state" ]]; then
     exit $?
 fi
 
-log_message() {
-    echo "$(date): $1" >> "$LOG_FILE"
-}
-
 # Initial state
-previous_state=$(read_lid_state 2>/dev/null) || previous_state="unknown"
-log_message "Lid monitor started, initial state: $previous_state"
+previous_error=""
+if observe_lid_state; then
+    previous_state="$observed_state"
+else
+    previous_state="unknown"
+    previous_error="$observed_error"
+    log_error lid_state_observation_failed reason="$observed_error"
+fi
+log_info monitor_started state="$previous_state"
 
 while true; do
-    current_state=$(read_lid_state 2>/dev/null) || current_state="unknown"
+    if observe_lid_state; then
+        current_state="$observed_state"
+        previous_error=""
+    else
+        current_state="unknown"
+        if [[ "$observed_error" != "$previous_error" ]]; then
+            log_error lid_state_observation_failed reason="$observed_error"
+        fi
+        previous_error="$observed_error"
+        sleep 1
+        continue
+    fi
     
     if [[ "$current_state" != "$previous_state" && "$current_state" != "unknown" ]]; then
-        log_message "Lid state changed from $previous_state to $current_state"
+        log_info lid_state_changed previous="$previous_state" current="$current_state"
         
         # Call the lid switch script with the appropriate argument
         if [[ "$current_state" == "closed" ]]; then
@@ -387,6 +468,9 @@ After=graphical-session.target
 [Service]
 Type=simple
 ExecStart=$SCRIPTS_DIR/lid-monitor.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arch-lidswitch
 Restart=always
 RestartSec=2
 Environment="DISPLAY=:0"
@@ -469,8 +553,8 @@ print_final_instructions() {
     echo
     echo -e "${BLUE}Useful commands:${NC}"
     echo "  • Check service status: systemctl --user status lid-monitor.service"
-    echo "  • View logs: tail -f /tmp/hypr-lid-monitor.log"
-    echo "  • View switch logs: tail -f /tmp/hypr-lid-switch.log"
+    echo "  • Follow service logs: journalctl --user -u lid-monitor.service -f -o cat"
+    echo "  • View current-boot logs: journalctl --user -u lid-monitor.service -b -o cat"
     echo "  • Stop service: systemctl --user stop lid-monitor.service"
     echo "  • Restart service: systemctl --user restart lid-monitor.service"
     echo

@@ -9,7 +9,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - ⚡ **Instant Response**: Real-time lid state monitoring with ~1 second response time  
 - 🛡️ **Hyprland Lua Compatible**: Uses `hyprctl eval`/`hl.monitor()` for modern Hyprland Lua configs
 - 🔧 **Zero Configuration**: Works out of the box after installation
-- 📝 **Comprehensive Logging**: Debug-friendly logs for troubleshooting
+- 📝 **Journal Logging**: Structured service and transition records for troubleshooting
 - 🔁 **Automatic Startup**: Systemd user service starts with your session
 - 💤 **Smart Power Management**: Hibernates when lid closes without external monitor
 - 📊 **Waybar Layout Refresh**: Refreshes Waybar layer geometry without restarting the Waybar process
@@ -124,15 +124,21 @@ HYPR_LID_STATE_ROOT=/path/to/button/lid \
 ### Monitoring Logs
 
 ```bash
-# View monitor daemon logs
-tail -f /tmp/hypr-lid-monitor.log
+# Follow monitor and switch records from the running service
+journalctl --user -u lid-monitor.service -f -o cat
 
-# View switch action logs  
-tail -f /tmp/hypr-lid-switch.log
+# View records from the current boot
+journalctl --user -u lid-monitor.service -b -o cat
 
-# View systemd service logs
-journalctl --user -u lid-monitor.service -f
+# View the previous boot when persistent journal storage is enabled
+journalctl --user -u lid-monitor.service -b -1 -o cat
 ```
+
+Runtime records use stable fields such as `component=lid-switch`,
+`event=monitor_query_failed`, and `action=close`. The user service sends both
+stdout and stderr to journald with the identifier `arch-lidswitch`; it does not
+create separate log files in `/tmp`. Journal retention follows the host's
+systemd-journald configuration.
 
 ## Troubleshooting
 
@@ -141,6 +147,11 @@ journalctl --user -u lid-monitor.service -f
 1. **Check service status**:
    ```bash
    systemctl --user status lid-monitor.service
+   ```
+
+   Inspect the service's current-boot diagnostics:
+   ```bash
+   journalctl --user -u lid-monitor.service -b -n 100 --no-pager -o cat
    ```
 
 2. **Verify Hyprland is running**:
@@ -168,8 +179,8 @@ journalctl --user -u lid-monitor.service -f
 
 3. **Manual detection test**:
    ```bash
-   ~/.config/hypr/scripts/lid-monitor.sh
-   # Check /tmp/hypr-lid-monitor.log for state changes
+   ~/.config/hypr/scripts/lid-monitor.sh --print-state
+   journalctl --user -u lid-monitor.service -f -o cat
    ```
 
 ### Wrong Monitor Detection
@@ -247,11 +258,15 @@ sleep 2    # For less CPU usage
 
 ### Logging
 
-Disable logging by commenting out `log_message` calls or redirect to `/dev/null`:
+The monitor and switch scripts emit concise `key=value` records on stdout and
+stderr. To inspect only transition failures from the current boot:
 
 ```bash
-LOG_FILE="/dev/null"
+journalctl --user -u lid-monitor.service -b -o cat | grep 'level=error'
 ```
+
+Storage limits, persistence, and rotation are controlled centrally by
+systemd-journald rather than by these scripts.
 
 ## Uninstallation
 
@@ -263,12 +278,12 @@ systemctl --user disable lid-monitor.service
 # Remove files
 rm -f ~/.config/hypr/scripts/lid-state.sh
 rm -f ~/.config/hypr/scripts/lid-switch.sh
-rm -f ~/.config/hypr/scripts/lid-monitor.sh  
+rm -f ~/.config/hypr/scripts/lid-monitor.sh
 rm -f ~/.config/systemd/user/lid-monitor.service
-
-# Clean up logs
-rm -f /tmp/hypr-lid-*.log
 
 # Reload systemd
 systemctl --user daemon-reload
 ```
+
+No separate runtime log files need removal. Existing journal records expire
+according to the host's systemd-journald retention policy.

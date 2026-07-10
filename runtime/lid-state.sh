@@ -19,14 +19,14 @@ read_lid_state() {
     if (( ${#state_files[@]} == 0 )); then
         printf 'No ACPI lid state files found under %s\n' "$lid_root" >&2
         printf '%s\n' unknown
-        return 1
+        return 2
     fi
 
     for state_file in "${state_files[@]}"; do
         if [[ ! -f "$state_file" || ! -r "$state_file" ]] || ! state_line=$(<"$state_file"); then
             printf 'Unable to read ACPI lid state: %s\n' "$state_file" >&2
             printf '%s\n' unknown
-            return 1
+            return 3
         fi
 
         if [[ "$state_line" =~ ^[[:space:]]*(state:[[:space:]]*)?(open|closed)[[:space:]]*$ ]]; then
@@ -34,7 +34,7 @@ read_lid_state() {
         else
             printf 'Malformed ACPI lid state: %s\n' "$state_file" >&2
             printf '%s\n' unknown
-            return 1
+            return 4
         fi
 
         if [[ -z "$observed_state" ]]; then
@@ -42,7 +42,7 @@ read_lid_state() {
         elif [[ "$state" != "$observed_state" ]]; then
             printf 'Conflicting ACPI lid states found under %s\n' "$lid_root" >&2
             printf '%s\n' unknown
-            return 1
+            return 5
         fi
     done
 

@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_BIN=$(command -v env)
+REAL_SLEEP_BIN=$(command -v sleep)
+TIMEOUT_BIN=$(command -v timeout)
 TEST_FILTER=${1:-}
 
 if [[ $# -gt 1 ]]; then
@@ -57,8 +59,8 @@ install_safe_path() {
 installed_cli_handles_documented_open_and_close() (
     set -euo pipefail
 
-    local test_root home fake_bin safe_bin effect_log switch_log installed_cli monitor_fixture
-    local close_effects open_effects runtime_log
+    local test_root home fake_bin safe_bin effect_log installed_cli monitor_fixture
+    local close_effects open_effects close_output open_output
 
     test_root=$(mktemp -d)
     trap 'rm -rf "$test_root"' EXIT
@@ -67,7 +69,6 @@ installed_cli_handles_documented_open_and_close() (
     fake_bin="$test_root/fake-bin"
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
-    switch_log="$test_root/lid-switch.log"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     mkdir -p "$home"
     : > "$effect_log"
@@ -79,7 +80,6 @@ installed_cli_handles_documented_open_and_close() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1
 
@@ -95,9 +95,10 @@ installed_cli_handles_documented_open_and_close() (
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
-        "$installed_cli" close
+        "$installed_cli" close \
+        > "$test_root/close.out" 2>&1
     close_effects=$(<"$effect_log")
+    close_output=$(<"$test_root/close.out")
 
     assert_contains "$close_effects" $'monitor\toutput=eDP-1\tdisabled=true' \
         'closing the lid should disable the installed laptop output'
@@ -116,9 +117,10 @@ installed_cli_handles_documented_open_and_close() (
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
-        "$installed_cli" open
+        "$installed_cli" open \
+        > "$test_root/open.out" 2>&1
     open_effects=$(<"$effect_log")
+    open_output=$(<"$test_root/open.out")
 
     assert_contains "$open_effects" $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2' \
         'opening the lid should enable the installed laptop output'
@@ -131,24 +133,21 @@ installed_cli_handles_documented_open_and_close() (
     assert_not_contains "$open_effects" $'systemctl\t' \
         'a successful open must not request a power action'
 
-    if [[ ! -f "$switch_log" ]]; then
-        printf 'installed CLI ignored the isolated log path\n' >&2
-        return 1
-    fi
-    runtime_log=$(<"$switch_log")
-    assert_contains "$runtime_log" 'Laptop display disabled, DP-2 remains as primary' \
-        'close transition should report success through the CLI log'
-    assert_contains "$runtime_log" 'Dual monitor setup restored with DP-2' \
-        'open transition should report success through the CLI log'
+    assert_contains "$close_output" \
+        'level=info component=lid-switch event=layout_applied action=close laptop=disabled external=DP-2' \
+        'close transition should report a structured success record'
+    assert_contains "$open_output" \
+        'level=info component=lid-switch event=layout_applied action=open layout=dual external=DP-2' \
+        'open transition should report a structured success record'
 )
 
 installed_cli_refuses_actions_when_monitor_query_fails() (
     set -euo pipefail
 
     local transition=$1
-    local test_root home fake_bin safe_bin effect_log switch_log installed_cli
-    local install_fixture missing_runtime_fixture runtime_effects runtime_log
-    local runtime_output runtime_status=0
+    local test_root home fake_bin safe_bin effect_log installed_cli
+    local install_fixture missing_runtime_fixture runtime_effects runtime_output
+    local runtime_output_file runtime_status=0
 
     test_root=$(mktemp -d)
     trap 'rm -rf "$test_root"' EXIT
@@ -157,8 +156,7 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
     fake_bin="$test_root/fake-bin"
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
-    switch_log="$test_root/lid-switch.log"
-    runtime_output="$test_root/runtime.out"
+    runtime_output_file="$test_root/runtime.out"
     install_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     missing_runtime_fixture="$test_root/missing-monitors.txt"
     mkdir -p "$home"
@@ -171,7 +169,6 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$install_fixture" \
-        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1
 
@@ -183,12 +180,11 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$missing_runtime_fixture" \
-        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$installed_cli" "$transition" \
-        > "$runtime_output" 2>&1 || runtime_status=$?
+        > "$runtime_output_file" 2>&1 || runtime_status=$?
 
     runtime_effects=$(<"$effect_log")
-    runtime_log=$(<"$switch_log")
+    runtime_output=$(<"$runtime_output_file")
 
     assert_contains "$runtime_effects" $'hyprctl\tmonitors' \
         'the installed CLI should reach the failing monitor-query boundary'
@@ -199,14 +195,14 @@ installed_cli_refuses_actions_when_monitor_query_fails() (
 
     if (( runtime_status != 2 )); then
         printf 'expected query failure status 2, got %d\nruntime output:\n%s\n' \
-            "$runtime_status" "$(<"$runtime_output")" >&2
+            "$runtime_status" "$runtime_output" >&2
         return 1
     fi
 
-    assert_contains "$runtime_log" \
-        "Failed to query Hyprland monitors; refusing lid $transition transition" \
-        'the query failure should be distinguishable in the runtime log'
-    assert_not_contains "$runtime_log" 'No external monitor' \
+    assert_contains "$runtime_output" \
+        "level=error component=lid-switch event=monitor_query_failed action=$transition" \
+        'the query failure should be distinguishable at the journal stream boundary'
+    assert_not_contains "$runtime_output" 'event=external_monitor_absent' \
         'a query failure must not be reported as a valid empty topology'
 )
 
@@ -257,14 +253,107 @@ create_lid_state_fixture() {
     esac
 }
 
+installed_runtime_reports_through_the_journal_boundary() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture lid_root
+    local installed_cli installed_daemon installed_unit runtime_artifacts unit_contents
+    local runtime_output daemon_output failures=0 runtime_status=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    lid_root="$test_root/button/lid"
+    mkdir -p "$home"
+    create_lid_state_fixture "$lid_root" lid0
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+    installed_unit="$home/.config/systemd/user/lid-monitor.service"
+
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$test_root/missing-monitors.txt" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_cli" close \
+        > "$test_root/runtime.out" 2>&1 || runtime_status=$?
+
+    if (( runtime_status != 2 )); then
+        printf 'expected query failure status 2, got %d\n' "$runtime_status" >&2
+        failures=$((failures + 1))
+    fi
+
+    runtime_output=$(<"$test_root/runtime.out")
+    assert_contains "$runtime_output" \
+        'level=error component=lid-switch event=monitor_query_failed action=close' \
+        'the runtime should expose a useful structured error to the service journal stream' \
+        || failures=$((failures + 1))
+
+    runtime_artifacts="$(<"$installed_cli")"$'\n'"$(<"$installed_daemon")"
+    assert_not_contains "$runtime_artifacts" '/tmp/' \
+        'installed runtime scripts must not contain shared-/tmp paths' \
+        || failures=$((failures + 1))
+    assert_not_contains "$runtime_artifacts" 'HYPR_LID_SWITCH_LOG_FILE' \
+        'installed runtime scripts must not expose a file-log redirection seam' \
+        || failures=$((failures + 1))
+
+    unit_contents=$(<"$installed_unit")
+    assert_contains "$unit_contents" 'StandardOutput=journal' \
+        'the installed unit should route daemon output to the journal' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'StandardError=journal' \
+        'the installed unit should route daemon diagnostics to the journal' \
+        || failures=$((failures + 1))
+    assert_contains "$unit_contents" 'SyslogIdentifier=arch-lidswitch' \
+        'the installed unit should give journal records a stable identifier' \
+        || failures=$((failures + 1))
+
+    rm -f "$fake_bin/sleep"
+    ln -s "$REAL_SLEEP_BIN" "$fake_bin/sleep"
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        HYPR_LID_STATE_ROOT="$test_root/missing-lid" \
+        "$TIMEOUT_BIN" 0.2 "$installed_daemon" \
+        > "$test_root/daemon.out" 2>&1 || true
+    daemon_output=$(<"$test_root/daemon.out")
+    assert_contains "$daemon_output" \
+        'level=error component=lid-monitor event=lid_state_observation_failed reason=missing' \
+        'the running daemon should expose why lid observation is unavailable to the journal stream' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 installed_lid_state_matches_expected_behavior() (
     set -euo pipefail
 
     local scenario=$1
     local expected_state=$2
     local expected_error=${3:-}
-    local test_root home fake_bin safe_bin effect_log switch_log monitor_fixture lid_root
-    local installed_cli installed_daemon cli_effects daemon_output installer_output runtime_log
+    local test_root home fake_bin safe_bin effect_log monitor_fixture lid_root
+    local installed_cli installed_daemon cli_effects daemon_output installer_output
     local cli_status=0 daemon_status=0
 
     test_root=$(mktemp -d)
@@ -274,7 +363,6 @@ installed_lid_state_matches_expected_behavior() (
     fake_bin="$test_root/fake-bin"
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
-    switch_log="$test_root/lid-switch.log"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     lid_root="$test_root/button/lid"
     mkdir -p "$home"
@@ -289,7 +377,6 @@ installed_lid_state_matches_expected_behavior() (
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
         HYPR_LID_STATE_ROOT="$lid_root" \
-        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1; then
         printf 'installer failed for lid fixture %s:\n%s\n' \
@@ -316,7 +403,6 @@ installed_lid_state_matches_expected_behavior() (
         TEST_EFFECT_LOG="$effect_log" \
         TEST_MONITORS_FIXTURE="$monitor_fixture" \
         HYPR_LID_STATE_ROOT="$lid_root" \
-        HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$installed_cli" \
         > "$test_root/cli.out" 2> "$test_root/cli.err" || cli_status=$?
     cli_effects=$(<"$effect_log")
@@ -354,10 +440,10 @@ installed_lid_state_matches_expected_behavior() (
                     "$cli_effects" >&2
                 return 1
             fi
-            runtime_log=$(<"$switch_log")
-            assert_contains "$runtime_log" \
-                'Unable to determine lid state; refusing automatic transition' \
-                'the installed CLI should explain why automatic action was refused' || return 1
+            assert_contains "$(<"$test_root/cli.err")" \
+                'level=error component=lid-switch event=lid_state_unknown action=auto' \
+                'the installed CLI should explain why automatic action was refused at its stderr boundary' \
+                || return 1
             ;;
         *)
             printf 'unknown expected lid state: %s\n' "$expected_state" >&2
@@ -573,6 +659,11 @@ run_test \
     'BUG-004-open-query-failure' \
     'installed CLI refuses display changes when the open monitor query fails' \
     installed_cli_refuses_display_when_open_monitor_query_fails
+
+run_test \
+    'BUG-017-journal-boundary' \
+    'installed runtime reports structured diagnostics through the service journal boundary' \
+    installed_runtime_reports_through_the_journal_boundary
 
 run_test \
     'BUG-012-lid0' \

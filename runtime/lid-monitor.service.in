@@ -5,6 +5,9 @@ After=graphical-session.target
 [Service]
 Type=simple
 ExecStart=$SCRIPTS_DIR/lid-monitor.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arch-lidswitch
 Restart=always
 RestartSec=2
 Environment="DISPLAY=:0"

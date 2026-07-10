@@ -224,8 +224,8 @@ print_final_instructions() {
     echo
     echo -e "${BLUE}Useful commands:${NC}"
     echo "  • Check service status: systemctl --user status lid-monitor.service"
-    echo "  • View logs: tail -f /tmp/hypr-lid-monitor.log"
-    echo "  • View switch logs: tail -f /tmp/hypr-lid-switch.log"
+    echo "  • Follow service logs: journalctl --user -u lid-monitor.service -f -o cat"
+    echo "  • View current-boot logs: journalctl --user -u lid-monitor.service -b -o cat"
     echo "  • Stop service: systemctl --user stop lid-monitor.service"
     echo "  • Restart service: systemctl --user restart lid-monitor.service"
     echo
