@@ -41,13 +41,13 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Delegates the lid event to systemd-logind
 - With the supported default policy, logind suspends when undocked and ignores a docked lid close
 
-The daemon observes a joint lid-and-topology fingerprint. Its first complete
-observation is only a baseline, so service startup does not mutate the layout.
-While the session remains awake, later dock, undock, or output activation
-changes are reconciled even when the lid state itself has not changed. Multiple
-external outputs and inactive outputs remain explicit records in the structured
-snapshot; DPMS state is observed separately and never changes whether an output
-is classified as enabled.
+The daemon observes a joint lid-and-topology fingerprint. It reconciles the
+first complete observation immediately at service startup, then uses that
+observation as the baseline for later changes. While the session remains awake,
+later dock, undock, or output activation changes are reconciled even when the
+lid state itself has not changed. Multiple external outputs and inactive outputs
+remain explicit records in the structured snapshot; DPMS state is observed
+separately and never changes whether an output is classified as enabled.
 
 ## Requirements
 
@@ -160,6 +160,9 @@ systemctl --user enable lid-monitor.service
 
 # Inspect lid state without changing display or power state
 ~/.config/hypr/scripts/lid-monitor.sh --print-state
+
+# Reconcile the current lid and topology once, then exit
+~/.config/hypr/scripts/lid-monitor.sh --once
 
 # Inspect an alternate ACPI lid root
 HYPR_LID_STATE_ROOT=/path/to/button/lid \

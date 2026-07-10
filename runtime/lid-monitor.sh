@@ -77,6 +77,49 @@ observe_topology() {
     return "$observation_status"
 }
 
+reconcile_current_joint_state() {
+    local trigger=$1
+    local reconciliation_status
+
+    current_state=""
+    current_topology=""
+
+    if observe_lid_state; then
+        current_state="$observed_state"
+        previous_lid_error=""
+    else
+        reconciliation_status=$?
+        previous_lid_error="$observed_error"
+        log_error lid_state_observation_failed reason="$observed_error" \
+            trigger="$trigger"
+        return "$reconciliation_status"
+    fi
+
+    if observe_topology; then
+        current_topology="$observed_topology"
+        previous_topology_error=""
+    else
+        reconciliation_status=$?
+        previous_topology_error="$observed_topology_error"
+        log_error topology_observation_failed reason="$observed_topology_error" \
+            trigger="$trigger"
+        return "$reconciliation_status"
+    fi
+
+    log_info reconciliation_started trigger="$trigger" state="$current_state" \
+        topology="$current_topology"
+    if "$LID_SWITCH_SCRIPT" "$current_state"; then
+        log_info reconciliation_succeeded trigger="$trigger" state="$current_state"
+        return 0
+    else
+        reconciliation_status=$?
+    fi
+
+    log_error reconciliation_failed trigger="$trigger" state="$current_state" \
+        status="$reconciliation_status"
+    return "$reconciliation_status"
+}
+
 if ! . "$SCRIPT_DIR/lid-state.sh"; then
     log_error lid_state_observer_load_failed
     exit 1
@@ -92,33 +135,27 @@ if ! . "$SCRIPT_DIR/monitor-state.sh"; then
     exit 1
 fi
 
-# Treat the first complete joint observation as a baseline. Reconciliation only
-# begins after a later lid or topology change, so daemon startup remains inert.
+if [[ "${1:-}" == "--once" ]]; then
+    previous_lid_error=""
+    previous_topology_error=""
+    reconcile_current_joint_state once
+    exit $?
+fi
+
+# Reconcile the first complete joint observation before establishing the
+# baseline used to detect later lid or topology changes.
 baseline_ready=false
 previous_state="unknown"
 previous_topology=""
 previous_lid_error=""
 previous_topology_error=""
-initial_lid_valid=false
-initial_topology_valid=false
+current_state=""
+current_topology=""
 
-if observe_lid_state; then
-    initial_lid_valid=true
-    previous_state="$observed_state"
-else
-    previous_lid_error="$observed_error"
-    log_error lid_state_observation_failed reason="$observed_error"
-fi
-
-if observe_topology; then
-    initial_topology_valid=true
-    previous_topology="$observed_topology"
-else
-    previous_topology_error="$observed_topology_error"
-    log_error topology_observation_failed reason="$observed_topology_error"
-fi
-
-if [[ "$initial_lid_valid" == true && "$initial_topology_valid" == true ]]; then
+reconcile_current_joint_state startup || true
+if [[ -n "$current_state" && -n "$current_topology" ]]; then
+    previous_state="$current_state"
+    previous_topology="$current_topology"
     baseline_ready=true
 fi
 log_info monitor_started state="$previous_state" \
@@ -161,6 +198,8 @@ while true; do
 
     if [[ "$current_state" != "$previous_state" || \
         "$current_topology" != "$previous_topology" ]]; then
+        detected_state="$current_state"
+        detected_topology="$current_topology"
         log_info joint_state_changed previous_state="$previous_state" \
             current_state="$current_state" \
             previous_topology="$previous_topology" \
@@ -170,15 +209,14 @@ while true; do
             log_info lid_state_changed previous="$previous_state" current="$current_state"
         fi
 
-        # Call the lid switch script with the appropriate argument
-        if [[ "$current_state" == "closed" ]]; then
-            "$LID_SWITCH_SCRIPT" close
-        elif [[ "$current_state" == "open" ]]; then
-            "$LID_SWITCH_SCRIPT" open
+        reconcile_current_joint_state joint_change || true
+        if [[ -n "$current_state" && -n "$current_topology" ]]; then
+            previous_state="$current_state"
+            previous_topology="$current_topology"
+        else
+            previous_state="$detected_state"
+            previous_topology="$detected_topology"
         fi
-
-        previous_state="$current_state"
-        previous_topology="$current_topology"
     fi
 
     sleep 1

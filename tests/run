@@ -461,7 +461,7 @@ installed_daemon_observes_joint_lid_and_topology_changes() (
 
     local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
     local monitor_fixture installed_daemon sequence_dir sequence_counter
-    local framework internal external_enabled external_inactive docked inactive
+    local framework internal external_enabled external_inactive docked docked_disabled inactive
     local undocked_enabled undocked_disabled daemon_output effects
     local disable_count restore_count failures=0
 
@@ -483,6 +483,9 @@ installed_daemon_observes_joint_lid_and_topology_changes() (
     external_inactive='{"name":"WL-1","disabled":true,"dpmsStatus":true}'
     docked=$(jq -cn --argjson internal "$internal" \
         --argjson external "$external_enabled" '[$internal, $external]')
+    docked_disabled=$(jq -cn --argjson internal "$internal" \
+        --argjson external "$external_enabled" \
+        '[($internal | .disabled = true), $external]')
     inactive=$(jq -cn --argjson internal "$internal" \
         --argjson external "$external_inactive" '[$internal, $external]')
     undocked_enabled=$(jq -cn --argjson internal "$internal" '[$internal]')
@@ -509,17 +512,27 @@ installed_daemon_observes_joint_lid_and_topology_changes() (
         > "$test_root/installer.out" 2>&1
     installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
 
-    printf '%s\n' "$docked" > "$sequence_dir/0.json"
-    printf '%s\n' '__FAIL__' > "$sequence_dir/1.json"
-    printf '%s\n' "$undocked_enabled" > "$sequence_dir/2.json"
-    printf '%s\n' "$undocked_enabled" > "$sequence_dir/3.json"
+    # Startup observes and reconciles the undocked state. Each later change is
+    # observed once by the loop and again by the shared reconciliation path;
+    # lid-switch then performs its own current-topology query.
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/0.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/1.json"
+    printf '%s\n' '__FAIL__' > "$sequence_dir/2.json"
+    printf '%s\n' "$inactive" > "$sequence_dir/3.json"
     printf '%s\n' "$inactive" > "$sequence_dir/4.json"
     printf '%s\n' "$inactive" > "$sequence_dir/5.json"
     printf '%s\n' "$docked" > "$sequence_dir/6.json"
     printf '%s\n' "$docked" > "$sequence_dir/7.json"
-    printf '%s\n' "$undocked_disabled" > "$sequence_dir/8.json"
-    printf '%s\n' "$undocked_disabled" > "$sequence_dir/9.json"
-    printf '%s\n' "$undocked_enabled" > "$sequence_dir/10.json"
+    printf '%s\n' "$docked" > "$sequence_dir/8.json"
+    printf '%s\n' "$docked_disabled" > "$sequence_dir/9.json"
+    printf '%s\n' "$docked_disabled" > "$sequence_dir/10.json"
+    printf '%s\n' "$docked_disabled" > "$sequence_dir/11.json"
+    printf '%s\n' "$undocked_disabled" > "$sequence_dir/12.json"
+    printf '%s\n' "$undocked_disabled" > "$sequence_dir/13.json"
+    printf '%s\n' "$undocked_disabled" > "$sequence_dir/14.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/15.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/16.json"
+    printf '%s\n' "$undocked_enabled" > "$sequence_dir/17.json"
     printf '%s\n' "$undocked_enabled" > "$sequence_dir/final.json"
     printf '%s\n' 0 > "$sequence_counter"
 
@@ -565,6 +578,455 @@ installed_daemon_observes_joint_lid_and_topology_changes() (
         printf 'daemon round trip left a stale internal layout snapshot\n' >&2
         failures=$((failures + 1))
     fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_once_reconciles_closed_docked_startup() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture monitor_json installed_daemon runtime_output effects
+    local runtime_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 0.2 "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once \
+        > "$test_root/runtime.out" 2>&1 || runtime_status=$?
+
+    runtime_output=$(<"$test_root/runtime.out")
+    effects=$(<"$effect_log")
+    if (( runtime_status != 0 )); then
+        printf 'expected --once status 0, got %d\n%s\n' \
+            "$runtime_status" "$runtime_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" $'monitor\toutput=eDP-1\tdisabled=true' \
+        '--once should reconcile an initially closed docked laptop without a lid edge' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        '--once must retain the existing external layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        '--once must not request a repository-owned power action' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'sleep\t1' \
+        '--once should exit before entering the monitor loop' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_daemon_once_reconciles_supported_initial_states() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root lid_state_file
+    local monitor_fixture framework laptop_only installed_daemon
+    local runtime_status runtime_output effects failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    lid_state_file="$lid_root/LID0/state"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_only=$(jq -c '[.[] | select(.name == "eDP-1")]' <<< "$framework")
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$lid_root/LID0"
+    printf '%s\n' 'state: open' > "$lid_state_file"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    run_initial_profile() {
+        local label=$1
+        local lid_state=$2
+        local topology=$3
+        local expected_record=$4
+
+        runtime_status=0
+        printf 'state: %s\n' "$lid_state" > "$lid_state_file"
+        : > "$effect_log"
+        "$TIMEOUT_BIN" 1 "$ENV_BIN" -i \
+            HOME="$home" \
+            PATH="$fake_bin:$safe_bin" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            TEST_HYPRCTL_MONITORS_JSON="$topology" \
+            HYPR_LID_STATE_ROOT="$lid_root" \
+            "$installed_daemon" --once \
+            > "$test_root/$label.out" 2>&1 || runtime_status=$?
+        runtime_output=$(<"$test_root/$label.out")
+        effects=$(<"$effect_log")
+
+        if (( runtime_status != 0 )); then
+            printf 'expected %s --once status 0, got %d\n%s\n' \
+                "$label" "$runtime_status" "$runtime_output" >&2
+            return 1
+        fi
+        assert_contains "$runtime_output" "$expected_record" \
+            "$label should report the selected initial-state outcome" || return 1
+        assert_not_contains "$effects" $'monitor\t' \
+            "$label should preserve an already-safe internal layout" || return 1
+        assert_not_contains "$effects" $'systemctl\t' \
+            "$label must not request repository-owned power" || return 1
+        assert_not_contains "$effects" $'sleep\t1' \
+            "$label --once must not enter the monitor loop" || return 1
+    }
+
+    run_initial_profile open-external open "$framework" \
+        'event=layout_noop action=open reason=internal_already_enabled enabled_external_count=1' \
+        || failures=$((failures + 1))
+    run_initial_profile open-laptop open "$laptop_only" \
+        'event=layout_noop action=open reason=internal_already_enabled enabled_external_count=0' \
+        || failures=$((failures + 1))
+    run_initial_profile closed-laptop closed "$laptop_only" \
+        'event=power_delegated owner=systemd-logind action=close reason=no_enabled_external' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_daemon_once_refuses_invalid_joint_observations() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework installed_daemon sequence_dir sequence_counter
+    local runtime_status runtime_output effects query_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    sequence_dir="$test_root/topology-sequence"
+    sequence_counter="$test_root/topology-counter"
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    runtime_status=0
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 1 "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        HYPR_LID_STATE_ROOT="$test_root/missing-lid" \
+        "$installed_daemon" --once \
+        > "$test_root/missing-lid.out" 2>&1 || runtime_status=$?
+    runtime_output=$(<"$test_root/missing-lid.out")
+    if (( runtime_status == 0 || runtime_status == 124 )); then
+        printf 'expected missing lid observation failure, got status %d\n%s\n' \
+            "$runtime_status" "$runtime_output" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -s "$effect_log" ]]; then
+        printf 'missing lid state caused external effects:\n%s\n' \
+            "$(<"$effect_log")" >&2
+        failures=$((failures + 1))
+    fi
+
+    printf '%s\n' "$framework" > "$sequence_dir/0.json"
+    printf '%s\n' '__FAIL__' > "$sequence_dir/1.json"
+    printf '%s\n' '__FAIL__' > "$sequence_dir/final.json"
+    printf '%s\n' 0 > "$sequence_counter"
+    runtime_status=0
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 1 "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once \
+        > "$test_root/query-failure.out" 2>&1 || runtime_status=$?
+    runtime_output=$(<"$test_root/query-failure.out")
+    effects=$(<"$effect_log")
+    query_count=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' "$effect_log" || true)
+    if (( runtime_status != 2 )); then
+        printf 'expected child monitor-query status 2, got %d\n%s\n' \
+            "$runtime_status" "$runtime_output" >&2
+        failures=$((failures + 1))
+    fi
+    if (( query_count != 2 )); then
+        printf 'expected one joint query plus one child query, got %d\n%s\n' \
+            "$query_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$runtime_output" \
+        'event=reconciliation_failed trigger=once state=closed status=2' \
+        '--once should expose the installed lid-switch failure status' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'a failed child query must not mutate monitor state' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'pkill\t' \
+        'a failed child query must not refresh Waybar' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'a failed child query must not request power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'sleep\t1' \
+        'a failed --once attempt must not retry or enter the loop' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_normal_daemon_reconciles_before_first_edge() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture monitor_json installed_daemon runtime_output effects
+    local runtime_status=0 disable_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    monitor_json=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    rm -f "$fake_bin/sleep"
+    ln -s "$REAL_SLEEP_BIN" "$fake_bin/sleep"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 0.4 "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$monitor_json" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" \
+        > "$test_root/runtime.out" 2>&1 || runtime_status=$?
+
+    runtime_output=$(<"$test_root/runtime.out")
+    effects=$(<"$effect_log")
+    disable_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
+    if (( runtime_status != 124 )); then
+        printf 'expected running daemon timeout status 124, got %d\n%s\n' \
+            "$runtime_status" "$runtime_output" >&2
+        failures=$((failures + 1))
+    fi
+    if (( disable_count != 1 )); then
+        printf 'expected one startup disable before any edge, got %d\n%s\n' \
+            "$disable_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$runtime_output" \
+        'event=reconciliation_succeeded trigger=startup state=closed' \
+        'normal daemon startup should report successful immediate reconciliation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$runtime_output" 'event=joint_state_changed' \
+        'startup reconciliation must not require a lid or topology edge' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'normal startup must not request repository-owned power' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installed_daemon_once_is_outcome_idempotent() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework disabled_framework installed_daemon
+    local first_status=0 second_status=0 first_effects second_effects second_output failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(<"$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    disabled_framework=$(jq -c \
+        'map(if .name == "eDP-1" then .disabled = true else . end)' \
+        <<< "$framework")
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 1 "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once \
+        > "$test_root/first.out" 2>&1 || first_status=$?
+    first_effects=$(<"$effect_log")
+
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 1 "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$disabled_framework" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --once \
+        > "$test_root/second.out" 2>&1 || second_status=$?
+    second_effects=$(<"$effect_log")
+    second_output=$(<"$test_root/second.out")
+
+    if (( first_status != 0 || second_status != 0 )); then
+        printf 'expected repeated --once statuses 0/0, got %d/%d\nfirst:\n%s\nsecond:\n%s\n' \
+            "$first_status" "$second_status" \
+            "$(<"$test_root/first.out")" "$second_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$first_effects" $'monitor\toutput=eDP-1\tdisabled=true' \
+        'the first reconciliation should reach clamshell state' \
+        || failures=$((failures + 1))
+    assert_not_contains "$second_effects" $'monitor\t' \
+        'restarting reconciliation in the achieved state should be a safe no-op' \
+        || failures=$((failures + 1))
+    assert_contains "$second_output" \
+        'event=layout_noop action=close reason=internal_already_disabled' \
+        'the repeated reconciliation should report its idempotent outcome' \
+        || failures=$((failures + 1))
+    assert_not_contains "$second_effects" $'systemctl\t' \
+        'repeated reconciliation must not request repository-owned power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$second_effects" $'sleep\t1' \
+        'repeated --once must still exit before the monitor loop' \
+        || failures=$((failures + 1))
 
     (( failures == 0 ))
 )
@@ -2633,6 +3095,31 @@ run_test \
     'BUG-008-daemon-joint-state' \
     'installed daemon reacts to closed topology changes while retaining query failures' \
     installed_daemon_observes_joint_lid_and_topology_changes
+
+run_test \
+    'BUG-009-once-closed-docked' \
+    'installed daemon reconciles an initially closed docked state once and exits' \
+    installed_daemon_once_reconciles_closed_docked_startup
+
+run_test \
+    'BUG-009-once-supported-states' \
+    'installed daemon reconciles every non-mutating supported initial state once' \
+    installed_daemon_once_reconciles_supported_initial_states
+
+run_test \
+    'BUG-009-once-invalid-observation' \
+    'installed daemon refuses invalid joint observations and propagates child status' \
+    installed_daemon_once_refuses_invalid_joint_observations
+
+run_test \
+    'BUG-009-normal-startup' \
+    'normal daemon reconciles its initial closed state before any edge' \
+    installed_normal_daemon_reconciles_before_first_edge
+
+run_test \
+    'BUG-009-idempotent-restart' \
+    'repeated one-shot reconciliation is outcome-idempotent' \
+    installed_daemon_once_is_outcome_idempotent
 
 run_test \
     'BUG-016-jq-dependency' \
