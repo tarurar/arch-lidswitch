@@ -345,6 +345,101 @@ installed_doctor_accepts_chosen_logind_policy() (
     (( failures == 0 ))
 )
 
+doctor_accepts_current_host_capability_profile() (
+    set -euo pipefail
+
+    local test_root fake_bin safe_bin effect_log doctor_output effects
+    local doctor_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_LOGIND_CAN_SUSPEND=yes \
+        TEST_LOGIND_CAN_HIBERNATE=na \
+        /bin/bash "$ROOT_DIR/runtime/lid-switch-doctor.sh" \
+        > "$test_root/doctor.out" 2>&1 || doctor_status=$?
+
+    doctor_output=$(<"$test_root/doctor.out")
+    effects=$(<"$effect_log")
+
+    if (( doctor_status != 0 )); then
+        printf 'expected current host capability profile status 0, got %d\n%s\n' \
+            "$doctor_status" "$doctor_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$doctor_output" 'PASS CanSuspend=yes' \
+        'doctor should verify the delegated suspend action is available' \
+        || failures=$((failures + 1))
+    assert_contains "$doctor_output" 'INFO CanHibernate=na hibernate=unused' \
+        'doctor should report the current unavailable hibernate capability as informational' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'busctl\tcall\torg.freedesktop.login1\t/org/freedesktop/login1\torg.freedesktop.login1.Manager\tCanSuspend' \
+        'doctor should read the effective suspend capability' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'busctl\tcall\torg.freedesktop.login1\t/org/freedesktop/login1\torg.freedesktop.login1.Manager\tCanHibernate' \
+        'doctor should read the informational hibernate capability' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'capability diagnostics must never request a power action' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+doctor_reports_available_hibernate_as_unused() (
+    set -euo pipefail
+
+    local test_root fake_bin safe_bin effect_log doctor_output effects
+    local doctor_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_LOGIND_CAN_SUSPEND=yes \
+        TEST_LOGIND_CAN_HIBERNATE=yes \
+        /bin/bash "$ROOT_DIR/runtime/lid-switch-doctor.sh" \
+        > "$test_root/doctor.out" 2>&1 || doctor_status=$?
+
+    doctor_output=$(<"$test_root/doctor.out")
+    effects=$(<"$effect_log")
+
+    if (( doctor_status != 0 )); then
+        printf 'expected available-but-unused hibernate status 0, got %d\n%s\n' \
+            "$doctor_status" "$doctor_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$doctor_output" 'PASS CanSuspend=yes' \
+        'verified suspend should remain the selected delegated action' \
+        || failures=$((failures + 1))
+    assert_contains "$doctor_output" \
+        'INFO CanHibernate=yes hibernate=available-but-unused' \
+        'an available hibernate capability should not select hibernation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'reporting an available capability must not request hibernation' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 installed_cli_refuses_actions_when_monitor_query_fails() (
     set -euo pipefail
 
@@ -952,6 +1047,103 @@ installer_reports_a_lid_inhibitor_diagnostic_failure() {
         TEST_SYSTEMD_INHIBIT_FAIL=1
 }
 
+installer_rejects_unavailable_suspend_capabilities() (
+    set -euo pipefail
+
+    local capability failures=0
+
+    for capability in na no challenge unexpected; do
+        if ! installer_policy_profile_is_rejected \
+            1 \
+            "FAIL CanSuspend=$capability expected=yes" \
+            "TEST_LOGIND_CAN_SUSPEND=$capability"; then
+            failures=$((failures + 1))
+        fi
+    done
+
+    (( failures == 0 ))
+)
+
+installer_reports_suspend_capability_query_failure() {
+    installer_policy_profile_is_rejected \
+        2 \
+        'ERROR Could not query login1 capability CanSuspend.' \
+        TEST_BUSCTL_FAIL_METHOD=CanSuspend
+}
+
+installer_reports_suspend_capability_parse_failure() {
+    installer_policy_profile_is_rejected \
+        2 \
+        'ERROR Unexpected value for login1 capability CanSuspend: malformed' \
+        TEST_BUSCTL_MALFORMED_METHOD=CanSuspend
+}
+
+installer_warns_when_hibernate_capability_is_unavailable() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local installer_output effects installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    mkdir -p "$home"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_LOGIND_CAN_SUSPEND=yes \
+        TEST_BUSCTL_FAIL_METHOD=CanHibernate \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    installer_output=$(<"$test_root/installer.out")
+    effects=$(<"$effect_log")
+
+    if (( installer_status != 0 )); then
+        printf 'expected optional hibernate diagnostic status 0, got %d\n%s\n' \
+            "$installer_status" "$installer_output" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -x "$home/.config/hypr/scripts/lid-switch-doctor.sh" ]]; then
+        printf 'installer did not complete after the optional diagnostic warning\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$installer_output" \
+        'WARN Could not query login1 capability CanHibernate.' \
+        'a hibernate query failure should be reported as a warning' \
+        || failures=$((failures + 1))
+    assert_contains "$installer_output" \
+        'WARN CanHibernate=<unavailable> hibernate=unused' \
+        'the warning should explain why the missing capability is non-blocking' \
+        || failures=$((failures + 1))
+    assert_not_contains "$installer_output" \
+        'ERROR Could not query login1 capability CanHibernate.' \
+        'an unused hibernate diagnostic must not be reported as a blocking error' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\thibernate' \
+        'the installer must not request hibernation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\tsuspend' \
+        'the installer must not request suspension' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 installed_session_lifecycle_is_bound_to_hyprland() (
     set -euo pipefail
 
@@ -1408,6 +1600,16 @@ run_test \
     installed_doctor_accepts_chosen_logind_policy
 
 run_test \
+    'BUG-006-current-capability-profile' \
+    'doctor accepts the current yes/na login1 capability profile' \
+    doctor_accepts_current_host_capability_profile
+
+run_test \
+    'BUG-006-hibernate-available-unused' \
+    'doctor reports available hibernation without selecting it' \
+    doctor_reports_available_hibernate_as_unused
+
+run_test \
     'BUG-004-close-query-failure' \
     'installed CLI refuses power when the close monitor query fails' \
     installed_cli_refuses_power_when_close_monitor_query_fails
@@ -1506,6 +1708,26 @@ run_test \
     'BUG-005-inhibitor-diagnostic-failure' \
     'installer distinguishes a lid-inhibitor diagnostic failure' \
     installer_reports_a_lid_inhibitor_diagnostic_failure
+
+run_test \
+    'BUG-006-suspend-unavailable' \
+    'installer rejects every unavailable suspend capability before writes' \
+    installer_rejects_unavailable_suspend_capabilities
+
+run_test \
+    'BUG-006-suspend-query-failure' \
+    'installer distinguishes a suspend capability query failure' \
+    installer_reports_suspend_capability_query_failure
+
+run_test \
+    'BUG-006-suspend-parse-failure' \
+    'installer distinguishes a malformed suspend capability result' \
+    installer_reports_suspend_capability_parse_failure
+
+run_test \
+    'BUG-006-hibernate-query-warning' \
+    'installer warns but continues when unused hibernate capability is unavailable' \
+    installer_warns_when_hibernate_capability_is_unavailable
 
 run_test \
     'BUG-003-session-lifecycle' \

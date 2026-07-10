@@ -54,28 +54,57 @@ emit_monitor_effect() {
 case "$command_name" in
     busctl)
         log_command "$@"
-        if [[ "${1:-}" != "get-property" ]]; then
-            printf 'Unsupported fake busctl operation: %s\n' "${1:-}" >&2
-            exit 98
-        fi
-        property=${5:-}
-        if [[ -n "${TEST_BUSCTL_FAIL_PROPERTY:-}" && \
-            "$property" == "$TEST_BUSCTL_FAIL_PROPERTY" ]]; then
-            printf 'Configured busctl failure for property: %s\n' "$property" >&2
-            exit 94
-        fi
-        case "$property" in
-            HandleLidSwitch)
-                printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH:-suspend}"
+        case "${1:-}" in
+            get-property)
+                property=${5:-}
+                if [[ -n "${TEST_BUSCTL_FAIL_PROPERTY:-}" && \
+                    "$property" == "$TEST_BUSCTL_FAIL_PROPERTY" ]]; then
+                    printf 'Configured busctl failure for property: %s\n' "$property" >&2
+                    exit 94
+                fi
+                case "$property" in
+                    HandleLidSwitch)
+                        printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH:-suspend}"
+                        ;;
+                    HandleLidSwitchDocked)
+                        printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH_DOCKED:-ignore}"
+                        ;;
+                    HandleLidSwitchExternalPower)
+                        printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH_EXTERNAL_POWER:-}"
+                        ;;
+                    *)
+                        printf 'Unsupported fake logind property: %s\n' "$property" >&2
+                        exit 98
+                        ;;
+                esac
                 ;;
-            HandleLidSwitchDocked)
-                printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH_DOCKED:-ignore}"
-                ;;
-            HandleLidSwitchExternalPower)
-                printf 's "%s"\n' "${TEST_LOGIND_HANDLE_LID_SWITCH_EXTERNAL_POWER:-}"
+            call)
+                method=${5:-}
+                if [[ -n "${TEST_BUSCTL_FAIL_METHOD:-}" && \
+                    "$method" == "$TEST_BUSCTL_FAIL_METHOD" ]]; then
+                    printf 'Configured busctl failure for method: %s\n' "$method" >&2
+                    exit 94
+                fi
+                if [[ -n "${TEST_BUSCTL_MALFORMED_METHOD:-}" && \
+                    "$method" == "$TEST_BUSCTL_MALFORMED_METHOD" ]]; then
+                    printf '%s\n' malformed
+                    exit 0
+                fi
+                case "$method" in
+                    CanSuspend)
+                        printf 's "%s"\n' "${TEST_LOGIND_CAN_SUSPEND:-yes}"
+                        ;;
+                    CanHibernate)
+                        printf 's "%s"\n' "${TEST_LOGIND_CAN_HIBERNATE:-na}"
+                        ;;
+                    *)
+                        printf 'Unsupported fake logind method: %s\n' "$method" >&2
+                        exit 98
+                        ;;
+                esac
                 ;;
             *)
-                printf 'Unsupported fake logind property: %s\n' "$property" >&2
+                printf 'Unsupported fake busctl operation: %s\n' "${1:-}" >&2
                 exit 98
                 ;;
         esac

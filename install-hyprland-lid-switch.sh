@@ -113,7 +113,8 @@ read_manager_string_property() {
         "$LOGIN1_PATH" \
         "$LOGIN1_MANAGER" \
         "$property"); then
-        printf 'ERROR Could not read effective logind property %s.\n' "$property" >&2
+        printf 'ERROR Could not read effective logind property %s.\n' \
+            "$property" >&2
         return 2
     fi
 
@@ -127,9 +128,35 @@ read_manager_string_property() {
     return 2
 }
 
+call_manager_string_method() {
+    local method=$1
+    local diagnostic_level=${2:-ERROR}
+    local raw_value
+
+    if ! raw_value=$(busctl call \
+        "$LOGIN1_SERVICE" \
+        "$LOGIN1_PATH" \
+        "$LOGIN1_MANAGER" \
+        "$method"); then
+        printf '%s Could not query login1 capability %s.\n' \
+            "$diagnostic_level" "$method" >&2
+        return 2
+    fi
+
+    if [[ "$raw_value" =~ ^s[[:space:]]+\"([^\"]*)\"$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    printf '%s Unexpected value for login1 capability %s: %s\n' \
+        "$diagnostic_level" "$method" "$raw_value" >&2
+    return 2
+}
+
 check_lid_power_policy() {
     local handle_lid_switch handle_lid_switch_docked
-    local handle_lid_switch_external_power inhibitor_output
+    local handle_lid_switch_external_power can_suspend can_hibernate
+    local inhibitor_output
     local policy_status=0
 
     if ! handle_lid_switch=$(read_manager_string_property HandleLidSwitch); then
@@ -143,6 +170,28 @@ check_lid_power_policy() {
     if ! handle_lid_switch_external_power=$(read_manager_string_property HandleLidSwitchExternalPower); then
         print_remediation
         return 2
+    fi
+    if ! can_suspend=$(call_manager_string_method CanSuspend); then
+        print_remediation
+        return 2
+    fi
+    if [[ "$can_suspend" == "yes" ]]; then
+        printf 'PASS CanSuspend=yes\n'
+    else
+        printf 'FAIL CanSuspend=%s expected=yes\n' "$can_suspend"
+        policy_status=1
+    fi
+    if can_hibernate=$(call_manager_string_method CanHibernate WARN); then
+        case "$can_hibernate" in
+            yes)
+                printf 'INFO CanHibernate=yes hibernate=available-but-unused\n'
+                ;;
+            *)
+                printf 'INFO CanHibernate=%s hibernate=unused\n' "$can_hibernate"
+                ;;
+        esac
+    else
+        printf 'WARN CanHibernate=<unavailable> hibernate=unused\n'
     fi
     if ! inhibitor_output=$(systemd-inhibit \
         --list \
@@ -737,7 +786,8 @@ read_manager_string_property() {
         "$LOGIN1_PATH" \
         "$LOGIN1_MANAGER" \
         "$property"); then
-        printf 'ERROR Could not read effective logind property %s.\n' "$property" >&2
+        printf 'ERROR Could not read effective logind property %s.\n' \
+            "$property" >&2
         return 2
     fi
 
@@ -751,9 +801,35 @@ read_manager_string_property() {
     return 2
 }
 
+call_manager_string_method() {
+    local method=$1
+    local diagnostic_level=${2:-ERROR}
+    local raw_value
+
+    if ! raw_value=$(busctl call \
+        "$LOGIN1_SERVICE" \
+        "$LOGIN1_PATH" \
+        "$LOGIN1_MANAGER" \
+        "$method"); then
+        printf '%s Could not query login1 capability %s.\n' \
+            "$diagnostic_level" "$method" >&2
+        return 2
+    fi
+
+    if [[ "$raw_value" =~ ^s[[:space:]]+\"([^\"]*)\"$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    printf '%s Unexpected value for login1 capability %s: %s\n' \
+        "$diagnostic_level" "$method" "$raw_value" >&2
+    return 2
+}
+
 check_lid_power_policy() {
     local handle_lid_switch handle_lid_switch_docked
-    local handle_lid_switch_external_power inhibitor_output
+    local handle_lid_switch_external_power can_suspend can_hibernate
+    local inhibitor_output
     local policy_status=0
 
     if ! handle_lid_switch=$(read_manager_string_property HandleLidSwitch); then
@@ -767,6 +843,28 @@ check_lid_power_policy() {
     if ! handle_lid_switch_external_power=$(read_manager_string_property HandleLidSwitchExternalPower); then
         print_remediation
         return 2
+    fi
+    if ! can_suspend=$(call_manager_string_method CanSuspend); then
+        print_remediation
+        return 2
+    fi
+    if [[ "$can_suspend" == "yes" ]]; then
+        printf 'PASS CanSuspend=yes\n'
+    else
+        printf 'FAIL CanSuspend=%s expected=yes\n' "$can_suspend"
+        policy_status=1
+    fi
+    if can_hibernate=$(call_manager_string_method CanHibernate WARN); then
+        case "$can_hibernate" in
+            yes)
+                printf 'INFO CanHibernate=yes hibernate=available-but-unused\n'
+                ;;
+            *)
+                printf 'INFO CanHibernate=%s hibernate=unused\n' "$can_hibernate"
+                ;;
+        esac
+    else
+        printf 'WARN CanHibernate=<unavailable> hibernate=unused\n'
     fi
     if ! inhibitor_output=$(systemd-inhibit \
         --list \

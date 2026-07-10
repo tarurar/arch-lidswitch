@@ -41,6 +41,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - **Hardware**: Laptop with ACPI lid switch support
 - **Session**: Wayland session
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
+- **Power capability**: login1 must report `CanSuspend=yes`; hibernation and swap/resume configuration are not required because this project never requests hibernation
 
 ## Installation
 
@@ -139,17 +140,27 @@ HYPR_LID_STATE_ROOT=/path/to/button/lid \
 ~/.config/hypr/scripts/lid-switch-doctor.sh
 ```
 
-The doctor reads effective systemd-logind properties and active low-level lid
-inhibitors. It succeeds only when logind is the sole lid-power owner:
+The doctor reads effective systemd-logind properties, power capabilities, and
+active low-level lid inhibitors. It succeeds only when logind is the sole
+lid-power owner and its selected suspend action is available:
 
 - `HandleLidSwitch=suspend`
 - `HandleLidSwitchDocked=ignore`
 - `HandleLidSwitchExternalPower` is unset or `suspend`
+- `CanSuspend=yes`
 - no process holds a `handle-lid-switch` inhibitor
 
+`CanHibernate` is reported for context only. The reviewed host profile
+`CanSuspend=yes` / `CanHibernate=na` is supported: logind suspends on the
+undocked lid action, while this project neither requests hibernation nor
+requires disk swap or a configured resume target. Even `CanHibernate=yes`
+remains unused.
+
 Exit status `1` means the effective policy conflicts with this supported
-contract. Exit status `2` means the doctor could not collect reliable
-diagnostics. The doctor and installer are read-only with respect to system
+contract or `CanSuspend` is anything other than exactly `yes`. Exit status `2`
+means the doctor could not collect a required diagnostic reliably. Failure to
+read the unused `CanHibernate` capability produces a warning without blocking
+installation. The doctor and installer are read-only with respect to system
 policy: they never modify `/etc` or systemd-logind configuration.
 
 ### Monitoring Logs
@@ -233,6 +244,11 @@ systemd-inhibit --list --what=handle-lid-switch --no-pager
 Resolve a conflict through the host administrator's normal system policy
 workflow. The installer reports conflicts before writing user files; it does
 not create or edit logind configuration under `/etc`.
+
+If the doctor reports `CanSuspend=na`, `no`, `challenge`, or another value,
+login1 cannot provide the noninteractive suspend action this configuration
+delegates. `CanHibernate` does not provide a fallback; its value is
+informational because arch-lidswitch never requests hibernation.
 
 ### Wrong Monitor Detection
 
