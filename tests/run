@@ -2953,8 +2953,9 @@ installer_migrates_only_the_legacy_default_target_service() (
         $'systemctl\t--user\tdisable\t--now\tlid-monitor.service' \
         $'systemctl\t--user\tdaemon-reload' \
         'the legacy default-target process should stop before the replacement unit is loaded'
-    assert_not_contains "$effects" $'systemctl\t--user\trestart\tlid-monitor.service' \
-        'BUG-003 should not absorb the general reinstall restart behavior from BUG-013'
+    assert_contains "$effects" \
+        $'systemctl\t--user\trestart\tlid-monitor.service\tlid-resume-monitor.service' \
+        'the migrated installation should activate both units through a fresh restart'
     assert_not_contains "$(<"$service")" 'WantedBy=default.target' \
         'the migrated unit should no longer retain the early-login enablement target'
 )
@@ -4326,6 +4327,7 @@ installer_packages_resume_monitor_and_requires_systemd_257() (
 
     local test_root home fake_bin safe_bin effect_log monitor_fixture
     local main_unit resume_unit main_contents resume_contents effects
+    local resume_show_count sleep_count
     local old_home old_fake old_safe old_log installer_status=0 failures=0
     local missing_home missing_fake missing_safe missing_log dependency
     local dependency_status dependency_output
@@ -4389,13 +4391,18 @@ installer_packages_resume_monitor_and_requires_systemd_257() (
         'installer should not independently enable the main-owned resume listener' \
         || failures=$((failures + 1))
     assert_contains "$effects" \
-        $'systemctl\t--user\tstart\tlid-resume-monitor.service' \
-        'installer should explicitly start the resume listener' \
+        $'systemctl\t--user\trestart\tlid-monitor.service\tlid-resume-monitor.service' \
+        'installer should explicitly restart the main daemon and resume listener' \
         || failures=$((failures + 1))
-    assert_contains "$effects" \
-        $'systemctl\t--user\tis-active\t--quiet\tlid-resume-monitor.service' \
-        'installer should explicitly verify the resume listener is active' \
-        || failures=$((failures + 1))
+    resume_show_count=$(grep -Fxc \
+        $'systemctl\t--user\tshow\t--no-pager\t--property=LoadState\t--property=ActiveState\t--property=SubState\t--property=MainPID\t--property=InvocationID\tlid-resume-monitor.service' \
+        "$effect_log" || true)
+    sleep_count=$(grep -Fxc $'sleep\t1.1' "$effect_log" || true)
+    if (( resume_show_count != 4 || sleep_count != 2 )); then
+        printf 'installer did not stably verify the restarted resume generation; shows=%d sleeps=%d\n' \
+            "$resume_show_count" "$sleep_count" >&2
+        failures=$((failures + 1))
+    fi
 
     for dependency in stdbuf timeout; do
         missing_home="$test_root/missing-$dependency-home"
@@ -5814,7 +5821,7 @@ installer_rejects_relative_xdg_state_home() (
 installer_rolls_back_systemctl_operation_failures() {
     local scenario failures=0
 
-    for scenario in stop daemon-reload start health stop-mutating start-mutating; do
+    for scenario in stop daemon-reload restart health stop-mutating restart-mutating; do
         (
             set -euo pipefail
 
@@ -6588,6 +6595,499 @@ installer_rejects_corrupted_promoted_backup_children() {
     (( failures == 0 ))
 }
 
+installer_reinstall_activates_fresh_generations() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture state_dir
+    local main_id_before resume_id_before main_id_after resume_id_after
+    local main_pid resume_pid manifest manifest_hash output effects
+    local main_loaded_hash resume_loaded_hash failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    state_dir="$effect_log.systemctl-state"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/initial.out" 2>&1
+
+    main_id_before=$(<"$state_dir/lid-monitor.service.invocation-id")
+    resume_id_before=$(<"$state_dir/lid-resume-monitor.service.invocation-id")
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+    : > "$effect_log"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_MV_ACTIVATE_UNITS_AFTER_CONTEXT=install-lid-state \
+        TEST_REAL_MV_BIN="$(command -v mv)" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/reinstall.out" 2>&1
+
+    main_id_after=$(<"$state_dir/lid-monitor.service.invocation-id")
+    resume_id_after=$(<"$state_dir/lid-resume-monitor.service.invocation-id")
+    main_pid=$(<"$state_dir/lid-monitor.service.main-pid")
+    resume_pid=$(<"$state_dir/lid-resume-monitor.service.main-pid")
+    main_loaded_hash=$(<"$state_dir/lid-monitor.service.loaded-sha256")
+    resume_loaded_hash=$(<"$state_dir/lid-resume-monitor.service.loaded-sha256")
+    manifest="$home/.local/state/arch-lidswitch/current.manifest"
+    manifest_hash=$(sha256sum "$manifest")
+    manifest_hash=${manifest_hash%% *}
+    output=$(<"$test_root/reinstall.out")
+    effects=$(<"$effect_log")
+
+    if [[ "$main_id_after" == "$main_id_before" || \
+        "$resume_id_after" == "$resume_id_before" ]]; then
+        printf 'reinstall did not replace both service generations\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! "$main_id_after" =~ ^[0-9a-f]{32}$ || \
+        "$main_id_after" == 00000000000000000000000000000000 || \
+        ! "$resume_id_after" =~ ^[0-9a-f]{32}$ || \
+        "$resume_id_after" == 00000000000000000000000000000000 || \
+        ! "$main_pid" =~ ^[1-9][0-9]*$ || \
+        ! "$resume_pid" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'reinstall exposed invalid service generation metadata\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$main_loaded_hash" != \
+        "$(sha256sum "$home/.config/hypr/scripts/lid-monitor.sh" | cut -d ' ' -f 1)" || \
+        "$resume_loaded_hash" != \
+        "$(sha256sum "$home/.config/hypr/scripts/lid-resume-monitor.sh" | cut -d ' ' -f 1)" ]]; then
+        printf 'active generations did not load the committed script bytes\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" \
+        $'systemctl\t--user\trestart\tlid-monitor.service\tlid-resume-monitor.service' \
+        'reinstall should explicitly activate fresh main and resume generations' \
+        || failures=$((failures + 1))
+    assert_before "$effects" $'external-activation\tinstall-lid-state' \
+        $'systemctl\t--user\trestart\tlid-monitor.service\tlid-resume-monitor.service' \
+        'explicit restart must replace a daemon reactivated during publication' \
+        || failures=$((failures + 1))
+    assert_contains "$output" "Active installation manifest_sha256=$manifest_hash" \
+        'installer should report the exact committed manifest checksum' \
+        || failures=$((failures + 1))
+    assert_contains "$output" \
+        "Active service unit=lid-monitor.service main_pid=$main_pid invocation_id=$main_id_after" \
+        'installer should report the verified main generation' \
+        || failures=$((failures + 1))
+    assert_contains "$output" \
+        "Active service unit=lid-resume-monitor.service main_pid=$resume_pid invocation_id=$resume_id_after" \
+        'installer should report the verified resume generation' \
+        || failures=$((failures + 1))
+    assert_before "$output" 'Committed artifact transaction' \
+        'Active installation manifest_sha256=' \
+        'runtime identity must be reported only after transaction commit' \
+        || failures=$((failures + 1))
+    if (( $(grep -Fxc $'systemctl\t--user\tshow\t--no-pager\t--property=LoadState\t--property=ActiveState\t--property=SubState\t--property=MainPID\t--property=InvocationID\tlid-monitor.service' "$effect_log" || true) < 3 )) || \
+        (( $(grep -Fxc $'sleep\t1.1' "$effect_log" || true) < 2 )); then
+        printf 'candidate health was not stable across the bounded restart window\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installer_unhealthy_candidate_restores_old_code_generation() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture state_dir
+    local main_script resume_script manifest main_hash resume_hash
+    local old_main old_resume old_manifest old_main_id old_resume_id
+    local restored_main_id restored_resume_id installer_status=0
+    local transaction_entry output failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    state_dir="$effect_log.systemctl-state"
+    main_script="$home/.config/hypr/scripts/lid-monitor.sh"
+    resume_script="$home/.config/hypr/scripts/lid-resume-monitor.sh"
+    manifest="$home/.local/state/arch-lidswitch/current.manifest"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/initial.out" 2>&1
+
+    printf '%s\n' '# simulated prior main generation' >> "$main_script"
+    printf '%s\n' '# simulated prior resume generation' >> "$resume_script"
+    main_hash=$(sha256sum "$main_script")
+    main_hash=${main_hash%% *}
+    resume_hash=$(sha256sum "$resume_script")
+    resume_hash=${resume_hash%% *}
+    awk -F '\t' -v OFS='\t' -v main_hash="$main_hash" \
+        -v resume_hash="$resume_hash" \
+        '$3 == "scripts/lid-monitor.sh" {$1 = main_hash} \
+         $3 == "scripts/lid-resume-monitor.sh" {$1 = resume_hash} \
+         {print}' "$manifest" > "$manifest.updated"
+    chmod 0600 "$manifest.updated"
+    mv -f "$manifest.updated" "$manifest"
+
+    "$ENV_BIN" -i HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        "$fake_bin/systemctl" --user restart \
+        lid-monitor.service lid-resume-monitor.service
+    old_main=$(<"$main_script")
+    old_resume=$(<"$resume_script")
+    old_manifest=$(<"$manifest")
+    old_main_id=$(<"$state_dir/lid-monitor.service.invocation-id")
+    old_resume_id=$(<"$state_dir/lid-resume-monitor.service.invocation-id")
+    : > "$effect_log"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_SYSTEMCTL_UNHEALTHY_RESTART_NUMBER=3 \
+        TEST_SYSTEMCTL_UNHEALTHY_MODE=pid-zero \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/reinstall.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'unhealthy candidate generation unexpectedly committed\n' >&2
+        failures=$((failures + 1))
+    fi
+    restored_main_id=$(<"$state_dir/lid-monitor.service.invocation-id")
+    restored_resume_id=$(<"$state_dir/lid-resume-monitor.service.invocation-id")
+    if [[ "$(<"$main_script")" != "$old_main" || \
+        "$(<"$resume_script")" != "$old_resume" || \
+        "$(<"$manifest")" != "$old_manifest" ]]; then
+        printf 'unhealthy candidate rollback did not restore old files/manifest\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$restored_main_id" == "$old_main_id" || \
+        "$restored_resume_id" == "$old_resume_id" || \
+        "$(<"$state_dir/lid-monitor.service.loaded-sha256")" != "$main_hash" || \
+        "$(<"$state_dir/lid-resume-monitor.service.loaded-sha256")" != "$resume_hash" || \
+        ! -e "$state_dir/lid-monitor.service.active" || \
+        ! -e "$state_dir/lid-resume-monitor.service.active" ]]; then
+        printf 'rollback did not activate healthy fresh old-code generations\n' >&2
+        failures=$((failures + 1))
+    fi
+    transaction_entry=$(find "$home/.local/state/arch-lidswitch/transactions" \
+        -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+    if [[ -n "$transaction_entry" ]]; then
+        printf 'healthy restored generation retained completed recovery state\n' >&2
+        failures=$((failures + 1))
+    fi
+    output=$(<"$test_root/reinstall.out")
+    assert_contains "$output" 'Failed to verify fresh lid service generations' \
+        'candidate health failure should be explicit' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'Previous installation state restored' \
+        'candidate health failure should report successful rollback' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'Active installation manifest_sha256=' \
+        'failed candidate must never report a committed active generation' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
+installer_bounds_candidate_generation_churn() {
+    local scenario failures=0
+
+    for scenario in converges bounded-failure; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture
+            local installer_status=0 show_count output transaction_entry
+            local churn_shows
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            churn_shows=$([[ "$scenario" == converges ]] && printf 2 || printf 99)
+            prepare_hyprland_config "$home"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_SYSTEMCTL_CHURN_RESTART_NUMBER=1 \
+                TEST_SYSTEMCTL_CHURN_UNIT=lid-monitor.service \
+                TEST_SYSTEMCTL_CHURN_SHOWS="$churn_shows" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+            show_count=$(grep -Fxc \
+                $'systemctl\t--user\tshow\t--no-pager\t--property=LoadState\t--property=ActiveState\t--property=SubState\t--property=MainPID\t--property=InvocationID\tlid-monitor.service' \
+                "$effect_log" || true)
+            output=$(<"$test_root/installer.out")
+            if [[ "$scenario" == converges ]]; then
+                if (( installer_status != 0 || show_count != 5 )); then
+                    printf 'bounded generation churn did not converge; status=%d shows=%d\n%s\n' \
+                        "$installer_status" "$show_count" "$output" >&2
+                    exit 1
+                fi
+                assert_contains "$output" 'Active installation manifest_sha256=' \
+                    'converged generation should commit and report identity'
+            else
+                if (( installer_status == 0 || show_count != 8 )); then
+                    printf 'persistent generation churn was not bounded; status=%d shows=%d\n%s\n' \
+                        "$installer_status" "$show_count" "$output" >&2
+                    exit 1
+                fi
+                assert_contains "$output" \
+                    'Service runtime did not stabilize during candidate verification' \
+                    'persistent generation churn should receive a bounded diagnostic'
+                assert_not_contains "$output" 'Active installation manifest_sha256=' \
+                    'unstable candidate must not report a committed identity'
+                transaction_entry=$(find \
+                    "$home/.local/state/arch-lidswitch/transactions" \
+                    -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+                if [[ -n "$transaction_entry" || \
+                    -e "$home/.config/hypr/scripts/lid-monitor.sh" ]]; then
+                    printf 'bounded churn rollback left a partial fresh installation\n' >&2
+                    exit 1
+                fi
+            fi
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_service_failures_restore_old_generation() {
+    local scenario failures=0
+
+    for scenario in restart restart-mutating show signal-restart signal-health; do
+        (
+            set -euo pipefail
+
+            local test_root home fake_bin safe_bin effect_log monitor_fixture state_dir
+            local main_script resume_script manifest main_hash resume_hash
+            local old_main old_resume old_manifest old_main_id old_resume_id
+            local installer_status=0 expected_status=0 failure_operation=""
+            local mutate_operation="" signal_event="" show_restart=""
+            local counter show_counter output transaction_entry
+
+            test_root=$(mktemp -d)
+            trap 'rm -rf "$test_root"' EXIT
+            home="$test_root/home"
+            fake_bin="$test_root/fake-bin"
+            safe_bin="$test_root/safe-bin"
+            effect_log="$test_root/effects.log"
+            monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+            state_dir="$effect_log.systemctl-state"
+            main_script="$home/.config/hypr/scripts/lid-monitor.sh"
+            resume_script="$home/.config/hypr/scripts/lid-resume-monitor.sh"
+            manifest="$home/.local/state/arch-lidswitch/current.manifest"
+            counter="$test_root/systemctl-failure-count"
+            show_counter="$test_root/show-failure-count"
+            prepare_hyprland_config "$home"
+            : > "$effect_log"
+            install_safe_path "$fake_bin" "$safe_bin"
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/initial.out" 2>&1
+
+            printf '%s\n' '# prior main bytes for failure rollback' >> "$main_script"
+            printf '%s\n' '# prior resume bytes for failure rollback' >> "$resume_script"
+            main_hash=$(sha256sum "$main_script")
+            main_hash=${main_hash%% *}
+            resume_hash=$(sha256sum "$resume_script")
+            resume_hash=${resume_hash%% *}
+            awk -F '\t' -v OFS='\t' -v main_hash="$main_hash" \
+                -v resume_hash="$resume_hash" \
+                '$3 == "scripts/lid-monitor.sh" {$1 = main_hash} \
+                 $3 == "scripts/lid-resume-monitor.sh" {$1 = resume_hash} \
+                 {print}' "$manifest" > "$manifest.updated"
+            chmod 0600 "$manifest.updated"
+            mv -f "$manifest.updated" "$manifest"
+            "$ENV_BIN" -i HOME="$home" PATH="$fake_bin:$safe_bin" \
+                TEST_EFFECT_LOG="$effect_log" \
+                "$fake_bin/systemctl" --user restart \
+                lid-monitor.service lid-resume-monitor.service
+            old_main=$(<"$main_script")
+            old_resume=$(<"$resume_script")
+            old_manifest=$(<"$manifest")
+            old_main_id=$(<"$state_dir/lid-monitor.service.invocation-id")
+            old_resume_id=$(<"$state_dir/lid-resume-monitor.service.invocation-id")
+            : > "$effect_log"
+
+            case "$scenario" in
+                restart)
+                    failure_operation=restart
+                    ;;
+                restart-mutating)
+                    failure_operation=restart
+                    mutate_operation=restart
+                    ;;
+                show)
+                    show_restart=3
+                    ;;
+                signal-restart)
+                    signal_event=restart
+                    expected_status=143
+                    ;;
+                signal-health)
+                    signal_event=health-sample
+                    expected_status=143
+                    ;;
+            esac
+
+            "$ENV_BIN" -i \
+                HOME="$home" PATH="$fake_bin:$safe_bin" \
+                WAYLAND_DISPLAY=wayland-test \
+                HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+                XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+                TEST_MONITORS_FIXTURE="$monitor_fixture" \
+                TEST_SYSTEMCTL_FAIL_OPERATION="$failure_operation" \
+                TEST_SYSTEMCTL_FAILURES=1 \
+                TEST_SYSTEMCTL_FAILURE_COUNTER="$counter" \
+                TEST_SYSTEMCTL_MUTATE_THEN_FAIL_OPERATION="$mutate_operation" \
+                TEST_SYSTEMCTL_FAIL_SHOW_RESTART_NUMBER="$show_restart" \
+                TEST_SYSTEMCTL_SHOW_FAILURES=1 \
+                TEST_SYSTEMCTL_SHOW_FAILURE_COUNTER="$show_counter" \
+                ARCH_LIDSWITCH_TEST_SIGNAL_AFTER_SERVICE_EVENT="$signal_event" \
+                "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+                > "$test_root/reinstall.out" 2>&1 || installer_status=$?
+
+            if (( installer_status == 0 )) || \
+                (( expected_status != 0 && installer_status != expected_status )); then
+                printf '%s failure returned unexpected status=%d\n%s\n' \
+                    "$scenario" "$installer_status" \
+                    "$(<"$test_root/reinstall.out")" >&2
+                exit 1
+            fi
+            if [[ "$(<"$main_script")" != "$old_main" || \
+                "$(<"$resume_script")" != "$old_resume" || \
+                "$(<"$manifest")" != "$old_manifest" || \
+                "$(<"$state_dir/lid-monitor.service.loaded-sha256")" != \
+                    "$main_hash" || \
+                "$(<"$state_dir/lid-resume-monitor.service.loaded-sha256")" != \
+                    "$resume_hash" || \
+                "$(<"$state_dir/lid-monitor.service.invocation-id")" == \
+                    "$old_main_id" || \
+                "$(<"$state_dir/lid-resume-monitor.service.invocation-id")" == \
+                    "$old_resume_id" ]]; then
+                printf '%s failure did not restore healthy old-code generations\n' \
+                    "$scenario" >&2
+                exit 1
+            fi
+            transaction_entry=$(find \
+                "$home/.local/state/arch-lidswitch/transactions" \
+                -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+            if [[ -n "$transaction_entry" ]]; then
+                printf '%s failure retained completed recovery state\n' \
+                    "$scenario" >&2
+                exit 1
+            fi
+            output=$(<"$test_root/reinstall.out")
+            assert_contains "$output" 'Previous installation state restored' \
+                "$scenario should report successful old-generation rollback" \
+                || exit 1
+            assert_not_contains "$output" 'Active installation manifest_sha256=' \
+                "$scenario must not report a failed candidate as committed" \
+                || exit 1
+        ) || failures=$((failures + 1))
+    done
+
+    (( failures == 0 ))
+}
+
+installer_rejects_generation_change_after_backup_promotion() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local installer_status=0 output transaction_entry backup_entry show_count
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_SYSTEMCTL_REPLACE_ON_SHOW_CALL=4 \
+        TEST_SYSTEMCTL_REPLACE_ON_SHOW_UNIT=lid-monitor.service \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    if (( installer_status == 0 )); then
+        printf 'post-promotion generation replacement unexpectedly committed\n' >&2
+        exit 1
+    fi
+    show_count=$(grep -Fxc \
+        $'systemctl\t--user\tshow\t--no-pager\t--property=LoadState\t--property=ActiveState\t--property=SubState\t--property=MainPID\t--property=InvocationID\tlid-monitor.service' \
+        "$effect_log" || true)
+    if (( show_count != 4 )); then
+        printf 'post-promotion identity seam fired at wrong sample: %d\n' \
+            "$show_count" >&2
+        exit 1
+    fi
+    output=$(<"$test_root/installer.out")
+    assert_contains "$output" \
+        'Candidate service generation changed before transaction commit' \
+        'commit must revalidate the exact stable generation identity'
+    assert_not_contains "$output" 'Committed artifact transaction' \
+        'changed post-promotion generation must not be marked committed'
+    assert_not_contains "$output" 'Active installation manifest_sha256=' \
+        'changed post-promotion generation must not be reported active'
+    transaction_entry=$(find "$home/.local/state/arch-lidswitch/transactions" \
+        -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+    backup_entry=$(find "$home/.local/state/arch-lidswitch/backups" \
+        -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+    if [[ -n "$transaction_entry" || -n "$backup_entry" || \
+        -e "$home/.config/hypr/scripts/lid-monitor.sh" || \
+        -e "$effect_log.systemctl-state/lid-monitor.service.active" ]]; then
+        printf 'post-promotion identity rollback left fresh candidate state\n' >&2
+        exit 1
+    fi
+)
+
 installer_requires_systemd_analyze_before_transaction_writes() (
     set -euo pipefail
 
@@ -6915,6 +7415,31 @@ run_test \
     installer_packages_resume_monitor_and_requires_systemd_257
 
 run_test \
+    'BUG-013-upgrade-generation' \
+    'reinstall activates and reports fresh main and resume generations' \
+    installer_reinstall_activates_fresh_generations
+
+run_test \
+    'BUG-013-unhealthy-rollback' \
+    'unhealthy candidate restores old files and healthy old-code generations' \
+    installer_unhealthy_candidate_restores_old_code_generation
+
+run_test \
+    'BUG-013-generation-stability' \
+    'candidate generation churn converges or fails within a fixed bound' \
+    installer_bounds_candidate_generation_churn
+
+run_test \
+    'BUG-013-service-failure-boundaries' \
+    'restart show mutating failures and signals restore old generations' \
+    installer_service_failures_restore_old_generation
+
+run_test \
+    'BUG-013-precommit-revalidation' \
+    'post-promotion generation change rolls back before commit' \
+    installer_rejects_generation_change_after_backup_promotion
+
+run_test \
     'BUG-018-transaction-commit' \
     'installer commits one complete private artifact transaction' \
     installer_commits_a_complete_private_transaction
@@ -6976,7 +7501,7 @@ run_test \
 
 run_test \
     'BUG-018-transaction-systemctl-failures' \
-    'stop reload start and health failures restore prior service state' \
+    'stop reload restart and health failures restore prior service state' \
     installer_rolls_back_systemctl_operation_failures
 
 run_test \

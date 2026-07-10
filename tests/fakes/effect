@@ -95,6 +95,75 @@ systemctl_state_file() {
     printf '%s/%s.%s\n' "$state_dir" "$safe_unit" "$state_kind"
 }
 
+systemctl_unit_script_path() {
+    local unit=$1
+
+    case "$unit" in
+        lid-monitor.service)
+            printf '%s\n' "${HOME:?}/.config/hypr/scripts/lid-monitor.sh"
+            ;;
+        lid-resume-monitor.service)
+            printf '%s\n' "${HOME:?}/.config/hypr/scripts/lid-resume-monitor.sh"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+systemctl_activate_unit_raw() {
+    local unit=$1
+    local restart_number=$2
+    local state_dir generation_counter generation pid invocation script hash
+
+    state_dir=$(systemctl_state_directory)
+    generation_counter="$state_dir/.generation-counter"
+    generation=0
+    if [[ -r "$generation_counter" ]]; then
+        read -r generation < "$generation_counter"
+    fi
+    generation=$((generation + 1))
+    printf '%s\n' "$generation" > "$generation_counter"
+    pid=$((20000 + generation))
+    printf -v invocation '%032x' "$generation"
+    : > "$(systemctl_state_file active "$unit")"
+    printf '%s\n' "$pid" > "$(systemctl_state_file main-pid "$unit")"
+    printf '%s\n' "$invocation" \
+        > "$(systemctl_state_file invocation-id "$unit")"
+    printf '%s\n' "$restart_number" \
+        > "$(systemctl_state_file restart-number "$unit")"
+    if script=$(systemctl_unit_script_path "$unit") && [[ -f "$script" ]]; then
+        hash=$(sha256sum "$script") || exit $?
+        hash=${hash%% *}
+    else
+        hash=missing
+    fi
+    printf '%s\n' "$hash" \
+        > "$(systemctl_state_file loaded-sha256 "$unit")"
+}
+
+systemctl_deactivate_unit_raw() {
+    local unit=$1
+    local state_kind
+
+    for state_kind in active main-pid invocation-id restart-number loaded-sha256; do
+        rm -f "$(systemctl_state_file "$state_kind" "$unit")"
+    done
+}
+
+next_systemctl_restart_number() {
+    local state_dir counter_file count=0
+
+    state_dir=$(systemctl_state_directory)
+    counter_file="$state_dir/.restart-command-counter"
+    if [[ -r "$counter_file" ]]; then
+        read -r count < "$counter_file"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$counter_file"
+    printf '%s\n' "$count"
+}
+
 initialize_systemctl_state() {
     local state_dir marker
 
@@ -112,10 +181,10 @@ initialize_systemctl_state() {
         : > "$(systemctl_state_file enabled lid-resume-monitor.service)"
     fi
     if [[ "${TEST_SYSTEMCTL_MAIN_ACTIVE:-0}" == 1 ]]; then
-        : > "$(systemctl_state_file active lid-monitor.service)"
+        systemctl_activate_unit_raw lid-monitor.service 0
     fi
     if [[ "${TEST_SYSTEMCTL_RESUME_ACTIVE:-0}" == 1 ]]; then
-        : > "$(systemctl_state_file active lid-resume-monitor.service)"
+        systemctl_activate_unit_raw lid-resume-monitor.service 0
     fi
 }
 
@@ -140,6 +209,101 @@ systemctl_has_state() {
 
     initialize_systemctl_state
     [[ -e "$(systemctl_state_file "$state_kind" "$unit")" ]]
+}
+
+systemctl_restart_number() {
+    local unit=$1
+    local path
+
+    path=$(systemctl_state_file restart-number "$unit")
+    if [[ -r "$path" ]]; then
+        cat "$path"
+    else
+        printf '0\n'
+    fi
+}
+
+emit_systemctl_show() {
+    local unit=$1
+    local restart_number load_state active_state sub_state main_pid invocation
+    local churn_unit=${TEST_SYSTEMCTL_CHURN_UNIT:-}
+    local churn_count=0 churn_counter churn_limit=${TEST_SYSTEMCTL_CHURN_SHOWS:-0}
+    local show_count=0 show_counter
+    local unhealthy=${TEST_SYSTEMCTL_UNHEALTHY_MODE:-}
+
+    restart_number=$(systemctl_restart_number "$unit")
+    show_counter=$(systemctl_state_file show-count "$unit")
+    if [[ -r "$show_counter" ]]; then
+        read -r show_count < "$show_counter"
+    fi
+    show_count=$((show_count + 1))
+    printf '%s\n' "$show_count" > "$show_counter"
+    if [[ -n "${TEST_SYSTEMCTL_REPLACE_ON_SHOW_CALL:-}" && \
+        "$show_count" == "$TEST_SYSTEMCTL_REPLACE_ON_SHOW_CALL" && \
+        "$unit" == "${TEST_SYSTEMCTL_REPLACE_ON_SHOW_UNIT:-}" ]]; then
+        systemctl_activate_unit_raw "$unit" "$restart_number"
+    fi
+    if [[ -n "${TEST_SYSTEMCTL_CHURN_RESTART_NUMBER:-}" && \
+        "$restart_number" == "$TEST_SYSTEMCTL_CHURN_RESTART_NUMBER" && \
+        "$unit" == "$churn_unit" ]]; then
+        churn_counter=$(systemctl_state_file churn-show-count "$unit")
+        if [[ -r "$churn_counter" ]]; then
+            read -r churn_count < "$churn_counter"
+        fi
+        if (( churn_limit == 0 || churn_count < churn_limit )); then
+            systemctl_activate_unit_raw "$unit" "$restart_number"
+            printf '%s\n' "$((churn_count + 1))" > "$churn_counter"
+        fi
+    fi
+
+    if systemctl_has_state active "$unit"; then
+        load_state=loaded
+        active_state=active
+        sub_state=running
+        main_pid=$(<"$(systemctl_state_file main-pid "$unit")")
+        invocation=$(<"$(systemctl_state_file invocation-id "$unit")")
+    else
+        if [[ -f "${HOME:?}/.config/systemd/user/$unit" ]]; then
+            load_state=loaded
+        else
+            load_state=not-found
+        fi
+        active_state=inactive
+        sub_state=dead
+        main_pid=0
+        invocation=00000000000000000000000000000000
+    fi
+
+    if [[ -n "${TEST_SYSTEMCTL_UNHEALTHY_RESTART_NUMBER:-}" && \
+        "$restart_number" == "$TEST_SYSTEMCTL_UNHEALTHY_RESTART_NUMBER" ]]; then
+        case "$unhealthy" in
+            pid-zero)
+                main_pid=0
+                ;;
+            invocation-zero)
+                invocation=00000000000000000000000000000000
+                ;;
+            substate-failed)
+                sub_state=failed
+                ;;
+            inactive)
+                active_state=inactive
+                sub_state=dead
+                ;;
+            malformed)
+                printf '%s\n' 'MainPID=not-a-pid'
+                return 0
+                ;;
+        esac
+    fi
+
+    # Deliberately emit a non-request order so installer parsing cannot rely on
+    # systemctl's property ordering.
+    printf 'InvocationID=%s\n' "$invocation"
+    printf 'SubState=%s\n' "$sub_state"
+    printf 'LoadState=%s\n' "$load_state"
+    printf 'MainPID=%s\n' "$main_pid"
+    printf 'ActiveState=%s\n' "$active_state"
 }
 
 structured_monitor_state_file() {
@@ -431,7 +595,8 @@ case "$command_name" in
         initialize_systemctl_state
         deferred_systemctl_failure=false
         failure_operation=${2:-}
-        if [[ "$failure_operation" == is-active && \
+        if [[ ( "$failure_operation" == is-active || \
+            "$failure_operation" == show ) && \
             "${TEST_SYSTEMCTL_FAIL_OPERATION:-}" == health && \
             -e "$(systemctl_state_directory)/.candidate-started" ]]; then
             failure_operation=health
@@ -449,6 +614,22 @@ case "$command_name" in
                 printf 'Configured systemctl daemon-reload call %d failure\n' \
                     "$exact_failure_count" >&2
                 exit 94
+            fi
+        fi
+        if [[ "$failure_operation" == show && \
+            -n "${TEST_SYSTEMCTL_FAIL_SHOW_RESTART_NUMBER:-}" && \
+            "$(systemctl_restart_number "${9:-}")" == \
+                "$TEST_SYSTEMCTL_FAIL_SHOW_RESTART_NUMBER" ]]; then
+            if configured_failure_pending \
+                "${TEST_SYSTEMCTL_SHOW_FAILURES:-1}" \
+                "${TEST_SYSTEMCTL_SHOW_FAILURE_COUNTER:?}" systemctl-show; then
+                printf 'Configured candidate systemctl show failure\n' >&2
+                exit 94
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
             fi
         fi
         if [[ -n "${TEST_SYSTEMCTL_FAIL_OPERATION:-}" && \
@@ -532,6 +713,19 @@ case "$command_name" in
                     fi
                     exit 3
                     ;;
+                show)
+                    if [[ "${3:-}" != --no-pager || \
+                        "${4:-}" != --property=LoadState || \
+                        "${5:-}" != --property=ActiveState || \
+                        "${6:-}" != --property=SubState || \
+                        "${7:-}" != --property=MainPID || \
+                        "${8:-}" != --property=InvocationID || \
+                        -z "${9:-}" ]]; then
+                        printf 'Malformed fake systemctl show invocation\n' >&2
+                        exit 98
+                    fi
+                    emit_systemctl_show "${9}"
+                    ;;
                 enable)
                     systemctl_set_state enabled "${3:-}" true
                     ;;
@@ -545,11 +739,33 @@ case "$command_name" in
                     fi
                     ;;
                 start)
-                    systemctl_set_state active "${3:-}" true
+                    unit=${3:-}
+                    if [[ "$unit" == lid-monitor.service || \
+                        "$unit" == lid-resume-monitor.service ]]; then
+                        if ! systemctl_has_state active "$unit"; then
+                            systemctl_activate_unit_raw "$unit" \
+                                "$(systemctl_restart_number "$unit")"
+                        fi
+                    else
+                        systemctl_set_state active "$unit" true
+                    fi
+                    : > "$(systemctl_state_directory)/.candidate-started"
+                    ;;
+                restart)
+                    restart_number=$(next_systemctl_restart_number)
+                    for unit in "${@:3}"; do
+                        systemctl_activate_unit_raw "$unit" "$restart_number"
+                    done
                     : > "$(systemctl_state_directory)/.candidate-started"
                     ;;
                 stop)
-                    systemctl_set_state active "${3:-}" false
+                    unit=${3:-}
+                    if [[ "$unit" == lid-monitor.service || \
+                        "$unit" == lid-resume-monitor.service ]]; then
+                        systemctl_deactivate_unit_raw "$unit"
+                    else
+                        systemctl_set_state active "$unit" false
+                    fi
                     ;;
             esac
         fi
@@ -768,8 +984,10 @@ case "$command_name" in
             fi
             if [[ "${ARCH_LIDSWITCH_ATOMIC_CONTEXT:-}" == \
                 "${TEST_MV_ACTIVATE_UNITS_AFTER_CONTEXT:-__not-configured__}" ]]; then
-                systemctl_set_state active lid-monitor.service true
-                systemctl_set_state active lid-resume-monitor.service true
+                systemctl_activate_unit_raw lid-monitor.service \
+                    "$(systemctl_restart_number lid-monitor.service)"
+                systemctl_activate_unit_raw lid-resume-monitor.service \
+                    "$(systemctl_restart_number lid-resume-monitor.service)"
                 printf 'external-activation\t%s\n' \
                     "$ARCH_LIDSWITCH_ATOMIC_CONTEXT" >> "$TEST_EFFECT_LOG"
             fi
