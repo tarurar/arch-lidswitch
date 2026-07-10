@@ -55,11 +55,12 @@ case "$command_name" in
     hyprctl)
         if [[ "${1:-}" == "monitors" ]]; then
             log_command "$@"
-            printf '%s\n' \
-                'Monitor eDP-1 (ID 0):' \
-                '    2880x1920@120.00000 at 0x0' \
-                'Monitor DP-2 (ID 1):' \
-                '    2560x1440@60.00000 at 2880x0'
+            if [[ -z "${TEST_MONITORS_FIXTURE:-}" || ! -r "$TEST_MONITORS_FIXTURE" ]]; then
+                printf 'Monitor fixture is not readable: %s\n' \
+                    "${TEST_MONITORS_FIXTURE:-<unset>}" >&2
+                exit 99
+            fi
+            cat "$TEST_MONITORS_FIXTURE"
         elif [[ "${1:-}" == "eval" ]]; then
             IFS=';' read -r -a monitor_expressions <<< "${2:-}"
             for expression in "${monitor_expressions[@]}"; do

@@ -70,8 +70,8 @@ detect_monitors() {
     # Get monitor information from hyprctl
     monitor_list=$(hyprctl monitors | awk '/Monitor / {print $2}')
 
-    laptop_monitor=$(grep -m1 "^eDP" <<<"${monitor_list}")
-    external_monitor=$(grep -m1 -E "^(DP|HDMI|USB-C)" <<<"${monitor_list}")
+    laptop_monitor=$(grep -m1 "^eDP" <<<"${monitor_list}" || true)
+    external_monitor=$(grep -m1 -E "^(DP|HDMI|USB-C)" <<<"${monitor_list}" || true)
     
     if [[ -z "$laptop_monitor" ]]; then
         log_error "Could not detect laptop monitor (eDP-*)"

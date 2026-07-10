@@ -1,0 +1,6 @@
+Monitor eDP-1 (ID 0):
+    2880x1920@120.00000 at 0x0
+Monitor DP-2 (ID 1):
+    2560x1440@60.00000 at 2880x0
+Monitor HDMI-A-1 (ID 2):
+    1920x1080@60.00000 at 5440x0

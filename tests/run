@@ -4,6 +4,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_BIN=$(command -v env)
+TEST_FILTER=${1:-}
+
+if [[ $# -gt 1 ]]; then
+    printf 'usage: %s [test-filter]\n' "$0" >&2
+    exit 2
+fi
 
 assert_contains() {
     local actual=$1
@@ -51,7 +57,7 @@ install_safe_path() {
 installed_cli_handles_documented_open_and_close() (
     set -euo pipefail
 
-    local test_root home fake_bin safe_bin effect_log switch_log installed_cli
+    local test_root home fake_bin safe_bin effect_log switch_log installed_cli monitor_fixture
     local close_effects open_effects runtime_log
 
     test_root=$(mktemp -d)
@@ -62,6 +68,7 @@ installed_cli_handles_documented_open_and_close() (
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
     switch_log="$test_root/lid-switch.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     mkdir -p "$home"
     : > "$effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
@@ -71,6 +78,7 @@ installed_cli_handles_documented_open_and_close() (
         PATH="$fake_bin:$safe_bin" \
         XDG_SESSION_TYPE=wayland \
         TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
         HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$ROOT_DIR/install-hyprland-lid-switch.sh" \
         > "$test_root/installer.out" 2>&1
@@ -86,6 +94,7 @@ installed_cli_handles_documented_open_and_close() (
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
         HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$installed_cli" close
     close_effects=$(<"$effect_log")
@@ -106,6 +115,7 @@ installed_cli_handles_documented_open_and_close() (
         HOME="$home" \
         PATH="$fake_bin:$safe_bin" \
         TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
         HYPR_LID_SWITCH_LOG_FILE="$switch_log" \
         "$installed_cli" open
     open_effects=$(<"$effect_log")
@@ -132,14 +142,113 @@ installed_cli_handles_documented_open_and_close() (
         'open transition should report success through the CLI log'
 )
 
+installer_matches_fixture_expectation() (
+    set -euo pipefail
+
+    local fixture_name=$1
+    local expected_outcome=$2
+    local expected_message=$3
+    local assertion_message=$4
+    local test_root home fake_bin safe_bin effect_log fixture installer_output
+    local installer_status=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    fixture="$ROOT_DIR/tests/fixtures/monitors/$fixture_name"
+    mkdir -p "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i \
+        HOME="$home" \
+        PATH="$fake_bin:$safe_bin" \
+        XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$fixture" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    installer_output=$(<"$test_root/installer.out")
+    case "$expected_outcome" in
+        success)
+            if (( installer_status != 0 )); then
+                printf 'installer failed for monitor fixture %s:\n%s\n' \
+                    "$fixture_name" "$installer_output" >&2
+                return 1
+            fi
+            if [[ ! -x "$home/.config/hypr/scripts/lid-switch.sh" ]]; then
+                printf 'installer did not create an executable lid-switch CLI\n' >&2
+                return 1
+            fi
+            ;;
+        failure)
+            if (( installer_status == 0 )); then
+                printf 'installer unexpectedly succeeded for monitor fixture %s\n' \
+                    "$fixture_name" >&2
+                return 1
+            fi
+            ;;
+        *)
+            printf 'unknown installer outcome expectation: %s\n' "$expected_outcome" >&2
+            return 2
+            ;;
+    esac
+
+    assert_contains "$installer_output" "$expected_message" "$assertion_message"
+)
+
+installer_succeeds_without_an_external_monitor() {
+    installer_matches_fixture_expectation \
+        'laptop-only.txt' \
+        success \
+        'No external monitor currently connected' \
+        'an absent external monitor should be reported as an informational state'
+}
+
+installer_succeeds_with_one_external_monitor() {
+    installer_matches_fixture_expectation \
+        'one-external.txt' \
+        success \
+        'Detected external monitor: DP-2' \
+        'the active external monitor should be reported during installation'
+}
+
+installer_succeeds_with_multiple_external_monitors() {
+    installer_matches_fixture_expectation \
+        'multiple-external.txt' \
+        success \
+        'Detected external monitor:' \
+        'multiple external monitors should not abort installation'
+}
+
+installer_rejects_a_missing_laptop_monitor() {
+    installer_matches_fixture_expectation \
+        'no-laptop.txt' \
+        failure \
+        'Could not detect laptop monitor (eDP-*)' \
+        'a missing laptop output should produce the intended explicit error'
+}
+
 tests_run=0
 tests_failed=0
+tests_selected=0
 
 run_test() {
-    local description=$1
-    local test_function=$2
+    local test_id=$1
+    local description=$2
+    local test_function=$3
     local output
 
+    if [[ -n "$TEST_FILTER" && "$test_id" != *"$TEST_FILTER"* ]]; then
+        return 0
+    fi
+
+    tests_selected=$((tests_selected + 1))
     tests_run=$((tests_run + 1))
     if output=$("$test_function" 2>&1); then
         printf 'ok %d - %s\n' "$tests_run" "$description"
@@ -153,8 +262,34 @@ run_test() {
 }
 
 run_test \
+    'installed-cli-transitions' \
     'installed CLI handles documented docked close and open transitions' \
     installed_cli_handles_documented_open_and_close
+
+run_test \
+    'BUG-007-laptop-only' \
+    'installer succeeds with only the laptop output active' \
+    installer_succeeds_without_an_external_monitor
+
+run_test \
+    'BUG-007-one-external' \
+    'installer succeeds with one external output active' \
+    installer_succeeds_with_one_external_monitor
+
+run_test \
+    'BUG-007-multiple-external' \
+    'installer succeeds with multiple external outputs active' \
+    installer_succeeds_with_multiple_external_monitors
+
+run_test \
+    'BUG-007-no-laptop' \
+    'installer explains why installation cannot continue without a laptop output' \
+    installer_rejects_a_missing_laptop_monitor
+
+if (( tests_selected == 0 )); then
+    printf 'No tests matched filter: %s\n' "$TEST_FILTER" >&2
+    exit 2
+fi
 
 printf '1..%d\n' "$tests_run"
 

@@ -1,0 +1,4 @@
+Monitor eDP-1 (ID 0):
+    2880x1920@120.00000 at 0x0
+Monitor DP-2 (ID 1):
+    2560x1440@60.00000 at 2880x0
