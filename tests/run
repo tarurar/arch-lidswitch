@@ -4151,6 +4151,8 @@ installed_daemon_stabilizes_resume_generations() (
     set -euo pipefail
 
     local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local normal_effect_log normal_runtime_dir normal_sequence_dir
+    local normal_sequence_counter
     local monitor_fixture sequence_dir sequence_counter framework disabled
     local laptop_only laptop_disabled laptop_asleep laptop_awake installed_cli installed_daemon
     local expected_laptop_token runtime_status output effects effects_prefix
@@ -4165,10 +4167,14 @@ installed_daemon_stabilizes_resume_generations() (
     safe_bin="$test_root/safe-bin"
     effect_log="$test_root/effects.log"
     runtime_dir="$test_root/runtime"
+    normal_effect_log="$test_root/normal-effects.log"
+    normal_runtime_dir="$test_root/normal-runtime"
     lid_root="$test_root/button/lid"
     monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
     sequence_dir="$test_root/topology-sequence"
     sequence_counter="$test_root/topology-counter"
+    normal_sequence_dir="$test_root/normal-topology-sequence"
+    normal_sequence_counter="$test_root/normal-topology-counter"
     framework=$(jq -c 'map(.dpmsStatus = true)' \
         "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
     disabled=$(jq -c 'map(if .name == "eDP-1" then
@@ -4181,10 +4187,12 @@ installed_daemon_stabilizes_resume_generations() (
     laptop_awake=$(jq -c '[.[] | select(.name == "eDP-1")]' <<< "$framework")
     expected_laptop_token='{"internal":"eDP-1","externals":[]}'
 
-    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir"
+    mkdir -m 0700 -p "$home" "$runtime_dir" "$sequence_dir" \
+        "$normal_runtime_dir" "$normal_sequence_dir"
     create_lid_state_fixture "$lid_root" lid1
     prepare_hyprland_config "$home"
     : > "$effect_log"
+    : > "$normal_effect_log"
     install_safe_path "$fake_bin" "$safe_bin"
     "$ENV_BIN" -i \
         HOME="$home" PATH="$fake_bin:$safe_bin" \
@@ -4329,14 +4337,16 @@ installed_daemon_stabilizes_resume_generations() (
     done
     normal_recovery+=("$framework" "$disabled" "$disabled")
     printf '%s\n' 'state: closed' > "$lid_root/LID1/state"
-    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+    write_monitor_sequence "$normal_sequence_dir" "$normal_sequence_counter" \
         "${normal_recovery[@]}"
-    : > "$effect_log"
+    : > "$normal_effect_log"
     "$ENV_BIN" -i \
-        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
-        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
-        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
-        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$normal_runtime_dir" \
+        TEST_EFFECT_LOG="$normal_effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$normal_sequence_dir" \
+        TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$normal_sequence_counter" \
         HYPR_LID_STATE_ROOT="$lid_root" \
         "$TIMEOUT_BIN" 3 "$installed_daemon" \
         > "$test_root/normal-rearmed.out" 2>&1 || true
