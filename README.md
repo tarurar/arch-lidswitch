@@ -38,6 +38,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 
 - Treats absent and inactive (`disabled=true`) external outputs the same for clamshell policy
 - Restores the internal display first if it was disabled by an earlier docked close
+- On resume, explicitly powers that restored internal display on before success
 - Delegates the lid event to systemd-logind
 - With the supported default policy, logind suspends when undocked and ignores a docked lid close
 
@@ -52,6 +53,17 @@ startup, changed topology, or resume reconciliation can mutate a display, the
 daemon requires three identical full lid/topology samples plus an immediate
 matching precommit sample. A dedicated login1 listener keeps one subscription
 across the sleep cycle and coalesces resume requests into the main daemon.
+
+Hyprland can accept an internal-output restore while applying nothing when no
+output is currently active. After that exact accepted-but-unverified result,
+arch-lidswitch creates one private, named headless recovery output, waits for
+it to become active, retries only the saved internal-panel layout, verifies the
+panel, and removes the temporary output again. A private ownership marker and
+runtime lock make crash cleanup distinguishable from a live recovery. The
+runtime refuses to remove a same-named output without its valid marker and
+never targets a physical external output during recovery. Immediately before
+retrying the saved layout, it also revalidates the expected lid state and the
+complete represented non-recovery topology, including inactive connectors.
 
 ## Requirements
 
@@ -150,7 +162,7 @@ recoverable failure into a permanent blank session.
 
 1. **Confirm the pinned release**:
 
-   The commands below pin `v0.1.1`. Before continuing, confirm that this exact
+   The commands below pin `v0.1.2`. Before continuing, confirm that this exact
    version exists on the GitHub Releases page and is marked **Immutable**. If
    the release does not exist or is not immutable, stop rather than falling
    back to a branch or piping remote content into a shell.
@@ -166,7 +178,7 @@ recoverable failure into a permanent blank session.
    (
      set -euo pipefail
 
-     ARCH_LIDSWITCH_VERSION='v0.1.1'
+     ARCH_LIDSWITCH_VERSION='v0.1.2'
      download_dir=$(mktemp -d)
      trap 'rm -rf -- "$download_dir"' EXIT
      installer="$download_dir/install-hyprland-lid-switch.sh"
@@ -249,7 +261,7 @@ triggering ref and the commit whose installer was tested.
 The release workflow accepts only stable `vMAJOR.MINOR.PATCH` tags, reruns the
 full test suite, packages the exact generated installer with a one-entry
 `SHA256SUMS`, and publishes both assets from the verified remote tag. After all
-changes intended for the release are committed, publish `v0.1.1` by creating
+changes intended for the release are committed, publish `v0.1.2` by creating
 and pushing that tag; branch pushes never publish releases.
 
 ## What Gets Installed
@@ -341,6 +353,12 @@ Dry-run mode queries the real lid/topology inputs and reports its intended
 `enabled_external_count`, desired DPMS state, and topology. It does not create
 or consume a layout snapshot, change display or power state, run the
 post-layout hook, or perform postcondition mutations.
+
+If a prior recovery left a valid ownership marker, dry-run exits with status
+`2` and `reason=recovery_cleanup_pending` instead of calculating policy from
+the temporary output. It leaves that output, marker, and layout snapshot
+unchanged. A same-named output without a valid marker is rejected rather than
+treated as a physical external display.
 
 ```bash
 # Preview explicit close behavior without changing state
@@ -599,12 +617,14 @@ ACTION OUTCOME INTERNAL_OUTPUT
 ```
 
 For example, a docked close supplies `close disabled eDP-1`; reopening supplies
-`open enabled eDP-1`. Invocation occurs exactly once after the layout mutation
-and its monitor postconditions have succeeded. No hook runs for a no-op, a
-failed transition, or a DPMS-only wake. Runtime is limited to two seconds, with
-a one-second forced-termination grace period. Invalid hooks, failures, and
-timeouts are logged but advisory: they do not fail or retry display
-reconciliation.
+`open enabled eDP-1`. Invocation occurs exactly once after the saved layout
+transition and its monitor postconditions have succeeded. If the layout was
+applied but a later recovery postcondition failed, the successful retry that
+verifies and consumes the saved snapshot delivers the deferred hook. No hook
+runs for an ordinary no-op or a DPMS-only wake. Runtime is limited to two
+seconds, with a one-second forced-termination grace period. Invalid hooks,
+failures, and timeouts are logged but advisory: they do not fail or retry
+display reconciliation.
 
 ### Workspace Assignment Scope
 
@@ -654,6 +674,11 @@ stderr. To inspect only transition failures from the current boot:
 ```bash
 journalctl --user -u lid-monitor.service -b -o cat | grep 'level=error'
 ```
+
+The zero-active-output path emits `last_output_recovery_started`, followed by
+either `last_output_recovery_succeeded` or a precise failure reason. An owned
+temporary output left by interruption is removed before the next policy
+observation; an unowned or insecure recovery marker fails closed.
 
 Storage limits, persistence, and rotation are controlled centrally by
 systemd-journald rather than by these scripts.

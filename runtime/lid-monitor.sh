@@ -86,8 +86,9 @@ observe_topology() {
     observed_topology_error=""
 }
 
-observe_joint_state() {
+observe_joint_state_unlocked() {
     local trigger=$1
+    local observation_status
 
     current_state=""
     current_topology=""
@@ -109,11 +110,54 @@ observe_joint_state() {
         current_policy_token=$observed_policy_token
         previous_topology_error=""
     else
+        observation_status=$?
         previous_topology_error=$observed_topology_error
         log_error topology_observation_failed reason="$observed_topology_error" \
             trigger="$trigger"
-        return 2
+        return "$observation_status"
     fi
+}
+
+observe_joint_state() {
+    local trigger=$1
+    local observation_status=0 release_status
+
+    if monitor_state_acquire_reconciliation_lock; then
+        :
+    else
+        observation_status=$?
+        log_error recovery_state_cleanup_failed phase=policy_observation \
+            trigger="$trigger" status="$observation_status" \
+            reason="$MONITOR_STATE_ERROR"
+        return "$observation_status"
+    fi
+    if monitor_state_reconcile_stale_recovery_output; then
+        :
+    else
+        observation_status=$?
+        log_error recovery_state_cleanup_failed phase=policy_observation \
+            trigger="$trigger" status="$observation_status" \
+            reason="$MONITOR_STATE_ERROR"
+    fi
+    if (( observation_status == 0 )); then
+        if observe_joint_state_unlocked "$trigger"; then
+            :
+        else
+            observation_status=$?
+        fi
+    fi
+    if monitor_state_release_reconciliation_lock; then
+        :
+    else
+        release_status=$?
+        if (( observation_status == 0 )); then
+            observation_status=$release_status
+            log_error recovery_state_cleanup_failed \
+                phase=policy_observation trigger="$trigger" \
+                status="$observation_status" reason="$MONITOR_STATE_ERROR"
+        fi
+    fi
+    return "$observation_status"
 }
 
 stabilize_joint_state() {
@@ -122,6 +166,7 @@ stabilize_joint_state() {
     local consecutive=0 samples=0
     local last_valid_state="" last_valid_topology=""
     local last_valid_full_topology="" last_valid_policy_token=""
+    local observation_status
 
     while (( samples < MAX_STABILITY_SAMPLES )); do
         samples=$((samples + 1))
@@ -142,6 +187,14 @@ stabilize_joint_state() {
                 consecutive=1
             fi
         else
+            observation_status=$?
+            if (( observation_status == 3 )) && \
+                [[ "$previous_topology_error" == recovery_output_unowned ]]; then
+                log_error stability_aborted trigger="$trigger" \
+                    samples="$samples" status=3 \
+                    reason=recovery_output_unowned
+                return 3
+            fi
             candidate=""
             consecutive=0
             log_info stability_reset trigger="$trigger" samples="$samples" \
@@ -209,7 +262,7 @@ observed_joint_state_matches_policy() {
     else
         [[ "$internal_enabled" == true ]] || return 1
     fi
-    if [[ "$state" == open && "$require_dpms" == true ]]; then
+    if [[ "$require_dpms" == true ]]; then
         internal_dpms=$(monitor_state_internal_dpms) || return 1
         [[ "$internal_dpms" == true ]] || return 1
     fi
@@ -221,22 +274,34 @@ invoke_lid_switch() {
     local commit_generation=$3
     local expected_lid=$4
     local expected_policy_token=$5
+    local invocation_status
+    local require_dpms=false
+
+    if [[ "$preserve_dpms" != true ]]; then
+        require_dpms=true
+    fi
 
     if [[ "$commit_generation" == true ]]; then
         if [[ "$state" == open && "$preserve_dpms" == true ]]; then
             ARCH_LIDSWITCH_EXPECTED_LID="$expected_lid" \
             ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN="$expected_policy_token" \
+            ARCH_LIDSWITCH_REQUIRE_DPMS="$require_dpms" \
                 "$LID_SWITCH_SCRIPT" --preserve-dpms open
         else
             ARCH_LIDSWITCH_EXPECTED_LID="$expected_lid" \
             ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN="$expected_policy_token" \
+            ARCH_LIDSWITCH_REQUIRE_DPMS="$require_dpms" \
                 "$LID_SWITCH_SCRIPT" "$state"
         fi
     elif [[ "$state" == open && "$preserve_dpms" == true ]]; then
-        "$LID_SWITCH_SCRIPT" --preserve-dpms open
+        ARCH_LIDSWITCH_REQUIRE_DPMS="$require_dpms" \
+            "$LID_SWITCH_SCRIPT" --preserve-dpms open
     else
-        "$LID_SWITCH_SCRIPT" "$state"
+        ARCH_LIDSWITCH_REQUIRE_DPMS="$require_dpms" \
+            "$LID_SWITCH_SCRIPT" "$state"
     fi
+    invocation_status=$?
+    return "$invocation_status"
 }
 
 apply_observed_joint_state() {
@@ -247,7 +312,8 @@ apply_observed_joint_state() {
     local attempted_state=$current_state
     local attempted_topology=$current_topology
     local attempted_policy_token=$current_policy_token
-    local attempted_internal wake_required=false
+    local attempted_internal attempted_enabled_external_count
+    local attempted_desired_internal wake_required=false
     local reconciliation_status
 
     log_info reconciliation_started trigger="$trigger" attempt="$attempt" \
@@ -294,7 +360,16 @@ apply_observed_joint_state() {
 
     attempted_internal=$(jq -er '.internal.enabled | tostring' \
         <<< "$attempted_topology")
-    if [[ "$attempted_state" == open ]] && \
+    attempted_enabled_external_count=$(jq -er \
+        '[.externals[] | select(.enabled)] | length' \
+        <<< "$attempted_topology")
+    if [[ "$attempted_state" == closed && \
+        "$attempted_enabled_external_count" -gt 0 ]]; then
+        attempted_desired_internal=disabled
+    else
+        attempted_desired_internal=enabled
+    fi
+    if [[ "$attempted_desired_internal" == enabled ]] && \
         { [[ "$preserve_dpms" != true ]] || \
             [[ "$attempted_internal" == false ]]; }; then
         wake_required=true
@@ -357,6 +432,37 @@ if ! . "$SCRIPT_DIR/monitor-state.sh"; then
     exit 1
 fi
 
+recovery_cleanup_status=0
+recovery_cleanup_error=""
+recovery_lock_release_status=0
+if monitor_state_acquire_reconciliation_lock; then
+    if monitor_state_reconcile_stale_recovery_output; then
+        :
+    else
+        recovery_cleanup_status=$?
+        recovery_cleanup_error=$MONITOR_STATE_ERROR
+    fi
+    if monitor_state_release_reconciliation_lock; then
+        if (( recovery_cleanup_status != 0 )); then
+            MONITOR_STATE_ERROR=$recovery_cleanup_error
+        fi
+    else
+        recovery_lock_release_status=$?
+        if (( recovery_cleanup_status == 0 )); then
+            recovery_cleanup_status=$recovery_lock_release_status
+        else
+            MONITOR_STATE_ERROR=$recovery_cleanup_error
+        fi
+    fi
+else
+    recovery_cleanup_status=$?
+fi
+if (( recovery_cleanup_status != 0 )); then
+    log_error recovery_state_cleanup_failed phase=startup \
+        status="$recovery_cleanup_status" reason="$MONITOR_STATE_ERROR"
+    exit "$recovery_cleanup_status"
+fi
+
 applied_ready=false
 applied_state=unknown
 applied_topology=""
@@ -398,8 +504,11 @@ if [[ "${1:-}" == --resume-once ]]; then
     requires_stability=true
     for ((attempt = 1; attempt <= MAX_RECONCILIATION_ATTEMPTS; attempt++)); do
         if [[ "$requires_stability" == true ]]; then
-            if ! stabilize_joint_state resume; then
-                exit 2
+            if stabilize_joint_state resume; then
+                :
+            else
+                reconciliation_status=$?
+                exit "$reconciliation_status"
             fi
             requires_stability=false
         fi

@@ -30,11 +30,16 @@ if ! . "$SCRIPT_DIR/monitor-state.sh"; then
     log_error monitor_state_module_load_failed
     exit 1
 fi
+trap monitor_state_cleanup_recovery_output_on_exit EXIT
 
 LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 EXPECTED_LID=${ARCH_LIDSWITCH_EXPECTED_LID:-}
 EXPECTED_POLICY_TOKEN=${ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN:-}
 POST_LAYOUT_HOOK=${ARCH_LIDSWITCH_POST_LAYOUT_HOOK:-}
+REQUIRE_DPMS=${ARCH_LIDSWITCH_REQUIRE_DPMS:-false}
+if [[ "$REQUIRE_DPMS" != true ]]; then
+    REQUIRE_DPMS=false
+fi
 
 run_post_layout_hook() {
     local action=$1
@@ -144,19 +149,50 @@ reconcile_lid_state() {
     local dry_run=$3
     local internal_enabled enabled_external_count desired_internal
     local post_external_count post_desired_internal snapshot_status
+    local recovery_status
     local wake_required=false desired_dpms=preserved
     local mutation_status=0 mutation_reason=none
     local layout_changed=false snapshot_involved=false noop_reason=""
     local verified_internal verified_dpms topology_snapshot decision
+    local stale_recovery_status
 
-    if [[ "$dry_run" != true ]]; then
+    if [[ "$dry_run" == true ]]; then
+        if monitor_state_check_recovery_state_read_only; then
+            :
+        else
+            stale_recovery_status=$?
+            log_error recovery_state_check_failed action="$action" \
+                status="$stale_recovery_status" reason="$MONITOR_STATE_ERROR"
+            return "$stale_recovery_status"
+        fi
+    else
+        if monitor_state_acquire_reconciliation_lock; then
+            :
+        else
+            stale_recovery_status=$?
+            log_error recovery_state_cleanup_failed action="$action" \
+                status="$stale_recovery_status" reason="$MONITOR_STATE_ERROR"
+            return "$stale_recovery_status"
+        fi
         log_info transition_started action="$action"
+        if monitor_state_reconcile_stale_recovery_output; then
+            :
+        else
+            stale_recovery_status=$?
+            log_error recovery_state_cleanup_failed action="$action" \
+                status="$stale_recovery_status" reason="$MONITOR_STATE_ERROR"
+            return "$stale_recovery_status"
+        fi
     fi
-    if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+    if monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+        :
+    else
+        stale_recovery_status=$?
         log_error monitor_query_failed action="$action" reason="$MONITOR_STATE_ERROR"
         log_error reconciliation_failed action="$action" phase=observe \
-            desired_internal=unknown status=2 reason="$MONITOR_STATE_ERROR"
-        return 2
+            desired_internal=unknown status="$stale_recovery_status" \
+            reason="$MONITOR_STATE_ERROR"
+        return "$stale_recovery_status"
     fi
     if verify_expected_generation "$action" pre_apply; then
         :
@@ -173,11 +209,12 @@ reconcile_lid_state() {
         desired_internal=enabled
     fi
 
-    if [[ "$action" == open ]]; then
-        if [[ "$preserve_dpms" != true || "$internal_enabled" == false ]]; then
-            wake_required=true
-            desired_dpms=true
-        fi
+    if [[ "$desired_internal" == enabled ]] && \
+        { [[ "$internal_enabled" == false ]] || \
+            [[ "$action" == open && "$preserve_dpms" != true ]] || \
+            [[ "$REQUIRE_DPMS" == true ]]; }; then
+        wake_required=true
+        desired_dpms=true
     fi
 
     if [[ "$dry_run" == true ]]; then
@@ -230,7 +267,7 @@ reconcile_lid_state() {
                 snapshot_involved=true
                 if monitor_state_internal_layout_matches_snapshot \
                     "$LAPTOP_DISPLAY"; then
-                    noop_reason=internal_already_enabled
+                    layout_changed=true
                 else
                     snapshot_status=$?
                     if (( snapshot_status == 1 )); then
@@ -294,6 +331,69 @@ reconcile_lid_state() {
         post_desired_internal=disabled
     else
         post_desired_internal=enabled
+    fi
+
+    if (( mutation_status == 0 )) && \
+        [[ "$desired_internal" == enabled && "$internal_enabled" == false && \
+            "$enabled_external_count" -eq 0 && "$verified_internal" == false && \
+            "$post_external_count" -eq 0 && \
+            "$post_desired_internal" == enabled && \
+            "$snapshot_involved" == true ]]; then
+        log_info last_output_recovery_started action="$action" \
+            internal_output="$LAPTOP_DISPLAY"
+        recovery_status=0
+        if monitor_state_restore_internal_layout_with_last_output_recovery \
+            "$LAPTOP_DISPLAY" "$EXPECTED_LID" "$wake_required"; then
+            :
+        else
+            recovery_status=$?
+            mutation_status=$recovery_status
+            mutation_reason=$MONITOR_STATE_ERROR
+            if (( recovery_status == 5 )); then
+                if monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+                    topology_snapshot=$MONITOR_STATE_TOPOLOGY
+                    MONITOR_STATE_ERROR=$mutation_reason
+                    verify_expected_generation "$action" \
+                        last_output_recovery_pre_apply || true
+                else
+                    mutation_status=2
+                    mutation_reason=$MONITOR_STATE_ERROR
+                fi
+            fi
+        fi
+        if (( recovery_status == 0 )); then
+            if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
+                log_error monitor_query_failed action="$action" \
+                    phase=last_output_recovery_postcondition \
+                    reason="$MONITOR_STATE_ERROR"
+                return 2
+            fi
+            topology_snapshot=$MONITOR_STATE_TOPOLOGY
+            if verify_expected_generation "$action" \
+                last_output_recovery_post_apply; then
+                :
+            else
+                return $?
+            fi
+            verified_internal=$(monitor_state_internal_enabled)
+            if verified_dpms=$(monitor_state_internal_dpms); then
+                :
+            else
+                verified_dpms=unknown
+            fi
+            post_external_count=$(monitor_state_enabled_external_count)
+            if [[ "$action" == close && "$post_external_count" -gt 0 ]]; then
+                post_desired_internal=disabled
+            else
+                post_desired_internal=enabled
+            fi
+            log_info last_output_recovery_succeeded action="$action" \
+                internal_output="$LAPTOP_DISPLAY"
+        else
+            log_error last_output_recovery_failed action="$action" \
+                internal_output="$LAPTOP_DISPLAY" \
+                status="$mutation_status" reason="$mutation_reason"
+        fi
     fi
 
     if [[ "$post_desired_internal" != "$desired_internal" ]]; then

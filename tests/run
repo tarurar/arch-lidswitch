@@ -385,7 +385,7 @@ readme_documents_pinned_checked_install_and_sleep_warnings() (
     installation=$(sed -n '/^## Installation$/,/^## /p' <<< "$readme")
     manual_testing=$(sed -n '/^### Manual Testing$/,/^### /p' <<< "$readme")
 
-    assert_contains "$installation" "ARCH_LIDSWITCH_VERSION='v0.1.1'" \
+    assert_contains "$installation" "ARCH_LIDSWITCH_VERSION='v0.1.2'" \
         'installation docs should pin a concrete versioned release' \
         || failures=$((failures + 1))
     assert_contains "$installation" \
@@ -4422,6 +4422,2833 @@ installed_daemon_stabilizes_resume_generations() (
     (( failures == 0 ))
 )
 
+installed_daemon_wakes_internal_on_closed_laptop_only_resume() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file final_topology query_status=0
+    local runtime_status=0 output effects failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = false]' <<< "$framework")
+    state_file="$test_root/closed-resume-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/closed-resume.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/closed-resume.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 0 )); then
+        printf 'closed laptop-only resume should converge, got status=%d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" \
+        $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2\ttransform=0\tmirror=' \
+        'closed laptop-only resume should restore the saved internal layout' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" $'dpms\toutput=eDP-1\tstate=on' \
+        'closed laptop-only resume must explicitly wake the restored internal output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'closed laptop-only resume must never mutate an external layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'closed laptop-only resume must never mutate external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'closed laptop-only resume must not request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'closed laptop-only resume must leave exactly one enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" ]]; then
+        printf 'closed laptop-only resume did not consume its restored layout snapshot: %s\n' \
+            "$snapshot_file" >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_retries_closed_resume_when_post_action_dpms_turns_off() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker phase_file final_topology
+    local runtime_status=0 query_status=0 output effects
+    local wake_count restore_count race_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = false]' <<< "$framework")
+    state_file="$test_root/closed-post-action-dpms-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    phase_file="$test_root/post-child-dpms-off.phase"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid1
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 3 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_POST_CHILD_DPMS_OFF_STATE_FILE="$phase_file" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/closed-post-action-dpms.out" 2>&1 \
+        || runtime_status=$?
+    output=$(<"$test_root/closed-post-action-dpms.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+    wake_count=$(grep -Fxc $'dpms\toutput=eDP-1\tstate=on' \
+        "$effect_log" || true)
+    restore_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2\ttransform=0\tmirror=' \
+        "$effect_log" || true)
+    race_count=$(grep -Fxc \
+        $'monitor-observation-race\toutput=eDP-1\tdpms=false' \
+        "$effect_log" || true)
+
+    if (( runtime_status != 0 )); then
+        printf 'closed resume DPMS race should converge in-process; status=%d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_before "$output" \
+        'event=reconciliation_failed trigger=resume attempt=1 state=closed status=4' \
+        'event=reconciliation_succeeded trigger=resume attempt=2 state=closed' \
+        'the off post-action observation must fail before a verified retry succeeds' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'reason=post_action_policy_mismatch' \
+        'the daemon must classify the off internal output as a post-action mismatch' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" \
+        'event=reconciliation_succeeded trigger=resume attempt=1 state=closed' \
+        'the daemon must not report success for an off post-action observation' \
+        || failures=$((failures + 1))
+    if (( wake_count != 2 || restore_count != 1 || race_count != 1 )); then
+        printf 'expected one restore, one injected race, and two explicit wakes; restores=%d races=%d wakes=%d\n%s\n' \
+            "$restore_count" "$race_count" "$wake_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -r "$phase_file" || "$(<"$phase_file")" != injected ]]; then
+        printf 'fake did not inject exactly the daemon post-action DPMS-off observation\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'closed resume retry must never mutate an external layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'closed resume retry must never mutate external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'closed resume retry must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" >/dev/null; then
+        printf 'closed resume retry must leave only enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" || \
+        -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'closed resume DPMS retry retained a snapshot or recovery marker\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake final_topology query_status=0
+    local runtime_status=0 output effects effects_after_create recovery_window
+    local hook_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/last-output-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/accepted-noop.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/accepted-noop.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 0 )); then
+        printf 'open resume must recover when the last-output enable returns ok without applying; status=%d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" \
+        $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2\ttransform=0\tmirror=' \
+        'resume should attempt the saved internal layout before recovery' \
+        || failures=$((failures + 1))
+    assert_before "$effects" \
+        $'monitor\toutput=ARCH-LIDSWITCH-RECOVERY\tdisabled=false' \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'the bounded recovery rule must be installed before headless creation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'last-output recovery must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'last-output recovery must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'last-output recovery must never request a power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'last-output recovery must leave exactly one enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" ]]; then
+        printf 'successful last-output recovery did not consume its layout snapshot: %s\n' \
+            "$snapshot_file" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'successful last-output recovery retained its ownership marker\n' >&2
+        failures=$((failures + 1))
+    fi
+    hook_count=$(grep -Fxc $'post-layout-hook\topen\tenabled\teDP-1' \
+        "$effect_log" || true)
+    if (( hook_count != 1 )); then
+        printf 'successful last-output recovery must run one verified hook; got %d\n' \
+            "$hook_count" >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_keeps_recovery_output_until_last_output_dpms_is_verified() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_dark installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake final_topology query_status=0
+    local runtime_status=0 output effects hook_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_dark=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = false]' <<< "$framework")
+    state_file="$test_root/last-awake-output-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 4 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_dark" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_NO_AWAKE_OUTPUT_DPMS_ACCEPTED_NOOP=1 \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/last-awake-output.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/last-awake-output.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_dark" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 0 )); then
+        printf 'open resume must keep an awake bootstrap until eDP-1 DPMS is applied; status=%d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$effects" != *$'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY'* || \
+        "$effects" != *$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'* ]]; then
+        printf 'last-awake-output recovery did not create and remove its bootstrap\n%s\n' \
+            "$effects" >&2
+        failures=$((failures + 1))
+    else
+        effects_after_create=${effects#*$'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY'}
+        recovery_window=${effects_after_create%%$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'*}
+        assert_contains "$recovery_window" \
+            $'dpms\toutput=eDP-1\tstate=on' \
+            'internal DPMS must be applied while the recovery output is still awake' \
+            || failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'last-awake-output recovery must never mutate an external layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'last-awake-output recovery must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'last-awake-output recovery must never request a power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'last-awake-output recovery must leave only enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+        printf 'successful last-awake-output recovery retained its layout snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'successful last-awake-output recovery retained its ownership marker\n' >&2
+        failures=$((failures + 1))
+    fi
+    hook_count=$(grep -Fxc $'post-layout-hook\topen\tenabled\teDP-1' \
+        "$effect_log" || true)
+    if (( hook_count != 1 )); then
+        printf 'successful last-awake-output recovery must run one verified hook; got %d\n' \
+            "$hook_count" >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_cli_dry_run_refuses_owned_recovery_state_without_mutation() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled recovery_topology installed_cli
+    local state_file snapshot_file ownership_marker hook_fake expected_snapshot
+    local final_topology output effects runtime_status=0 query_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    recovery_topology=$(jq -c '. + [{
+        id: 999, name: "ARCH-LIDSWITCH-RECOVERY",
+        width: 1280, height: 720, refreshRate: 60,
+        x: 0, y: 0, scale: 1, transform: 0,
+        disabled: false, mirrorOf: "none", dpmsStatus: true
+    }]' <<< "$laptop_disabled")
+    state_file="$test_root/dry-run-recovery-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_cli="$home/.config/hypr/scripts/lid-switch.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    printf '%s\n' ARCH-LIDSWITCH-RECOVERY > "$ownership_marker"
+    chmod 0600 "$ownership_marker"
+    : > "$effect_log"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$recovery_topology" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        "$installed_cli" --dry-run close \
+        > "$test_root/dry-run-recovery.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/dry-run-recovery.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$recovery_topology" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all) || query_status=$?
+
+    if (( runtime_status != 2 )); then
+        printf 'dry-run with owned recovery state must fail status 2, got %d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" \
+        'event=recovery_state_check_failed action=close status=2 reason=recovery_cleanup_pending' \
+        'dry-run should explain that real execution must clean recovery state first' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=dry_run ' \
+        'dry-run must not predict policy from a temporary recovery output' \
+        || failures=$((failures + 1))
+    for forbidden in $'hyprctl\toutput\tremove' $'hyprctl\toutput\tcreate' \
+        $'monitor\t' $'dpms\t' $'systemctl\t' $'post-layout-hook\t'; do
+        assert_not_contains "$effects" "$forbidden" \
+            'dry-run recovery inspection must remain read-only' \
+            || failures=$((failures + 1))
+    done
+    if (( query_status != 0 )) || ! jq -e --argjson expected "$recovery_topology" \
+        '. == $expected' <<< "$final_topology" >/dev/null; then
+        printf 'dry-run recovery inspection changed topology\n%s\n' \
+            "$final_topology" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$snapshot_file" || -L "$snapshot_file" || \
+        "$(<"$snapshot_file")" != "$expected_snapshot" || \
+        "$(stat -c %a "$snapshot_file")" != 600 || \
+        ! -f "$ownership_marker" || -L "$ownership_marker" || \
+        "$(<"$ownership_marker")" != ARCH-LIDSWITCH-RECOVERY || \
+        "$(stat -c %a "$ownership_marker")" != 600 ]]; then
+        printf 'dry-run recovery inspection changed private recovery state\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$runtime_dir/arch-lidswitch/reconciliation.lock" || \
+        -L "$runtime_dir/arch-lidswitch/reconciliation.lock" ]]; then
+        printf 'dry-run recovery inspection created a reconciliation lock\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_restabilizes_when_external_hotplugs_during_last_output_recovery() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled expected_internal expected_dp2
+    local installed_daemon state_file snapshot_file ownership_marker final_topology
+    local output effects generation_record output_after_generation hotplug_record
+    local effects_after_hotplug recovery_window effects_after_cleanup
+    local runtime_status=0 query_status=0 generation_line barrier_count
+    local restore_count create_count remove_count failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    expected_internal=$(jq -c '.[] | select(.name == "eDP-1")' \
+        <<< "$framework")
+    expected_dp2=$(jq -c '.[] | select(.name == "DP-2")' \
+        <<< "$framework")
+    state_file="$test_root/recovery-hotplug-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hotplug_record=$'external-hotplug\toutput=DP-2\tenabled=true\tdpms=true'
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_HEADLESS_CREATE_HOTPLUG_DP2=1 \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/recovery-hotplug.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/recovery-hotplug.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 0 )); then
+        printf 'resume should restabilize and converge after recovery-time DP-2 hotplug; status=%d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    generation_record=$(grep -Em1 \
+        'event=reconciliation_failed action=open .*status=5 reason=generation_mismatch' \
+        "$test_root/recovery-hotplug.out" || true)
+    if [[ -z "$generation_record" ]]; then
+        printf 'recovery-time hotplug did not emit an explicit status-5 generation-change record:\n%s\n' \
+            "$output" >&2
+        failures=$((failures + 1))
+    else
+        assert_contains "$generation_record" 'DP-2' \
+            'generation-change record should identify the newly observed external output' \
+            || failures=$((failures + 1))
+        generation_line=$(grep -nEm1 \
+            'event=reconciliation_failed action=open .*status=5 reason=generation_mismatch' \
+            "$test_root/recovery-hotplug.out" | cut -d: -f1)
+        output_after_generation=$(sed -n \
+            "$((generation_line + 1)),\$p" "$test_root/recovery-hotplug.out")
+        assert_before "$output_after_generation" \
+            'event=stability_verified trigger=resume' \
+            'event=reconciliation_started trigger=resume attempt=2' \
+            'status 5 must force a fresh stability barrier before the retry' \
+            || failures=$((failures + 1))
+    fi
+    barrier_count=$(grep -Fc 'event=stability_verified trigger=resume' \
+        "$test_root/recovery-hotplug.out" || true)
+    if (( barrier_count < 2 )); then
+        printf 'recovery-time topology change should require a fresh stability barrier, got %d:\n%s\n' \
+            "$barrier_count" "$output" >&2
+        failures=$((failures + 1))
+    fi
+
+    if [[ "$effects" != *"$hotplug_record"* || \
+        "$effects" != *$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'* ]]; then
+        printf 'fake recovery-time hotplug/cleanup boundary was not reached:\n%s\n' \
+            "$effects" >&2
+        failures=$((failures + 1))
+    else
+        effects_after_hotplug=${effects#*"$hotplug_record"}
+        recovery_window=${effects_after_hotplug%%$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'*}
+        assert_not_contains "$recovery_window" $'monitor\toutput=eDP-1' \
+            'generation change must be detected before retrying the saved eDP-1 layout' \
+            || failures=$((failures + 1))
+        assert_not_contains "$recovery_window" $'dpms\toutput=eDP-1' \
+            'generation change must be detected before retrying internal DPMS' \
+            || failures=$((failures + 1))
+        effects_after_cleanup=${effects_after_hotplug#*$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'}
+        assert_contains "$effects_after_cleanup" \
+            $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2\ttransform=0\tmirror=' \
+            'stable retry should still have the saved internal layout snapshot' \
+            || failures=$((failures + 1))
+    fi
+
+    restore_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2\ttransform=0\tmirror=' \
+        "$effect_log" || true)
+    create_count=$(grep -Fxc \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" || true)
+    remove_count=$(grep -Fxc \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" || true)
+    if (( restore_count < 2 || create_count != 1 || remove_count != 1 )); then
+        printf 'hotplug recovery should retry layout around one owned bootstrap, got restores=%d creates=%d removes=%d\n%s\n' \
+            "$restore_count" "$create_count" "$remove_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'recovery and stable retry must never mutate the hotplugged external layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'recovery and stable retry must never mutate hotplugged external DPMS' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'recovery-time external hotplug must never request a power action' \
+        || failures=$((failures + 1))
+
+    if (( query_status != 0 )) || ! jq -e \
+        --argjson expected_internal "$expected_internal" \
+        --argjson expected_dp2 "$expected_dp2" '
+        type == "array" and length == 2 and
+        ([.[] | select(.name == "eDP-1")] == [$expected_internal]) and
+        ([.[] | select(.name == "DP-2")] == [$expected_dp2]) and
+        all(.[]; .name != "ARCH-LIDSWITCH-RECOVERY")
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'stable retry must leave exact enabled eDP-1 and unchanged DP-2 only; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+        printf 'successful stable reconciliation did not consume its layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'recovery-time generation change leaked its private ownership marker\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_revalidates_complete_generation_before_recovery_mutation() (
+    set -euo pipefail
+
+    local test_root scenario case_root home fake_bin safe_bin effect_log
+    local runtime_dir lid_root monitor_fixture framework laptop_disabled
+    local expected_internal expected_dp3 installed_daemon state_file snapshot_file
+    local ownership_marker lid_state_file mutation_record expected_lid
+    local output effects effects_after_mutation recovery_window effects_after_cleanup
+    local final_topology final_lid generation_line output_after_generation
+    local runtime_status query_status barrier_count mutation_count
+    local success_record
+    local failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    expected_internal=$(jq -c '.[] | select(.name == "eDP-1")' \
+        <<< "$framework")
+    expected_dp3='{"id":2,"name":"DP-3","disabled":true,"dpmsStatus":true}'
+
+    for scenario in inactive-dp3 lid-closed; do
+        case_root="$test_root/$scenario"
+        home="$case_root/home"
+        fake_bin="$case_root/fake-bin"
+        safe_bin="$case_root/safe-bin"
+        effect_log="$case_root/effects.log"
+        runtime_dir="$case_root/runtime"
+        lid_root="$case_root/button/lid"
+        state_file="$case_root/monitor-state.json"
+        snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+        ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+        lid_state_file="$lid_root/LID0/state"
+        runtime_status=0
+        query_status=0
+
+        case "$scenario" in
+            inactive-dp3)
+                mutation_record=$'connector-represented\toutput=DP-3\tenabled=false\tdpms=true'
+                expected_lid=open
+                ;;
+            lid-closed)
+                mutation_record=$'lid-change\tstate=closed'
+                expected_lid=closed
+                ;;
+        esac
+
+        mkdir -m 0700 -p "$home" "$runtime_dir"
+        create_lid_state_fixture "$lid_root" lid0
+        prepare_hyprland_config "$home"
+        : > "$effect_log"
+        install_safe_path "$fake_bin" "$safe_bin"
+        "$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            WAYLAND_DISPLAY=wayland-test \
+            HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+            XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            TEST_HYPRCTL_MONITORS_JSON="$framework" \
+            HYPR_LID_STATE_ROOT="$lid_root" \
+            "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+            > "$case_root/installer.out" 2>&1
+        installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+        write_internal_layout_snapshot "$runtime_dir"
+        : > "$effect_log"
+        "$TIMEOUT_BIN" 3 "$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            XDG_RUNTIME_DIR="$runtime_dir" TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+            TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+            TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+            TEST_HYPRCTL_HEADLESS_CREATE_GENERATION_CHANGE="$scenario" \
+            TEST_HYPRCTL_HEADLESS_CREATE_LID_STATE_FILE="$lid_state_file" \
+            HYPR_LID_STATE_ROOT="$lid_root" \
+            "$installed_daemon" --resume-once \
+            > "$case_root/runtime.out" 2>&1 || runtime_status=$?
+        output=$(<"$case_root/runtime.out")
+        effects=$(<"$effect_log")
+        final_topology=$("$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+            TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+            "$fake_bin/hyprctl" -j monitors all \
+            2> "$case_root/final-topology.err") || query_status=$?
+        final_lid=$(<"$lid_state_file")
+
+        if (( runtime_status != 0 )); then
+            printf '%s recovery generation change should converge, got status %d\n%s\n%s\n' \
+                "$scenario" "$runtime_status" "$output" "$effects" >&2
+            failures=$((failures + 1))
+        fi
+        assert_contains "$output" 'status=5 reason=generation_mismatch' \
+            "$scenario must reject the first incomplete recovery generation" \
+            || failures=$((failures + 1))
+        generation_line=$(grep -nEm1 'status=5 reason=generation_mismatch' \
+            "$case_root/runtime.out" | cut -d: -f1 || true)
+        if [[ -z "$generation_line" ]]; then
+            failures=$((failures + 1))
+        else
+            output_after_generation=$(sed -n \
+                "$((generation_line + 1)),\$p" "$case_root/runtime.out")
+            assert_before "$output_after_generation" \
+                'event=stability_verified trigger=resume' \
+                'event=reconciliation_started trigger=resume attempt=' \
+                "$scenario status 5 must force a fresh stability barrier" \
+                || failures=$((failures + 1))
+        fi
+        barrier_count=$(grep -Fc 'event=stability_verified trigger=resume' \
+            "$case_root/runtime.out" || true)
+        if (( barrier_count < 2 )); then
+            printf '%s generation change required two stability barriers, got %d\n%s\n' \
+                "$scenario" "$barrier_count" "$output" >&2
+            failures=$((failures + 1))
+        fi
+        success_record=$(grep -Em1 \
+            "event=reconciliation_succeeded trigger=resume attempt=[0-9]+ state=$expected_lid" \
+            "$case_root/runtime.out" || true)
+        if [[ -z "$success_record" ]]; then
+            printf '%s did not converge to the new stable %s policy\n%s\n' \
+                "$scenario" "$expected_lid" "$output" >&2
+            failures=$((failures + 1))
+        fi
+
+        if [[ "$effects" != *"$mutation_record"* || \
+            "$effects" != *$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'* ]]; then
+            printf '%s did not reach its create-boundary mutation and cleanup\n%s\n' \
+                "$scenario" "$effects" >&2
+            failures=$((failures + 1))
+        else
+            effects_after_mutation=${effects#*"$mutation_record"}
+            recovery_window=${effects_after_mutation%%$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'*}
+            assert_not_contains "$recovery_window" $'monitor\toutput=eDP-1' \
+                "$scenario must revalidate before retrying the saved internal layout" \
+                || failures=$((failures + 1))
+            assert_not_contains "$recovery_window" $'dpms\toutput=eDP-1' \
+                "$scenario must revalidate before retrying internal DPMS" \
+                || failures=$((failures + 1))
+            effects_after_cleanup=${effects_after_mutation#*$'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY'}
+            assert_contains "$effects_after_cleanup" \
+                $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2\ttransform=0\tmirror=' \
+                "$scenario stable retry must retain the exact saved layout" \
+                || failures=$((failures + 1))
+        fi
+
+        mutation_count=$(grep -Fxc "$mutation_record" "$effect_log" || true)
+        if (( mutation_count != 1 )); then
+            printf '%s create boundary must publish one generation change, got %d\n%s\n' \
+                "$scenario" "$mutation_count" "$effects" >&2
+            failures=$((failures + 1))
+        fi
+        assert_not_contains "$effects" $'monitor\toutput=DP-3' \
+            "$scenario recovery must not mutate an external connector" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'dpms\toutput=DP-3' \
+            "$scenario recovery must not mutate external output power" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'systemctl\t' \
+            "$scenario recovery must not request a system power action" \
+            || failures=$((failures + 1))
+
+        if (( query_status != 0 )); then
+            printf '%s final topology query failed status %d\n%s\n' \
+                "$scenario" "$query_status" \
+                "$(<"$case_root/final-topology.err")" >&2
+            failures=$((failures + 1))
+        elif [[ "$scenario" == inactive-dp3 ]]; then
+            if ! jq -e --argjson internal "$expected_internal" \
+                --argjson dp3 "$expected_dp3" '
+                type == "array" and length == 2 and
+                ([.[] | select(.name == "eDP-1")] == [$internal]) and
+                ([.[] | select(.name == "DP-3")] == [$dp3]) and
+                all(.[]; .name != "ARCH-LIDSWITCH-RECOVERY")
+            ' <<< "$final_topology" >/dev/null; then
+                printf 'inactive DP-3 policy did not preserve exact physical topology\n%s\n' \
+                    "$final_topology" >&2
+                failures=$((failures + 1))
+            fi
+        elif ! jq -e --argjson internal "$expected_internal" '
+            type == "array" and . == [$internal]
+        ' <<< "$final_topology" >/dev/null; then
+            printf 'closed-lid policy did not converge to exact internal topology\n%s\n' \
+                "$final_topology" >&2
+            failures=$((failures + 1))
+        fi
+        if [[ "$final_lid" != "state: $expected_lid" ]]; then
+            printf '%s changed to unexpected final lid state: %s\n' \
+                "$scenario" "$final_lid" >&2
+            failures=$((failures + 1))
+        fi
+        if [[ -e "$snapshot_file" || -L "$snapshot_file" || \
+            -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+            printf '%s successful retry retained private recovery state\n' \
+                "$scenario" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    (( failures == 0 ))
+)
+
+installed_daemon_serializes_live_last_output_recovery() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker ready_file release_fifo
+    local topology_before_b final_topology output_a output_b effects_b
+    local before_b_lines first_b_line wait_iteration
+    local a_pid="" a_status=0 b_status=0 query_status=0 failures=0
+    local release_guard_fd=""
+
+    test_root=$(mktemp -d)
+    cleanup_live_recovery_test() {
+        if [[ -n "$a_pid" ]] && kill -0 "$a_pid" 2>/dev/null; then
+            kill "$a_pid" 2>/dev/null || true
+            wait "$a_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$release_guard_fd" ]]; then
+            exec {release_guard_fd}>&- || true
+        fi
+        rm -rf "$test_root"
+    }
+    trap cleanup_live_recovery_test EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/live-recovery-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    ready_file="$test_root/headless-create.ready"
+    release_fifo="$test_root/headless-create.release"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    mkfifo -m 0600 "$release_fifo"
+    exec {release_guard_fd}<> "$release_fifo"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 5 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_HEADLESS_CREATE_READY_FILE="$ready_file" \
+        TEST_HYPRCTL_HEADLESS_CREATE_RELEASE_FIFO="$release_fifo" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/invocation-a.out" 2>&1 &
+    a_pid=$!
+
+    for ((wait_iteration = 0; wait_iteration < 300; wait_iteration++)); do
+        if [[ -f "$ready_file" ]]; then
+            break
+        fi
+        if ! kill -0 "$a_pid" 2>/dev/null; then
+            break
+        fi
+        "$REAL_SLEEP_BIN" 0.01
+    done
+    if [[ ! -f "$ready_file" ]]; then
+        wait "$a_pid" || a_status=$?
+        a_pid=""
+        printf 'invocation A did not reach the blocked live-recovery boundary; status=%d\n%s\n%s\n' \
+            "$a_status" "$(<"$test_root/invocation-a.out")" \
+            "$(<"$effect_log")" >&2
+        return 1
+    fi
+
+    topology_before_b=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all)
+    if ! jq -e '
+        type == "array" and length == 2 and
+        any(.[]; .name == "eDP-1" and .disabled == true) and
+        any(.[]; .name == "ARCH-LIDSWITCH-RECOVERY" and
+            .disabled == false and .dpmsStatus == true)
+    ' <<< "$topology_before_b" > /dev/null; then
+        printf 'invocation A signaled ready without exposing its live recovery output:\n%s\n' \
+            "$topology_before_b" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$ownership_marker" || \
+        "$(<"$ownership_marker")" != ARCH-LIDSWITCH-RECOVERY || \
+        "$(stat -c %a "$ownership_marker")" != 600 ]]; then
+        printf 'invocation A did not expose a valid private recovery ownership marker\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    before_b_lines=$(wc -l < "$effect_log")
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/invocation-b.out" 2>&1 || b_status=$?
+    output_b=$(<"$test_root/invocation-b.out")
+    first_b_line=$((before_b_lines + 1))
+    effects_b=$(sed -n "${first_b_line},\$p" "$effect_log")
+
+    if (( b_status != 3 )); then
+        printf 'concurrent invocation B must fail status 3, got %d\n%s\n%s\n' \
+            "$b_status" "$output_b" "$effects_b" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output_b" 'status=3 reason=recovery_reconciliation_busy' \
+        'concurrent recovery must retain its precise busy reason' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output_b" 'policy_token=' \
+        'concurrent recovery must fail before any policy-bearing record' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects_b" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'concurrent recovery must not remove the live owned output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects_b" \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'concurrent recovery must not create another recovery output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects_b" $'monitor\t' \
+        'concurrent recovery must not mutate any monitor rule' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects_b" $'dpms\t' \
+        'concurrent recovery must not mutate output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects_b" $'systemctl\t' \
+        'concurrent recovery must not request a system power action' \
+        || failures=$((failures + 1))
+
+    printf 'release\n' > "$release_fifo"
+    wait "$a_pid" || a_status=$?
+    a_pid=""
+    output_a=$(<"$test_root/invocation-a.out")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( a_status != 0 )); then
+        printf 'lock-owning invocation A must succeed after release, got %d\n%s\n%s\n' \
+            "$a_status" "$output_a" "$(<"$effect_log")" >&2
+        failures=$((failures + 1))
+    fi
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'serialized recovery must leave only enabled awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" ]]; then
+        printf 'successful serialized recovery did not consume its layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'successful serialized recovery did not consume its ownership marker\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_retains_recovery_state_when_headless_create_is_rejected() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake expected_snapshot final_topology
+    local runtime_status=0 query_status=0 output effects failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/create-rejection-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_HEADLESS_CREATE_FAIL=1 \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/create-rejection.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/create-rejection.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 3 )); then
+        printf 'rejected headless recovery creation must fail status 3, got %d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'last-output recovery should reach the rejected headless create boundary' \
+        || failures=$((failures + 1))
+    assert_contains "$output" \
+        'event=last_output_recovery_failed action=open internal_output=eDP-1 status=3 reason=recovery_output_create_failed' \
+        'headless create rejection should retain its precise recovery reason' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=reconciliation_succeeded' \
+        'a rejected recovery output must never report reconciliation success' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'a rejected recovery output must not trigger removal of an uncreated output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'post-layout-hook\t' \
+        'failed last-output recovery must not run the post-layout hook' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'failed last-output recovery must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'failed last-output recovery must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'failed last-output recovery must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == true and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'headless create rejection leaked or changed recovery topology; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$snapshot_file" ]]; then
+        printf 'headless create rejection removed the layout snapshot\n' >&2
+        failures=$((failures + 1))
+    elif [[ "$(<"$snapshot_file")" != "$expected_snapshot" || \
+        "$(stat -c %a "$snapshot_file")" != 600 ]]; then
+        printf 'headless create rejection did not retain the valid private layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'rejected uncreated recovery output retained an ownership marker\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_preserves_foreign_recovery_output_after_create_collision() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake expected_snapshot
+    local first_status=0 second_status=0 query_status=0 first_output second_output
+    local first_effects second_effects final_topology failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/foreign-collision-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_HEADLESS_CREATE_FOREIGN_COLLISION=1 \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/create-collision.out" 2>&1 || first_status=$?
+    first_output=$(<"$test_root/create-collision.out")
+    first_effects=$(<"$effect_log")
+
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/unowned-followup.out" 2>&1 || second_status=$?
+    second_output=$(<"$test_root/unowned-followup.out")
+    second_effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( first_status != 3 || second_status != 3 )); then
+        printf 'foreign create collision must fail status 3 now and on retry; got %d/%d\n%s\n%s\n' \
+            "$first_status" "$second_status" "$first_output" "$second_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$first_output" \
+        'event=last_output_recovery_failed action=open internal_output=eDP-1 status=3 reason=recovery_output_create_failed' \
+        'server-side name rejection must retain its precise create failure reason' \
+        || failures=$((failures + 1))
+    assert_contains "$second_output" \
+        'event=topology_observation_failed reason=recovery_output_unowned trigger=stability_resume' \
+        'the next invocation must recognize the collided output as unowned' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects$second_effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'neither invocation may remove the foreign recovery output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_output$second_output" 'event=reconciliation_succeeded' \
+        'a foreign recovery collision must never report reconciliation success' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_output$second_output" 'event=last_output_recovery_succeeded' \
+        'a foreign recovery collision must never report recovery success' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects$second_effects" $'post-layout-hook\t' \
+        'a foreign recovery collision must not run the post-layout hook' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects$second_effects" $'monitor\toutput=DP-2' \
+        'a foreign recovery collision must not mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects$second_effects" $'dpms\toutput=DP-2' \
+        'a foreign recovery collision must not change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects$second_effects" $'systemctl\t' \
+        'a foreign recovery collision must not request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 2 and
+        any(.[]; .name == "eDP-1" and .disabled == true and
+            .dpmsStatus == true) and
+        any(.[]; .name == "ARCH-LIDSWITCH-RECOVERY" and
+            .disabled == false and .dpmsStatus == true)
+    ' <<< "$final_topology" >/dev/null; then
+        printf 'foreign recovery collision did not remain intact; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'foreign recovery collision retained the product ownership marker\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$snapshot_file" || -L "$snapshot_file" || \
+        "$(<"$snapshot_file")" != "$expected_snapshot" || \
+        "$(stat -c %a -- "$snapshot_file")" != 600 ]]; then
+        printf 'foreign recovery collision did not retain the private layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_prioritizes_failed_cleanup_after_partial_headless_create() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake expected_snapshot final_topology
+    local runtime_status=0 query_status=0 output effects failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/partial-create-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 3 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_HEADLESS_CREATE_MUTATE_THEN_FAIL=1 \
+        TEST_HYPRCTL_HEADLESS_REMOVE_FAIL=1 \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/partial-create.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/partial-create.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 3 )); then
+        printf 'failed cleanup after partial headless create must return 3, got %d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" \
+        'event=last_output_recovery_failed action=open internal_output=eDP-1 status=3 reason=recovery_output_remove_failed' \
+        'failed cleanup must supersede the partial create command failure' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'reason=recovery_output_create_failed' \
+        'partial creation with failed cleanup must not report only create failure' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=last_output_recovery_succeeded' \
+        'partial creation with failed cleanup must not report recovery success' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'event=reconciliation_succeeded' \
+        'partial creation with failed cleanup must not report reconciliation success' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'the regression must reach the mutating headless-create boundary' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'the partial create failure must attempt owned-output cleanup' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'post-layout-hook\t' \
+        'failed cleanup must not run the post-layout hook' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'failed cleanup must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'failed cleanup must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'failed cleanup must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 2 and
+        any(.[]; .name == "eDP-1" and .disabled == true) and
+        any(.[]; .name == "ARCH-LIDSWITCH-RECOVERY" and
+            .disabled == false and .dpmsStatus == true)
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'failed cleanup must retain its owned headless output; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$snapshot_file" || -L "$snapshot_file" || \
+        "$(<"$snapshot_file")" != "$expected_snapshot" || \
+        "$(stat -c %a -- "$snapshot_file")" != 600 ]]; then
+        printf 'failed cleanup did not retain the valid private layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$ownership_marker" || -L "$ownership_marker" || \
+        "$(<"$ownership_marker")" != ARCH-LIDSWITCH-RECOVERY || \
+        "$(stat -c %a -- "$ownership_marker")" != 600 ]]; then
+        printf 'failed cleanup did not retain its valid private ownership marker\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_rejects_accepted_noop_recovery_boundaries() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin lid_root monitor_fixture framework
+    local laptop_disabled installed_daemon hook_fake expected_snapshot scenario
+    local expected_reason accepted_noop_flag runtime_dir effect_log state_file
+    local snapshot_file ownership_marker output effects final_topology
+    local runtime_status query_status failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    hook_fake="$fake_bin/post-layout-hook"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+
+    mkdir -m 0700 -p "$home"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$test_root/install-effects.log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    for scenario in create internal-enable remove; do
+        runtime_dir="$test_root/runtime-$scenario"
+        effect_log="$test_root/effects-$scenario.log"
+        state_file="$test_root/state-$scenario.json"
+        snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+        ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+        runtime_status=0
+        query_status=0
+        case "$scenario" in
+            create)
+                expected_reason=recovery_output_create_unverified
+                accepted_noop_flag=TEST_HYPRCTL_HEADLESS_CREATE_ACCEPTED_NOOP
+                ;;
+            internal-enable)
+                expected_reason=recovery_internal_enable_unverified
+                accepted_noop_flag=TEST_HYPRCTL_RECOVERY_INTERNAL_RESTORE_ACCEPTED_NOOP
+                ;;
+            remove)
+                expected_reason=recovery_output_remove_unverified
+                accepted_noop_flag=TEST_HYPRCTL_HEADLESS_REMOVE_ACCEPTED_NOOP
+                ;;
+        esac
+
+        mkdir -m 0700 -p "$runtime_dir"
+        write_internal_layout_snapshot "$runtime_dir"
+        : > "$effect_log"
+        "$TIMEOUT_BIN" 9 "$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+            TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+            TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+            "$accepted_noop_flag=1" \
+            ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+            HYPR_LID_STATE_ROOT="$lid_root" \
+            "$installed_daemon" --resume-once \
+            > "$test_root/$scenario.out" 2>&1 || runtime_status=$?
+        output=$(<"$test_root/$scenario.out")
+        effects=$(<"$effect_log")
+        final_topology=$("$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+            TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+            "$fake_bin/hyprctl" -j monitors all \
+            2> "$test_root/$scenario-topology.err") || query_status=$?
+
+        if (( runtime_status != 3 )); then
+            printf '%s accepted-noop recovery must fail bounded with status 3, got %d\n%s\n%s\n' \
+                "$scenario" "$runtime_status" "$output" "$effects" >&2
+            failures=$((failures + 1))
+        fi
+        assert_contains "$output" \
+            "event=last_output_recovery_failed action=open internal_output=eDP-1 status=3 reason=$expected_reason" \
+            "$scenario accepted-noop must retain its precise unverified reason" \
+            || failures=$((failures + 1))
+        assert_not_contains "$output" 'event=last_output_recovery_succeeded' \
+            "$scenario accepted-noop must not report recovery success" \
+            || failures=$((failures + 1))
+        assert_not_contains "$output" 'event=reconciliation_succeeded' \
+            "$scenario accepted-noop must not report reconciliation success" \
+            || failures=$((failures + 1))
+        assert_contains "$effects" \
+            $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+            "$scenario regression must reach headless creation" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'post-layout-hook\t' \
+            "$scenario accepted-noop must not run the post-layout hook" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+            "$scenario accepted-noop must not mutate an external output" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+            "$scenario accepted-noop must not change external output power" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'systemctl\t' \
+            "$scenario accepted-noop must not request a system power action" \
+            || failures=$((failures + 1))
+
+        if [[ ! -f "$snapshot_file" || -L "$snapshot_file" || \
+            "$(<"$snapshot_file")" != "$expected_snapshot" || \
+            "$(stat -c %a -- "$snapshot_file")" != 600 ]]; then
+            printf '%s accepted-noop did not retain the private layout snapshot\n' \
+                "$scenario" >&2
+            failures=$((failures + 1))
+        fi
+        if [[ "$scenario" == remove ]]; then
+            assert_contains "$effects" \
+                $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+                'accepted-noop removal must reach the remove boundary' \
+                || failures=$((failures + 1))
+            if (( query_status != 0 )) || ! jq -e '
+                type == "array" and length == 2 and
+                any(.[]; .name == "eDP-1" and .disabled == false) and
+                any(.[]; .name == "ARCH-LIDSWITCH-RECOVERY" and
+                    .disabled == false and .dpmsStatus == true)
+            ' <<< "$final_topology" >/dev/null; then
+                printf 'accepted-noop removal must retain the owned output; query_status=%d\n%s\n%s\n' \
+                    "$query_status" "$final_topology" \
+                    "$(<"$test_root/$scenario-topology.err")" >&2
+                failures=$((failures + 1))
+            fi
+            if [[ ! -f "$ownership_marker" || -L "$ownership_marker" || \
+                "$(<"$ownership_marker")" != ARCH-LIDSWITCH-RECOVERY || \
+                "$(stat -c %a -- "$ownership_marker")" != 600 ]]; then
+                printf 'accepted-noop removal did not retain its private ownership marker\n' \
+                    >&2
+                failures=$((failures + 1))
+            fi
+        else
+            if (( query_status != 0 )) || ! jq -e '
+                type == "array" and length == 1 and
+                .[0].name == "eDP-1" and .[0].disabled == true and
+                .[0].dpmsStatus == true
+            ' <<< "$final_topology" >/dev/null; then
+                printf '%s accepted-noop must leave only disabled eDP-1; query_status=%d\n%s\n%s\n' \
+                    "$scenario" "$query_status" "$final_topology" \
+                    "$(<"$test_root/$scenario-topology.err")" >&2
+                failures=$((failures + 1))
+            fi
+            if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+                printf '%s accepted-noop retained an ownership marker without an output\n' \
+                    "$scenario" >&2
+                failures=$((failures + 1))
+            fi
+            if [[ "$scenario" == create ]]; then
+                assert_not_contains "$effects" \
+                    $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+                    'unobserved accepted-noop creation must clear ownership without removal' \
+                    || failures=$((failures + 1))
+            else
+                assert_contains "$effects" \
+                    $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+                    'unverified internal enable must clean its owned recovery output' \
+                    || failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    (( failures == 0 ))
+)
+
+installed_daemon_rejects_unowned_recovery_output_before_resume_policy() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled unowned_topology installed_daemon
+    local state_file snapshot_file ownership_marker expected_snapshot final_topology
+    local runtime_status=0 query_status=0 output effects failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    unowned_topology=$(jq -c '. + [{
+        id: 999,
+        name: "ARCH-LIDSWITCH-RECOVERY",
+        width: 1280,
+        height: 720,
+        refreshRate: 60,
+        x: 0,
+        y: 0,
+        scale: 1,
+        transform: 0,
+        disabled: false,
+        mirrorOf: "none",
+        dpmsStatus: true
+    }]' <<< "$laptop_disabled")
+    state_file="$test_root/unowned-recovery-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$unowned_topology" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/unowned-recovery.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/unowned-recovery.out")
+    effects=$(<"$effect_log")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$unowned_topology" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 3 )); then
+        printf 'an unowned reserved recovery output must fail status 3, got %d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" \
+        'event=topology_observation_failed reason=recovery_output_unowned trigger=stability_resume' \
+        'an unowned reserved output should retain its precise observation failure reason' \
+        || failures=$((failures + 1))
+    assert_not_contains "$output" 'policy_token=' \
+        'an unowned reserved output must fail before any policy-bearing record' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'resume must not remove an unowned reserved output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'resume must not create a recovery output after an unowned collision' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\t' \
+        'an unowned reserved output must prevent every monitor mutation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\t' \
+        'an unowned reserved output must prevent every DPMS mutation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'an unowned reserved output must prevent every system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e --argjson expected "$unowned_topology" \
+        '. == $expected' <<< "$final_topology" > /dev/null; then
+        printf 'unowned recovery collision changed its topology; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$snapshot_file" ]]; then
+        printf 'unowned recovery collision removed the layout snapshot\n' >&2
+        failures=$((failures + 1))
+    elif [[ "$(<"$snapshot_file")" != "$expected_snapshot" || \
+        "$(stat -c %a "$snapshot_file")" != 600 ]]; then
+        printf 'unowned recovery collision did not retain the valid private layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'unowned recovery collision claimed ownership of the reserved output\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_rejects_invalid_recovery_markers_before_resume_policy() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin lid_root monitor_fixture framework
+    local laptop_disabled recovery_topology installed_daemon hook_fake
+    local expected_snapshot expected_marker scenario expected_reason
+    local runtime_dir effect_log state_file snapshot_file ownership_marker
+    local marker_target marker_link marker_type marker_mode target_type target_mode
+    local runtime_status query_status output effects final_topology failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    recovery_topology=$(jq -c '. + [{
+        id: 999,
+        name: "ARCH-LIDSWITCH-RECOVERY",
+        width: 1280,
+        height: 720,
+        refreshRate: 60,
+        x: 0,
+        y: 0,
+        scale: 1,
+        transform: 0,
+        disabled: false,
+        mirrorOf: "none",
+        dpmsStatus: true
+    }]' <<< "$laptop_disabled")
+    hook_fake="$fake_bin/post-layout-hook"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+    expected_marker=ARCH-LIDSWITCH-RECOVERY
+
+    mkdir -m 0700 -p "$home"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$test_root/install-effects.log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    for scenario in symlink permissive-mode; do
+        runtime_dir="$test_root/runtime-$scenario"
+        effect_log="$test_root/effects-$scenario.log"
+        state_file="$test_root/state-$scenario.json"
+        snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+        ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+        marker_target="$test_root/marker-target-$scenario"
+        runtime_status=0
+        query_status=0
+
+        mkdir -m 0700 -p "$runtime_dir"
+        write_internal_layout_snapshot "$runtime_dir"
+        case "$scenario" in
+            symlink)
+                printf '%s\n' "$expected_marker" > "$marker_target"
+                chmod 0600 "$marker_target"
+                ln -s "$marker_target" "$ownership_marker"
+                expected_reason=recovery_marker_insecure
+                ;;
+            permissive-mode)
+                printf '%s\n' "$expected_marker" > "$ownership_marker"
+                chmod 0644 "$ownership_marker"
+                expected_reason=recovery_marker_invalid
+                ;;
+        esac
+        marker_type=$(stat -c %F -- "$ownership_marker")
+        marker_mode=$(stat -c %a -- "$ownership_marker")
+        marker_link=""
+        target_type=""
+        target_mode=""
+        if [[ "$scenario" == symlink ]]; then
+            marker_link=$(readlink -- "$ownership_marker")
+            target_type=$(stat -c %F -- "$marker_target")
+            target_mode=$(stat -c %a -- "$marker_target")
+        fi
+
+        : > "$effect_log"
+        "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            TEST_HYPRCTL_MONITORS_JSON="$recovery_topology" \
+            TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+            ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+            HYPR_LID_STATE_ROOT="$lid_root" \
+            "$installed_daemon" --resume-once \
+            > "$test_root/$scenario.out" 2>&1 || runtime_status=$?
+        output=$(<"$test_root/$scenario.out")
+        effects=$(<"$effect_log")
+
+        if (( runtime_status != 2 )); then
+            printf '%s recovery marker must fail status 2, got %d\n%s\n%s\n' \
+                "$scenario" "$runtime_status" "$output" "$effects" >&2
+            failures=$((failures + 1))
+        fi
+        assert_contains "$output" \
+            "event=recovery_state_cleanup_failed phase=startup status=2 reason=$expected_reason" \
+            "$scenario marker should retain its precise startup failure reason" \
+            || failures=$((failures + 1))
+        assert_not_contains "$output" 'policy_token=' \
+            "$scenario marker must fail before any policy-bearing record" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" \
+            $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+            "$scenario marker must not authorize recovery-output removal" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" \
+            $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+            "$scenario marker must not permit recovery-output creation" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'monitor\t' \
+            "$scenario marker must prevent every monitor mutation" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'dpms\t' \
+            "$scenario marker must prevent every DPMS mutation" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'systemctl\t' \
+            "$scenario marker must prevent every system power action" \
+            || failures=$((failures + 1))
+        assert_not_contains "$effects" $'post-layout-hook\t' \
+            "$scenario marker must prevent the post-layout hook" \
+            || failures=$((failures + 1))
+
+        final_topology=$("$ENV_BIN" -i \
+            HOME="$home" PATH="$fake_bin:$safe_bin" \
+            TEST_EFFECT_LOG="$effect_log" \
+            TEST_MONITORS_FIXTURE="$monitor_fixture" \
+            TEST_HYPRCTL_MONITORS_JSON="$recovery_topology" \
+            TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+            "$fake_bin/hyprctl" -j monitors all \
+            2> "$test_root/final-topology-$scenario.err") || query_status=$?
+        if (( query_status != 0 )) || \
+            ! jq -e --argjson expected "$recovery_topology" \
+                '. == $expected' <<< "$final_topology" > /dev/null; then
+            printf '%s recovery marker changed topology; query_status=%d\n%s\n%s\n' \
+                "$scenario" "$query_status" "$final_topology" \
+                "$(<"$test_root/final-topology-$scenario.err")" >&2
+            failures=$((failures + 1))
+        fi
+        if [[ ! -f "$snapshot_file" || -L "$snapshot_file" || \
+            "$(<"$snapshot_file")" != "$expected_snapshot" || \
+            "$(stat -c %a -- "$snapshot_file")" != 600 ]]; then
+            printf '%s recovery marker changed the private layout snapshot\n' \
+                "$scenario" >&2
+            failures=$((failures + 1))
+        fi
+
+        if [[ "$scenario" == symlink ]]; then
+            if [[ ! -L "$ownership_marker" || \
+                "$(readlink -- "$ownership_marker")" != "$marker_link" || \
+                "$(stat -c %F -- "$ownership_marker")" != "$marker_type" || \
+                "$(stat -c %a -- "$ownership_marker")" != "$marker_mode" || \
+                ! -f "$marker_target" || -L "$marker_target" || \
+                "$(<"$marker_target")" != "$expected_marker" || \
+                "$(stat -c %F -- "$marker_target")" != "$target_type" || \
+                "$(stat -c %a -- "$marker_target")" != "$target_mode" ]]; then
+                printf 'insecure symlink marker or its target was changed\n' >&2
+                failures=$((failures + 1))
+            fi
+        elif [[ ! -f "$ownership_marker" || -L "$ownership_marker" || \
+            "$(<"$ownership_marker")" != "$expected_marker" || \
+            "$(stat -c %F -- "$ownership_marker")" != "$marker_type" || \
+            "$(stat -c %a -- "$ownership_marker")" != "$marker_mode" ]]; then
+            printf 'invalid permissive-mode marker was changed\n' >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    (( failures == 0 ))
+)
+
+installed_daemon_cleans_stale_owned_recovery_before_resume_policy() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled stale_topology installed_daemon
+    local state_file snapshot_file ownership_marker final_topology policy_records
+    local runtime_status=0 query_status=0 output effects failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    stale_topology=$(jq -c '. + [{
+        id: 999,
+        name: "ARCH-LIDSWITCH-RECOVERY",
+        width: 1280,
+        height: 720,
+        refreshRate: 60,
+        x: 0,
+        y: 0,
+        scale: 1,
+        transform: 0,
+        disabled: false,
+        mirrorOf: "none",
+        dpmsStatus: true
+    }]' <<< "$laptop_disabled")
+    state_file="$test_root/stale-recovery-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    printf '%s\n' 'ARCH-LIDSWITCH-RECOVERY' > "$ownership_marker"
+    chmod 0600 "$ownership_marker"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 2 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$stale_topology" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/stale-recovery.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/stale-recovery.out")
+    effects=$(<"$effect_log")
+    policy_records=$(grep -F 'policy_token=' \
+        "$test_root/stale-recovery.out" || true)
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$stale_topology" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 0 )); then
+        printf 'stale owned recovery cleanup should converge, got status %d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'resume should remove its stale owned recovery output' \
+        || failures=$((failures + 1))
+    assert_contains "$effects" \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'resume should perform a fresh last-output recovery after stale cleanup' \
+        || failures=$((failures + 1))
+    assert_before "$effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'stale cleanup must precede fresh incident recovery' \
+        || failures=$((failures + 1))
+    assert_contains "$output" 'event=reconciliation_started trigger=resume' \
+        'resume should enter reconciliation after stale cleanup' \
+        || failures=$((failures + 1))
+    assert_contains "$output" \
+        'event=last_output_recovery_succeeded action=open internal_output=eDP-1' \
+        'resume should complete fresh incident recovery after stale cleanup' \
+        || failures=$((failures + 1))
+    assert_not_contains "$policy_records" 'ARCH-LIDSWITCH-RECOVERY' \
+        'owned stale recovery must not enter a policy fingerprint or reconciliation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'stale cleanup and recovery must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'stale cleanup and recovery must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'stale cleanup and recovery must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'stale cleanup must finish with only enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" ]]; then
+        printf 'successful stale recovery cleanup did not consume the layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$ownership_marker" ]]; then
+        printf 'successful stale recovery cleanup did not consume its ownership marker\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_cleans_delayed_owned_recovery_before_resume_policy() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker publication_counter final_topology
+    local policy_records output effects remove_count
+    local runtime_status=0 query_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/delayed-recovery-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    publication_counter="$test_root/delayed-publication-count"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    printf '%s\n' ARCH-LIDSWITCH-RECOVERY > "$ownership_marker"
+    chmod 0600 "$ownership_marker"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 5 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_DELAYED_RECOVERY_PUBLICATION_COUNTER="$publication_counter" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/delayed-recovery.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/delayed-recovery.out")
+    effects=$(<"$effect_log")
+    policy_records=$(grep -F 'policy_token=' \
+        "$test_root/delayed-recovery.out" || true)
+    remove_count=$(grep -Fxc \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" || true)
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 0 )); then
+        printf 'delayed owned recovery cleanup should converge, got status %d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -r "$publication_counter" || \
+        "$(<"$publication_counter")" != 1 ]]; then
+        printf 'fake did not publish the recovery output exactly once after its first query\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if (( remove_count < 2 )); then
+        printf 'delayed stale cleanup plus fresh recovery required two removals, got %d\n%s\n' \
+            "$remove_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_before "$effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        'delayed stale output removal must precede fresh incident recovery' \
+        || failures=$((failures + 1))
+    assert_not_contains "$policy_records" ARCH-LIDSWITCH-RECOVERY \
+        'delayed owned recovery output must be gone before policy observation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'delayed stale cleanup must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'delayed stale cleanup must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'delayed stale cleanup must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'delayed stale cleanup must leave only enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" || \
+        -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'successful delayed cleanup retained recovery state\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_retries_owned_recovery_removal_after_rejection() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake expected_snapshot
+    local first_status=0 second_status=0 first_query_status=0 final_query_status=0
+    local first_output second_output first_effects second_effects
+    local first_topology final_topology second_start hook_count policy_records
+    local failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/removal-retry-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+    expected_snapshot='{"output":"eDP-1","mode":"2880x1920@120","position":"0x0","scale":2,"transform":0,"mirror":""}'
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 3 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_HEADLESS_REMOVE_FAIL=1 \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/remove-rejected.out" 2>&1 || first_status=$?
+    first_output=$(<"$test_root/remove-rejected.out")
+    first_effects=$(<"$effect_log")
+    first_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/first-topology.err") || first_query_status=$?
+
+    if (( first_status != 3 )); then
+        printf 'persistent recovery-output removal rejection must fail status 3, got %d\n%s\n%s\n' \
+            "$first_status" "$first_output" "$first_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$first_output" \
+        'event=last_output_recovery_failed action=open internal_output=eDP-1 status=3 reason=recovery_output_remove_failed' \
+        'rejected recovery-output removal should retain its precise reason' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_output" 'event=reconciliation_succeeded' \
+        'rejected recovery-output removal must not report reconciliation success' \
+        || failures=$((failures + 1))
+    assert_contains "$first_effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'the first invocation should reach the rejected output-removal boundary' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects" $'post-layout-hook\t' \
+        'a failed removal must not run the post-layout hook' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects" $'monitor\toutput=DP-2' \
+        'a failed removal must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects" $'dpms\toutput=DP-2' \
+        'a failed removal must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$first_effects" $'systemctl\t' \
+        'a failed removal must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( first_query_status != 0 )) || ! jq -e '
+        type == "array" and length == 2 and
+        any(.[]; .name == "eDP-1") and
+        any(.[]; .name == "ARCH-LIDSWITCH-RECOVERY" and
+            .disabled == false and .dpmsStatus == true)
+    ' <<< "$first_topology" > /dev/null; then
+        printf 'rejected removal must retain the owned recovery output; query_status=%d\n%s\n%s\n' \
+            "$first_query_status" "$first_topology" \
+            "$(<"$test_root/first-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$snapshot_file" || \
+        "$(<"$snapshot_file")" != "$expected_snapshot" || \
+        "$(stat -c %a "$snapshot_file")" != 600 ]]; then
+        printf 'rejected removal did not retain the valid private layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -f "$ownership_marker" || \
+        "$(<"$ownership_marker")" != ARCH-LIDSWITCH-RECOVERY || \
+        "$(stat -c %a "$ownership_marker")" != 600 ]]; then
+        printf 'rejected removal did not retain its valid private ownership marker\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+
+    second_start=$(wc -l < "$effect_log")
+    "$TIMEOUT_BIN" 3 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/removal-retried.out" 2>&1 || second_status=$?
+    second_output=$(<"$test_root/removal-retried.out")
+    second_effects=$(sed -n "$((second_start + 1)),\$p" "$effect_log")
+    policy_records=$(grep -F 'policy_token=' \
+        "$test_root/removal-retried.out" || true)
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || final_query_status=$?
+
+    if (( second_status != 0 )); then
+        printf 'a later invocation must retry owned stale removal and converge, got %d\n%s\n%s\n' \
+            "$second_status" "$second_output" "$second_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$second_effects" \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        'the later invocation should retry removal of the owned stale output' \
+        || failures=$((failures + 1))
+    assert_contains "$second_output" 'event=reconciliation_succeeded' \
+        'the later invocation should report successful reconciliation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$policy_records" 'ARCH-LIDSWITCH-RECOVERY' \
+        'the retried stale output must be removed before any policy record' \
+        || failures=$((failures + 1))
+    assert_not_contains "$second_effects" $'monitor\toutput=DP-2' \
+        'removal retry must never mutate an external output' \
+        || failures=$((failures + 1))
+    assert_not_contains "$second_effects" $'dpms\toutput=DP-2' \
+        'removal retry must never change external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$second_effects" $'systemctl\t' \
+        'removal retry must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( final_query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and
+        .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" > /dev/null; then
+        printf 'removal retry must leave only enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$final_query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" || \
+        -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'successful removal retry retained recovery marker or layout snapshot\n' \
+            >&2
+        failures=$((failures + 1))
+    fi
+    hook_count=$(grep -Fc $'post-layout-hook\t' "$effect_log" || true)
+    if (( hook_count != 1 )); then
+        printf 'post-layout hook must run exactly once across failed removal and successful retry; got %d\n%s\n' \
+            "$hook_count" "$(<"$effect_log")" >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_recovers_after_one_recovery_removal_rejection() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake remove_counter
+    local runtime_status=0 query_status=0 output effects final_topology
+    local policy_records remove_count hook_count second_remove_line hook_line
+    local failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/remove-fail-once-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+    remove_counter="$test_root/remove-counter"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 4 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_HEADLESS_REMOVE_FAILURES=1 \
+        TEST_HYPRCTL_HEADLESS_REMOVE_COUNTER="$remove_counter" \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/remove-fail-once.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/remove-fail-once.out")
+    effects=$(<"$effect_log")
+    policy_records=$(grep -F 'policy_token=' \
+        "$test_root/remove-fail-once.out" || true)
+    remove_count=$(grep -Fxc \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" || true)
+    hook_count=$(grep -Fxc $'post-layout-hook\topen\tenabled\teDP-1' \
+        "$effect_log" || true)
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+
+    if (( runtime_status != 0 )); then
+        printf 'one rejected recovery-output removal should heal in-process, got %d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -r "$remove_counter" || "$(<"$remove_counter")" != 2 ]] || \
+        (( remove_count != 2 )); then
+        printf 'one rejection plus serialized cleanup must issue two removals; counter=%s effects=%d\n%s\n' \
+            "$([[ -r "$remove_counter" ]] && printf '%s' "$(<"$remove_counter")" || printf missing)" \
+            "$remove_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" \
+        'event=reconciliation_failed trigger=resume attempt=1 state=open status=3' \
+        'the rejected removal must fail the first serialized attempt' \
+        || failures=$((failures + 1))
+    assert_contains "$output" \
+        'event=reconciliation_succeeded trigger=resume attempt=2 state=open' \
+        'the same resume process must converge on its next serialized attempt' \
+        || failures=$((failures + 1))
+    assert_not_contains "$policy_records" ARCH-LIDSWITCH-RECOVERY \
+        'deferred cleanup must keep the temporary output out of policy records' \
+        || failures=$((failures + 1))
+    if (( hook_count != 1 )); then
+        printf 'healed recovery must run the optional post-layout hook exactly once; got %d\n%s\n' \
+            "$hook_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    second_remove_line=$(grep -Fn \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" | sed -n '2{s/:.*//;p}') || true
+    hook_line=$(grep -Fn $'post-layout-hook\topen\tenabled\teDP-1' \
+        "$effect_log" | sed -n '1{s/:.*//;p}') || true
+    if [[ -z "$second_remove_line" || -z "$hook_line" ]] || \
+        (( second_remove_line >= hook_line )); then
+        printf 'successful stale cleanup must precede the next completed reconciliation\n%s\n' \
+            "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'remove retry must never mutate an external layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'remove retry must never mutate external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'remove retry must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" >/dev/null; then
+        printf 'healed removal must leave only enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" || \
+        -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'healed removal retained recovery marker or layout snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
+installed_daemon_retries_recovery_dpms_before_delivering_hook() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
+    local monitor_fixture framework laptop_disabled installed_daemon state_file
+    local snapshot_file ownership_marker hook_fake dpms_counter
+    local runtime_status=0 query_status=0 output effects final_topology
+    local recovery_create_count recovery_remove_count internal_restore_count
+    local dpms_count hook_count recovery_remove_line last_dpms_line hook_line
+    local failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    runtime_dir="$test_root/runtime"
+    lid_root="$test_root/button/lid"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    framework=$(jq -c 'map(.dpmsStatus = true)' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+    laptop_disabled=$(jq -c '[.[] | select(.name == "eDP-1")
+        | .disabled = true | .dpmsStatus = true]' <<< "$framework")
+    state_file="$test_root/recovery-dpms-state.json"
+    snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
+    ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    hook_fake="$fake_bin/post-layout-hook"
+    dpms_counter="$test_root/recovery-dpms-counter"
+
+    mkdir -m 0700 -p "$home" "$runtime_dir"
+    create_lid_state_fixture "$lid_root" lid0
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$hook_fake"
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$framework" HYPR_LID_STATE_ROOT="$lid_root" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+    installed_daemon="$home/.config/hypr/scripts/lid-monitor.sh"
+
+    write_internal_layout_snapshot "$runtime_dir"
+    : > "$effect_log"
+    "$TIMEOUT_BIN" 4 "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" XDG_RUNTIME_DIR="$runtime_dir" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_RECOVERY_DPMS_FAILURES=1 \
+        TEST_HYPRCTL_RECOVERY_DPMS_COUNTER="$dpms_counter" \
+        ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
+        HYPR_LID_STATE_ROOT="$lid_root" \
+        "$installed_daemon" --resume-once \
+        > "$test_root/recovery-dpms.out" 2>&1 || runtime_status=$?
+    output=$(<"$test_root/recovery-dpms.out")
+    final_topology=$("$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
+        TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
+        "$fake_bin/hyprctl" -j monitors all \
+        2> "$test_root/final-topology.err") || query_status=$?
+    effects=$(<"$effect_log")
+    recovery_create_count=$(grep -Fxc \
+        $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" || true)
+    recovery_remove_count=$(grep -Fxc \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" || true)
+    internal_restore_count=$(grep -Fxc \
+        $'monitor\toutput=eDP-1\tdisabled=false\tmode=2880x1920@120\tposition=0x0\tscale=2\ttransform=0\tmirror=' \
+        "$effect_log" || true)
+    dpms_count=$(grep -Fxc $'dpms\toutput=eDP-1\tstate=on' \
+        "$effect_log" || true)
+    hook_count=$(grep -Fxc $'post-layout-hook\topen\tenabled\teDP-1' \
+        "$effect_log" || true)
+
+    if (( runtime_status != 0 )); then
+        printf 'one recovery DPMS rejection must heal in the same resume; status=%d\n%s\n%s\n' \
+            "$runtime_status" "$output" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ ! -r "$dpms_counter" || "$(<"$dpms_counter")" != 1 ]]; then
+        printf 'DPMS must be rejected exactly once while the recovery output is active; counter=%s\n%s\n' \
+            "$([[ -r "$dpms_counter" ]] && printf '%s' "$(<"$dpms_counter")" || printf missing)" \
+            "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$output" \
+        'event=reconciliation_failed trigger=resume attempt=1 state=open status=3' \
+        'the rejected recovery DPMS apply must fail attempt one' \
+        || failures=$((failures + 1))
+    assert_contains "$output" \
+        'event=reconciliation_succeeded trigger=resume attempt=2 state=open' \
+        'attempt two must verify the recovered layout and finish the same resume' \
+        || failures=$((failures + 1))
+    if (( recovery_create_count != 1 || recovery_remove_count != 1 || \
+        internal_restore_count != 2 )); then
+        printf 'the primary accepted-noop path must recover once and clean headless; create=%d remove=%d restores=%d\n%s\n' \
+            "$recovery_create_count" "$recovery_remove_count" \
+            "$internal_restore_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    if (( dpms_count != 2 )); then
+        printf 'expected successful pre-recovery and retry DPMS effects only; got %d\n%s\n' \
+            "$dpms_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    if (( hook_count != 1 )); then
+        printf 'verified retry must deliver the optional layout hook exactly once; got %d\n%s\n' \
+            "$hook_count" "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    last_dpms_line=$(grep -Fn $'dpms\toutput=eDP-1\tstate=on' \
+        "$effect_log" | sed -n '${s/:.*//;p}') || true
+    recovery_remove_line=$(grep -Fn \
+        $'hyprctl\toutput\tremove\tARCH-LIDSWITCH-RECOVERY' \
+        "$effect_log" | sed -n '1{s/:.*//;p}') || true
+    hook_line=$(grep -Fn $'post-layout-hook\topen\tenabled\teDP-1' \
+        "$effect_log" | sed -n '1{s/:.*//;p}') || true
+    if [[ -z "$last_dpms_line" || -z "$recovery_remove_line" || \
+        -z "$hook_line" ]] || (( recovery_remove_line >= last_dpms_line || \
+        last_dpms_line >= hook_line )); then
+        printf 'recovery cleanup and the successful DPMS retry must precede the deferred hook\n%s\n' \
+            "$effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$effects" $'monitor\toutput=DP-2' \
+        'recovery DPMS retry must never mutate an external layout' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'dpms\toutput=DP-2' \
+        'recovery DPMS retry must never mutate external output power' \
+        || failures=$((failures + 1))
+    assert_not_contains "$effects" $'systemctl\t' \
+        'recovery DPMS retry must never request a system power action' \
+        || failures=$((failures + 1))
+    if (( query_status != 0 )) || ! jq -e '
+        type == "array" and length == 1 and
+        .[0].name == "eDP-1" and .[0].disabled == false and
+        .[0].dpmsStatus == true
+    ' <<< "$final_topology" >/dev/null; then
+        printf 'DPMS retry must leave only enabled, awake eDP-1; query_status=%d\n%s\n%s\n' \
+            "$query_status" "$final_topology" \
+            "$(<"$test_root/final-topology.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$snapshot_file" || -L "$snapshot_file" || \
+        -e "$ownership_marker" || -L "$ownership_marker" ]]; then
+        printf 'successful DPMS retry retained recovery marker or layout snapshot\n' >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+)
+
 installed_daemon_rejects_transitional_enabled_external_layouts() (
     set -euo pipefail
 
@@ -8208,6 +11035,101 @@ run_test \
     'BUG-002-stability' \
     'daemon stabilizes resume generations before any display mutation' \
     installed_daemon_stabilizes_resume_generations
+
+run_test \
+    'BUG-002-closed-resume-dpms' \
+    'closed laptop-only resume restores and explicitly wakes the internal output' \
+    installed_daemon_wakes_internal_on_closed_laptop_only_resume
+
+run_test \
+    'BUG-002-closed-resume-post-action-dpms' \
+    'closed resume retries when its first daemon post-action sample is asleep' \
+    installed_daemon_retries_closed_resume_when_post_action_dpms_turns_off
+
+run_test \
+    'BUG-002-last-output-accepted-noop' \
+    'resume recovers when Hyprland accepts but does not apply the last-output enable' \
+    installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied
+
+run_test \
+    'BUG-002-last-awake-output-dpms-accepted-noop' \
+    'resume keeps its bootstrap awake until last-output DPMS is verified' \
+    installed_daemon_keeps_recovery_output_until_last_output_dpms_is_verified
+
+run_test \
+    'BUG-002-dry-run-recovery-state' \
+    'dry-run refuses pending owned recovery state without mutating it' \
+    installed_cli_dry_run_refuses_owned_recovery_state_without_mutation
+
+run_test \
+    'BUG-002-recovery-external-hotplug' \
+    'resume restabilizes before retrying when an external appears during recovery' \
+    installed_daemon_restabilizes_when_external_hotplugs_during_last_output_recovery
+
+run_test \
+    'BUG-002-recovery-generation-completeness' \
+    'resume revalidates inactive connectors and lid state before recovery mutation' \
+    installed_daemon_revalidates_complete_generation_before_recovery_mutation
+
+run_test \
+    'BUG-002-live-recovery-serialization' \
+    'a concurrent resume cannot reconcile another invocation live recovery output' \
+    installed_daemon_serializes_live_last_output_recovery
+
+run_test \
+    'BUG-002-last-output-create-rejection' \
+    'rejected headless recovery creation retains state and leaves no output behind' \
+    installed_daemon_retains_recovery_state_when_headless_create_is_rejected
+
+run_test \
+    'BUG-002-last-output-create-name-collision' \
+    'a server-side name collision remains foreign and is never removed' \
+    installed_daemon_preserves_foreign_recovery_output_after_create_collision
+
+run_test \
+    'BUG-002-partial-create-cleanup-failure' \
+    'failed cleanup supersedes a headless create error after output creation' \
+    installed_daemon_prioritizes_failed_cleanup_after_partial_headless_create
+
+run_test \
+    'BUG-002-recovery-accepted-noop-boundaries' \
+    'accepted but unapplied recovery mutations fail bounded with owned state intact' \
+    installed_daemon_rejects_accepted_noop_recovery_boundaries
+
+run_test \
+    'BUG-002-unowned-recovery-output' \
+    'resume rejects an unowned reserved output before policy or display mutation' \
+    installed_daemon_rejects_unowned_recovery_output_before_resume_policy
+
+run_test \
+    'BUG-002-invalid-recovery-markers' \
+    'resume rejects insecure recovery ownership markers before policy or mutation' \
+    installed_daemon_rejects_invalid_recovery_markers_before_resume_policy
+
+run_test \
+    'BUG-002-stale-owned-recovery-cleanup' \
+    'resume removes stale owned recovery state before policy reconciliation' \
+    installed_daemon_cleans_stale_owned_recovery_before_resume_policy
+
+run_test \
+    'BUG-002-delayed-owned-recovery-cleanup' \
+    'resume waits for and removes delayed owned recovery output publication' \
+    installed_daemon_cleans_delayed_owned_recovery_before_resume_policy
+
+run_test \
+    'BUG-002-recovery-output-remove-retry' \
+    'a rejected owned recovery removal is retained and retried safely' \
+    installed_daemon_retries_owned_recovery_removal_after_rejection
+
+run_test \
+    'BUG-002-recovery-output-remove-fail-once' \
+    'a one-time recovery removal rejection heals in the same resume process' \
+    installed_daemon_recovers_after_one_recovery_removal_rejection
+
+run_test \
+    'BUG-002-recovery-dpms-retry' \
+    'a one-time DPMS rejection during recovery retries before hook delivery' \
+    installed_daemon_retries_recovery_dpms_before_delivering_hook
 
 run_test \
     'BUG-002-signal-coalescing' \

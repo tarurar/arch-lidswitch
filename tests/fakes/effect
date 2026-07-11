@@ -81,6 +81,28 @@ configured_failure_pending() {
     (( failure_count < failure_limit ))
 }
 
+configured_recovery_dpms_failure_pending() {
+    local output=$1
+    local state_file
+
+    [[ "${TEST_HYPRCTL_RECOVERY_DPMS_FAILURES:-0}" != 0 ]] \
+        || return 1
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 1
+    fi
+    state_file=$(prepare_structured_monitor_state) || return 99
+    jq -e --arg output "$output" '
+        any(.[]; .name == "ARCH-LIDSWITCH-RECOVERY" and
+            .disabled == false) and
+        any(.[]; .name == $output and .disabled == false)
+    ' "$state_file" >/dev/null || return 1
+    configured_failure_pending \
+        "${TEST_HYPRCTL_RECOVERY_DPMS_FAILURES:-0}" \
+        "${TEST_HYPRCTL_RECOVERY_DPMS_COUNTER:-}" \
+        recovery-dpms
+}
+
 systemctl_state_directory() {
     printf '%s\n' "${TEST_SYSTEMCTL_STATE_DIR:-$TEST_EFFECT_LOG.systemctl-state}"
 }
@@ -344,6 +366,55 @@ apply_monitor_effect_to_structured_state() {
     mv -f "$temporary_state" "$state_file"
 }
 
+configured_last_output_restore_accepted_noop() {
+    local expression=$1
+    local property disabled state_file enabled_count
+
+    [[ "${TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP:-0}" == 1 ]] \
+        || return 1
+    [[ "${TEST_HYPRCTL_EVAL_OUTPUT:-ok}" == ok ]] || return 1
+    disabled=$(property_value "$expression" disabled) || return 1
+    [[ "$disabled" == false ]] || return 1
+    for property in mode position scale transform mirror; do
+        property_value "$expression" "$property" > /dev/null || return 1
+    done
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 1
+    fi
+    state_file=$(prepare_structured_monitor_state) || return 99
+    enabled_count=$(jq -er \
+        '[.[] | select(.disabled == false)] | length' "$state_file") \
+        || return 99
+    (( enabled_count == 0 ))
+}
+
+configured_recovery_internal_restore_accepted_noop() {
+    local expression=$1
+    local output disabled state_file
+
+    [[ "${TEST_HYPRCTL_RECOVERY_INTERNAL_RESTORE_ACCEPTED_NOOP:-0}" == 1 ]] \
+        || return 1
+    [[ "${TEST_HYPRCTL_EVAL_OUTPUT:-ok}" == ok ]] || return 1
+    output=$(property_value "$expression" output) || return 1
+    [[ "$output" != ARCH-LIDSWITCH-RECOVERY ]] || return 1
+    disabled=$(property_value "$expression" disabled) || return 1
+    [[ "$disabled" == false ]] || return 1
+    for property in mode position scale transform mirror; do
+        property_value "$expression" "$property" > /dev/null || return 1
+    done
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 1
+    fi
+    state_file=$(prepare_structured_monitor_state) || return 99
+    jq -e --arg output "$output" '
+        any(.[]; .name == "ARCH-LIDSWITCH-RECOVERY" and
+            .disabled == false) and
+        any(.[]; .name == $output and .disabled == true)
+    ' "$state_file" >/dev/null || return 1
+}
+
 apply_dpms_effect_to_structured_state() {
     local output=$1
     local state_file temporary_state
@@ -357,6 +428,258 @@ apply_dpms_effect_to_structured_state() {
     jq -c --arg output "$output" \
         'map(if .name == $output then .dpmsStatus = true else . end)' \
         "$state_file" > "$temporary_state" || return 99
+    mv -f "$temporary_state" "$state_file"
+}
+
+arm_post_child_dpms_off_observation() {
+    local output=$1
+    local phase_file=${TEST_HYPRCTL_POST_CHILD_DPMS_OFF_STATE_FILE:-}
+
+    [[ -n "$phase_file" ]] || return 0
+    [[ "$output" == "${TEST_HYPRCTL_POST_CHILD_DPMS_OFF_OUTPUT:-eDP-1}" ]] \
+        || return 0
+    if [[ ! -e "$phase_file" ]]; then
+        printf '%s\n' armed > "$phase_file"
+    fi
+}
+
+inject_post_child_dpms_off_observation() {
+    local phase_file=${TEST_HYPRCTL_POST_CHILD_DPMS_OFF_STATE_FILE:-}
+    local output=${TEST_HYPRCTL_POST_CHILD_DPMS_OFF_OUTPUT:-eDP-1}
+    local phase state_file temporary_state
+
+    [[ -n "$phase_file" ]] || return 0
+    [[ -r "$phase_file" ]] || return 0
+    read -r phase < "$phase_file"
+    case "$phase" in
+        armed)
+            # The child owns the first observation after its successful DPMS
+            # request and must still see the output awake.
+            printf '%s\n' child-verified > "$phase_file"
+            ;;
+        child-verified)
+            if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+                -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+                printf 'Post-child DPMS observation requires structured state\n' >&2
+                return 99
+            fi
+            state_file=$(prepare_structured_monitor_state) || return 99
+            temporary_state="$state_file.tmp"
+            jq -c --arg output "$output" '
+                map(if .name == $output then .dpmsStatus = false else . end)
+            ' "$state_file" > "$temporary_state" || return 99
+            mv -f "$temporary_state" "$state_file"
+            printf '%s\n' injected > "$phase_file"
+            printf 'monitor-observation-race\toutput=%s\tdpms=false\n' \
+                "$output" >> "$TEST_EFFECT_LOG"
+            ;;
+        injected)
+            ;;
+        *)
+            printf 'Invalid post-child DPMS observation phase: %s\n' \
+                "$phase" >&2
+            return 99
+            ;;
+    esac
+}
+
+configured_no_awake_output_dpms_accepted_noop() {
+    local state_file awake_output_count
+
+    [[ "${TEST_HYPRCTL_NO_AWAKE_OUTPUT_DPMS_ACCEPTED_NOOP:-0}" == 1 ]] \
+        || return 1
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 1
+    fi
+    state_file=$(prepare_structured_monitor_state) || return 99
+    awake_output_count=$(jq -er '
+        [.[] | select(.disabled == false and .dpmsStatus == true)] | length
+    ' "$state_file") || return 99
+    (( awake_output_count == 0 ))
+}
+
+create_headless_output_in_structured_state() {
+    local output=$1
+    local state_file temporary_state
+
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 0
+    fi
+    state_file=$(prepare_structured_monitor_state)
+    if jq -e --arg output "$output" \
+        'any(.[]; .name == $output)' "$state_file" >/dev/null; then
+        printf 'Fake headless output already exists: %s\n' "$output" >&2
+        return 99
+    fi
+    temporary_state="$state_file.tmp"
+    jq -c --arg output "$output" '. + [{
+        id: 999,
+        name: $output,
+        width: 1280,
+        height: 720,
+        refreshRate: 60,
+        x: 0,
+        y: 0,
+        scale: 1,
+        transform: 0,
+        disabled: false,
+        mirrorOf: "none",
+        dpmsStatus: true
+    }]' "$state_file" > "$temporary_state" || return 99
+    mv -f "$temporary_state" "$state_file"
+}
+
+publish_delayed_recovery_output_after_structured_query() {
+    local counter_file=${TEST_HYPRCTL_DELAYED_RECOVERY_PUBLICATION_COUNTER:-}
+    local publication_count=0
+
+    [[ -n "$counter_file" ]] || return 0
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        printf 'Delayed recovery publication requires structured state\n' >&2
+        return 99
+    fi
+    if [[ -r "$counter_file" ]]; then
+        read -r publication_count < "$counter_file"
+    fi
+    if [[ ! "$publication_count" =~ ^[0-9]+$ ]]; then
+        printf 'Invalid delayed recovery publication count: %s\n' \
+            "$publication_count" >&2
+        return 99
+    fi
+    if (( publication_count == 0 )); then
+        printf '%s\n' 1 > "$counter_file"
+        create_headless_output_in_structured_state \
+            ARCH-LIDSWITCH-RECOVERY || return $?
+    fi
+}
+
+hotplug_dp2_in_structured_state() {
+    local state_file temporary_state match_count
+
+    [[ "${TEST_HYPRCTL_HEADLESS_CREATE_HOTPLUG_DP2:-0}" == 1 ]] \
+        || return 0
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 0
+    fi
+    state_file=$(prepare_structured_monitor_state)
+    match_count=$(jq -er \
+        '[.[] | select(.name == "DP-2")] | length' "$state_file") \
+        || return 99
+    if (( match_count != 0 )); then
+        printf 'Fake DP-2 hotplug requires DP-2 to be absent\n' >&2
+        return 99
+    fi
+    temporary_state="$state_file.tmp"
+    jq -c '. + [{
+        id: 1,
+        name: "DP-2",
+        width: 3840,
+        height: 2160,
+        refreshRate: 59.997,
+        x: 1440,
+        y: -180,
+        scale: 1.25,
+        transform: 3,
+        disabled: false,
+        mirrorOf: "none",
+        dpmsStatus: true
+    }]' "$state_file" > "$temporary_state" || return 99
+    mv -f "$temporary_state" "$state_file"
+    printf 'external-hotplug\toutput=DP-2\tenabled=true\tdpms=true\n' \
+        >> "$TEST_EFFECT_LOG"
+}
+
+change_generation_at_headless_creation() {
+    local scenario=${TEST_HYPRCTL_HEADLESS_CREATE_GENERATION_CHANGE:-}
+    local lid_state_file state_file temporary_state match_count current_lid
+
+    case "$scenario" in
+        "")
+            return 0
+            ;;
+        inactive-dp3)
+            if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+                -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+                printf 'Inactive connector publication requires structured state\n' >&2
+                return 99
+            fi
+            state_file=$(prepare_structured_monitor_state)
+            match_count=$(jq -er \
+                '[.[] | select(.name == "DP-3")] | length' "$state_file") \
+                || return 99
+            if (( match_count == 1 )); then
+                return 0
+            fi
+            if (( match_count != 0 )); then
+                printf 'Fake DP-3 is not uniquely represented\n' >&2
+                return 99
+            fi
+            temporary_state="$state_file.tmp"
+            jq -c '. + [{
+                id: 2,
+                name: "DP-3",
+                disabled: true,
+                dpmsStatus: true
+            }]' "$state_file" > "$temporary_state" || return 99
+            mv -f "$temporary_state" "$state_file"
+            printf 'connector-represented\toutput=DP-3\tenabled=false\tdpms=true\n' \
+                >> "$TEST_EFFECT_LOG"
+            ;;
+        lid-closed)
+            lid_state_file=${TEST_HYPRCTL_HEADLESS_CREATE_LID_STATE_FILE:-}
+            if [[ "$lid_state_file" != /* || ! -f "$lid_state_file" || \
+                -L "$lid_state_file" ]]; then
+                printf 'Invalid headless-create lid state file\n' >&2
+                return 99
+            fi
+            current_lid=$(<"$lid_state_file")
+            case "$current_lid" in
+                'state: open')
+                    printf '%s\n' 'state: closed' > "$lid_state_file"
+                    printf 'lid-change\tstate=closed\n' >> "$TEST_EFFECT_LOG"
+                    ;;
+                'state: closed')
+                    ;;
+                *)
+                    printf 'Invalid configured lid state: %s\n' \
+                        "$current_lid" >&2
+                    return 99
+                    ;;
+            esac
+            ;;
+        *)
+            printf 'Unknown headless-create generation change: %s\n' \
+                "$scenario" >&2
+            return 99
+            ;;
+    esac
+}
+
+remove_headless_output_from_structured_state() {
+    local output=$1
+    local state_file temporary_state match_count
+
+    if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
+        -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
+        return 0
+    fi
+    state_file=$(prepare_structured_monitor_state)
+    match_count=$(jq -er --arg output "$output" \
+        '[.[] | select(.name == $output)] | length' "$state_file") \
+        || return 99
+    if (( match_count != 1 )); then
+        printf 'Fake headless output is not uniquely represented: %s\n' \
+            "$output" >&2
+        return 99
+    fi
+    temporary_state="$state_file.tmp"
+    jq -c --arg output "$output" \
+        '[.[] | select(.name != $output)]' "$state_file" \
+        > "$temporary_state" || return 99
     mv -f "$temporary_state" "$state_file"
 }
 
@@ -515,10 +838,77 @@ case "$command_name" in
                 exit 94
             elif [[ -n "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
                 structured_state_file=$(prepare_structured_monitor_state)
+                inject_post_child_dpms_off_observation || exit $?
                 cat "$structured_state_file"
+                publish_delayed_recovery_output_after_structured_query \
+                    || exit $?
             else
                 printf '%s\n' '[{"id":0,"name":"eDP-1","width":2880,"height":1920,"refreshRate":120,"x":0,"y":0,"scale":2,"transform":0,"disabled":false,"mirrorOf":"none"},{"id":1,"name":"DP-2","width":3840,"height":2160,"refreshRate":60,"x":1440,"y":0,"scale":1,"transform":0,"disabled":false,"mirrorOf":"none"}]'
             fi
+        elif [[ "${1:-}" == "output" && "${2:-}" == "create" && \
+            "${3:-}" == "headless" && $# == 4 && \
+            "${4:-}" == ARCH-LIDSWITCH-RECOVERY ]]; then
+            log_command "$@"
+            if [[ "${TEST_HYPRCTL_HEADLESS_CREATE_FOREIGN_COLLISION:-0}" == 1 ]]; then
+                create_headless_output_in_structured_state "$4" || exit $?
+                printf 'Name already taken\n'
+                exit 0
+            fi
+            if [[ "${TEST_HYPRCTL_HEADLESS_CREATE_FAIL:-0}" == 1 ]]; then
+                printf 'no backend replied\n'
+                exit 0
+            fi
+            if [[ "${TEST_HYPRCTL_HEADLESS_CREATE_ACCEPTED_NOOP:-0}" != 1 ]]; then
+                create_headless_output_in_structured_state "$4" || exit $?
+            fi
+            if [[ "${TEST_HYPRCTL_HEADLESS_CREATE_MUTATE_THEN_FAIL:-0}" == 1 ]]; then
+                printf 'Configured headless output post-create failure\n' >&2
+                exit 94
+            fi
+            hotplug_dp2_in_structured_state || exit $?
+            change_generation_at_headless_creation || exit $?
+            if [[ -n "${TEST_HYPRCTL_HEADLESS_CREATE_READY_FILE:-}" || \
+                -n "${TEST_HYPRCTL_HEADLESS_CREATE_RELEASE_FIFO:-}" ]]; then
+                if [[ -z "${TEST_HYPRCTL_HEADLESS_CREATE_READY_FILE:-}" || \
+                    -z "${TEST_HYPRCTL_HEADLESS_CREATE_RELEASE_FIFO:-}" || \
+                    ! -p "$TEST_HYPRCTL_HEADLESS_CREATE_RELEASE_FIFO" ]]; then
+                    printf 'Invalid configured headless create gate\n' >&2
+                    exit 99
+                fi
+                printf 'ready\n' \
+                    > "$TEST_HYPRCTL_HEADLESS_CREATE_READY_FILE"
+                gate=""
+                if ! IFS= read -r gate \
+                    < "$TEST_HYPRCTL_HEADLESS_CREATE_RELEASE_FIFO" || \
+                    [[ "$gate" != release ]]; then
+                    printf 'Invalid headless create gate release\n' >&2
+                    exit 99
+                fi
+            fi
+            printf 'ok\n'
+        elif [[ "${1:-}" == "output" && "${2:-}" == "remove" && \
+            "${3:-}" == ARCH-LIDSWITCH-RECOVERY && $# == 3 ]]; then
+            log_command "$@"
+            if configured_failure_pending \
+                "${TEST_HYPRCTL_HEADLESS_REMOVE_FAILURES:-0}" \
+                "${TEST_HYPRCTL_HEADLESS_REMOVE_COUNTER:-}" \
+                headless-remove; then
+                printf 'cannot remove a real display\n'
+                exit 0
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
+            fi
+            if [[ "${TEST_HYPRCTL_HEADLESS_REMOVE_FAIL:-0}" == 1 ]]; then
+                printf 'cannot remove a real display\n'
+                exit 0
+            fi
+            if [[ "${TEST_HYPRCTL_HEADLESS_REMOVE_ACCEPTED_NOOP:-0}" != 1 ]]; then
+                remove_headless_output_from_structured_state "$3" || exit $?
+            fi
+            printf 'ok\n'
         elif [[ "${1:-}" == "eval" && \
             "${2:-}" == assert\(type\(hl\)* ]]; then
             log_command "$@"
@@ -543,6 +933,16 @@ case "$command_name" in
                     "${2:-}" >&2
                 exit 96
             fi
+            if configured_recovery_dpms_failure_pending \
+                "$dpms_output"; then
+                printf 'Configured recovery DPMS rejection\n'
+                exit 0
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
+            fi
             printf 'dpms\toutput=%s\tstate=on\n' "$dpms_output" >> "$TEST_EFFECT_LOG"
             if configured_failure_pending \
                 "${TEST_HYPRCTL_DPMS_FAILURES:-0}" \
@@ -557,7 +957,18 @@ case "$command_name" in
             fi
             dpms_output_value=${TEST_HYPRCTL_DPMS_OUTPUT:-ok}
             if [[ "$dpms_output_value" == ok ]]; then
-                apply_dpms_effect_to_structured_state "$dpms_output" || exit $?
+                if configured_no_awake_output_dpms_accepted_noop; then
+                    :
+                else
+                    failure_status=$?
+                    if (( failure_status != 1 )); then
+                        exit "$failure_status"
+                    fi
+                    apply_dpms_effect_to_structured_state \
+                        "$dpms_output" || exit $?
+                    arm_post_child_dpms_off_observation \
+                        "$dpms_output" || exit $?
+                fi
             fi
             printf '%s\n' "$dpms_output_value"
         elif [[ "${1:-}" == "eval" ]]; then
@@ -579,7 +990,26 @@ case "$command_name" in
             IFS=';' read -r -a monitor_expressions <<< "${2:-}"
             for expression in "${monitor_expressions[@]}"; do
                 emit_monitor_effect "$expression"
-                if [[ "${TEST_HYPRCTL_EVAL_OUTPUT:-ok}" == ok ]]; then
+                monitor_accepted_noop=false
+                if configured_last_output_restore_accepted_noop "$expression"; then
+                    monitor_accepted_noop=true
+                else
+                    accepted_noop_status=$?
+                    if (( accepted_noop_status != 1 )); then
+                        exit "$accepted_noop_status"
+                    fi
+                    if configured_recovery_internal_restore_accepted_noop \
+                        "$expression"; then
+                        monitor_accepted_noop=true
+                    else
+                        accepted_noop_status=$?
+                        if (( accepted_noop_status != 1 )); then
+                            exit "$accepted_noop_status"
+                        fi
+                    fi
+                fi
+                if [[ "$monitor_accepted_noop" != true && \
+                    "${TEST_HYPRCTL_EVAL_OUTPUT:-ok}" == ok ]]; then
                     apply_monitor_effect_to_structured_state "$expression" || exit $?
                 fi
             done
