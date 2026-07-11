@@ -789,8 +789,20 @@ case "$command_name" in
             printf 'Configured staged unit verification failure\n' >&2
             exit 94
         fi
+        if [[ -n "${TEST_EXPECT_SYSTEMD_ANALYZE_RUNTIME_DIR:-}" && \
+            ( "${XDG_RUNTIME_DIR:-}" != \
+                "$TEST_EXPECT_SYSTEMD_ANALYZE_RUNTIME_DIR" || \
+              ! -d "$TEST_EXPECT_SYSTEMD_ANALYZE_RUNTIME_DIR" ) ]]; then
+            printf 'Unexpected staged unit verification runtime: expected=%s actual=%s\n' \
+                "$TEST_EXPECT_SYSTEMD_ANALYZE_RUNTIME_DIR" \
+                "${XDG_RUNTIME_DIR:-<unset>}" >&2
+            exit 98
+        fi
         if [[ "${SYSTEMD_UNIT_PATH:-}" != *: || \
-            -z "${XDG_RUNTIME_DIR:-}" || ! -d "$XDG_RUNTIME_DIR" || \
+            -z "${XDG_RUNTIME_DIR:-}" || \
+            "$XDG_RUNTIME_DIR" != /* || \
+            ! -d "$XDG_RUNTIME_DIR" || -L "$XDG_RUNTIME_DIR" || \
+            ! -O "$XDG_RUNTIME_DIR" || ! -w "$XDG_RUNTIME_DIR" || \
             "${1:-}" != --user || "${2:-}" != --generators=no || \
             "${3:-}" != --man=no || "${4:-}" != --recursive-errors=yes || \
             "${5:-}" != verify ]]; then

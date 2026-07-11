@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_BIN=$(command -v env)
+ENV_BIN="$ROOT_DIR/tests/fakes/environment"
 REAL_SLEEP_BIN=$(command -v sleep)
 TIMEOUT_BIN=$(command -v timeout)
 LUA_BIN=${LUA_BIN:-$(command -v lua)}
@@ -385,7 +385,7 @@ readme_documents_pinned_checked_install_and_sleep_warnings() (
     installation=$(sed -n '/^## Installation$/,/^## /p' <<< "$readme")
     manual_testing=$(sed -n '/^### Manual Testing$/,/^### /p' <<< "$readme")
 
-    assert_contains "$installation" "ARCH_LIDSWITCH_VERSION='v0.1.0'" \
+    assert_contains "$installation" "ARCH_LIDSWITCH_VERSION='v0.1.1'" \
         'installation docs should pin a concrete versioned release' \
         || failures=$((failures + 1))
     assert_contains "$installation" \
@@ -6282,6 +6282,65 @@ installer_validates_staged_systemd_units_before_mutation() (
     (( failures == 0 ))
 )
 
+installer_keeps_unit_verification_out_of_persistent_state() (
+    set -euo pipefail
+
+    local test_root home fake_bin safe_bin effect_log monitor_fixture
+    local long_component state_home runtime_dir manifest effects
+    local installer_status=0 failures=0
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    long_component=$(printf '%096d' 0)
+    state_home="$test_root/$long_component"
+    runtime_dir="$test_root/runtime"
+    manifest="$state_home/arch-lidswitch/current.manifest"
+    mkdir -m 0700 -p "$state_home" "$runtime_dir"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+    ln -s "$ROOT_DIR/tests/fakes/effect" "$fake_bin/mv"
+
+    if (( ${#state_home} <= 107 || ${#runtime_dir} >= 70 )); then
+        printf 'invalid long-state/short-runtime regression fixture\n' >&2
+        return 1
+    fi
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_STATE_HOME="$state_home" XDG_RUNTIME_DIR="$runtime_dir" \
+        WAYLAND_DISPLAY=wayland-test HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+        XDG_SESSION_TYPE=wayland TEST_EFFECT_LOG="$effect_log" \
+        TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_EXPECT_SYSTEMD_ANALYZE_RUNTIME_DIR="$runtime_dir" \
+        TEST_REAL_MV_BIN="$(command -v mv)" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1 || installer_status=$?
+
+    effects=$(<"$effect_log")
+    if (( installer_status != 0 )); then
+        printf 'installer coupled staged unit verification to persistent state, status=%d:\n%s\n' \
+            "$installer_status" "$(<"$test_root/installer.out")" >&2
+        return 1
+    fi
+    if [[ ! -s "$manifest" ]]; then
+        printf 'installer did not commit its manifest under the persistent state root\n' >&2
+        failures=$((failures + 1))
+    fi
+    assert_before "$effects" \
+        $'systemd-analyze\t--user\t--generators=no\t--man=no\t--recursive-errors=yes\tverify' \
+        $'mv-context\tinstall-lid-state' \
+        'staged unit verification should precede the first live publication' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+)
+
 installer_rejects_relative_xdg_state_home() (
     set -euo pipefail
 
@@ -8239,6 +8298,11 @@ run_test \
     'BUG-018-transaction-staged-unit-validation' \
     'staged target and services are verified before any live mutation' \
     installer_validates_staged_systemd_units_before_mutation
+
+run_test \
+    'BUG-018-transaction-staged-unit-runtime' \
+    'staged unit verification uses the short session runtime with long state paths' \
+    installer_keeps_unit_verification_out_of_persistent_state
 
 run_test \
     'BUG-018-transaction-relative-state-path' \

@@ -1,0 +1,31 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REAL_ENV_BIN=$(command -v env)
+
+home=""
+installer_invocation=false
+for argument in "$@"; do
+    case "$argument" in
+        HOME=*)
+            home=${argument#HOME=}
+            ;;
+        "$ROOT_DIR/install-hyprland-lid-switch.sh")
+            installer_invocation=true
+            ;;
+    esac
+done
+
+if [[ "${1:-}" == -i && "$installer_invocation" == true ]]; then
+    if [[ -z "$home" ]]; then
+        printf 'isolated installer test is missing HOME\n' >&2
+        exit 2
+    fi
+    runtime_dir="$home/.test-xdg-runtime"
+    mkdir -m 0700 -p "$runtime_dir"
+    exec "$REAL_ENV_BIN" -i XDG_RUNTIME_DIR="$runtime_dir" "${@:2}"
+fi
+
+exec "$REAL_ENV_BIN" "$@"

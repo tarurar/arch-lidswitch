@@ -3278,14 +3278,13 @@ render_config_candidate() {
 
 validate_staged_systemd_units() {
     local verify_dir="$transaction_dir/unit-verify"
-    local verify_runtime="$transaction_dir/unit-verify-runtime"
     local verify_target="$verify_dir/hyprland-session.target"
     local verify_main="$verify_dir/lid-monitor.service"
     local verify_resume="$verify_dir/lid-resume-monitor.service"
     local validation_output
 
-    if ! mkdir -p -- "$verify_dir" "$verify_runtime" || \
-        ! chmod 0700 -- "$verify_dir" "$verify_runtime" || \
+    if ! mkdir -p -- "$verify_dir" || \
+        ! chmod 0700 -- "$verify_dir" || \
         ! cp -- "$(artifact_stage_path session-target)" "$verify_target" || \
         ! cp -- "$(artifact_stage_path main-service)" "$verify_main" || \
         ! cp -- "$(artifact_stage_path resume-service)" "$verify_resume"; then
@@ -3303,7 +3302,6 @@ validate_staged_systemd_units() {
     fi
 
     if ! validation_output=$(SYSTEMD_UNIT_PATH="$verify_dir:" \
-        XDG_RUNTIME_DIR="$verify_runtime" \
         "$SYSTEMD_ANALYZE_BIN" --user --generators=no --man=no \
         --recursive-errors=yes verify \
         "$verify_target" "$verify_main" "$verify_resume" 2>&1); then

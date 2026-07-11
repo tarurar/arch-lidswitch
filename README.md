@@ -150,7 +150,7 @@ recoverable failure into a permanent blank session.
 
 1. **Confirm the pinned release**:
 
-   The commands below pin `v0.1.0`. Before continuing, confirm that this exact
+   The commands below pin `v0.1.1`. Before continuing, confirm that this exact
    version exists on the GitHub Releases page and is marked **Immutable**. If
    the release does not exist or is not immutable, stop rather than falling
    back to a branch or piping remote content into a shell.
@@ -166,7 +166,7 @@ recoverable failure into a permanent blank session.
    (
      set -euo pipefail
 
-     ARCH_LIDSWITCH_VERSION='v0.1.0'
+     ARCH_LIDSWITCH_VERSION='v0.1.1'
      download_dir=$(mktemp -d)
      trap 'rm -rf -- "$download_dir"' EXIT
      installer="$download_dir/install-hyprland-lid-switch.sh"
@@ -249,7 +249,7 @@ triggering ref and the commit whose installer was tested.
 The release workflow accepts only stable `vMAJOR.MINOR.PATCH` tags, reruns the
 full test suite, packages the exact generated installer with a one-entry
 `SHA256SUMS`, and publishes both assets from the verified remote tag. After all
-changes intended for the release are committed, publish `v0.1.0` by creating
+changes intended for the release are committed, publish `v0.1.1` by creating
 and pushing that tag; branch pushes never publish releases.
 
 ## What Gets Installed
