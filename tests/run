@@ -385,7 +385,7 @@ readme_documents_pinned_checked_install_and_sleep_warnings() (
     installation=$(sed -n '/^## Installation$/,/^## /p' <<< "$readme")
     manual_testing=$(sed -n '/^### Manual Testing$/,/^### /p' <<< "$readme")
 
-    assert_contains "$installation" "ARCH_LIDSWITCH_VERSION='v0.1.3'" \
+    assert_contains "$installation" "ARCH_LIDSWITCH_VERSION='v0.1.4'" \
         'installation docs should pin a concrete versioned release' \
         || failures=$((failures + 1))
     assert_contains "$installation" \
