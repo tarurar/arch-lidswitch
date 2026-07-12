@@ -4656,6 +4656,7 @@ installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied() 
     local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
     local monitor_fixture framework laptop_disabled installed_daemon state_file
     local snapshot_file ownership_marker hook_fake final_topology query_status=0
+    local overlap_observation
     local runtime_status=0 output effects effects_after_create recovery_window
     local hook_count failures=0
 
@@ -4675,6 +4676,7 @@ installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied() 
     state_file="$test_root/last-output-state.json"
     snapshot_file="$runtime_dir/arch-lidswitch/internal-layout.json"
     ownership_marker="$runtime_dir/arch-lidswitch/recovery-output"
+    overlap_observation="$test_root/recovery-overlap.jsonl"
     hook_fake="$fake_bin/post-layout-hook"
 
     mkdir -m 0700 -p "$home" "$runtime_dir"
@@ -4701,6 +4703,7 @@ installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied() 
         TEST_HYPRCTL_MONITORS_JSON="$laptop_disabled" \
         TEST_HYPRCTL_MONITORS_STATE_FILE="$state_file" \
         TEST_HYPRCTL_LAST_OUTPUT_RESTORE_ACCEPTED_NOOP=1 \
+        TEST_HYPRCTL_OVERLAP_OBSERVATION_FILE="$overlap_observation" \
         ARCH_LIDSWITCH_POST_LAYOUT_HOOK="$hook_fake" \
         HYPR_LID_STATE_ROOT="$lid_root" \
         "$installed_daemon" --resume-once \
@@ -4725,7 +4728,7 @@ installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied() 
         'resume should attempt the saved internal layout before recovery' \
         || failures=$((failures + 1))
     assert_before "$effects" \
-        $'monitor\toutput=ARCH-LIDSWITCH-RECOVERY\tdisabled=false' \
+        $'monitor\toutput=ARCH-LIDSWITCH-RECOVERY\tdisabled=false\tmode=1280x720@60\tposition=auto-right\tscale=1' \
         $'hyprctl\toutput\tcreate\theadless\tARCH-LIDSWITCH-RECOVERY' \
         'the bounded recovery rule must be installed before headless creation' \
         || failures=$((failures + 1))
@@ -4756,6 +4759,11 @@ installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied() 
     fi
     if [[ -e "$ownership_marker" || -L "$ownership_marker" ]]; then
         printf 'successful last-output recovery retained its ownership marker\n' >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -s "$overlap_observation" ]]; then
+        printf 'last-output recovery exposed overlapping enabled outputs:\n%s\n' \
+            "$(<"$overlap_observation")" >&2
         failures=$((failures + 1))
     fi
     hook_count=$(grep -Fxc $'post-layout-hook\topen\tenabled\teDP-1' \
@@ -11048,7 +11056,7 @@ run_test \
 
 run_test \
     'BUG-002-last-output-accepted-noop' \
-    'resume recovers when Hyprland accepts but does not apply the last-output enable' \
+    'resume recovers without overlap when the last-output enable is accepted-noop' \
     installed_daemon_recovers_when_last_output_enable_is_accepted_but_not_applied
 
 run_test \

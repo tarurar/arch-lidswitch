@@ -58,12 +58,15 @@ Hyprland can accept an internal-output restore while applying nothing when no
 output is currently active. After that exact accepted-but-unverified result,
 arch-lidswitch creates one private, named headless recovery output, waits for
 it to become active, retries only the saved internal-panel layout, verifies the
-panel, and removes the temporary output again. A private ownership marker and
-runtime lock make crash cleanup distinguishable from a live recovery. The
-runtime refuses to remove a same-named output without its valid marker and
-never targets a physical external output during recovery. Immediately before
-retrying the saved layout, it also revalidates the expected lid state and the
-complete represented non-recovery topology, including inactive connectors.
+panel, and removes the temporary output again. Hyprland automatically keeps the
+temporary output immediately to the right of the restored panel while both are
+active, so their logical layout rectangles never overlap during verification.
+A private ownership marker and runtime lock make crash cleanup distinguishable
+from a live recovery. The runtime refuses to remove a same-named output without
+its valid marker and never targets a physical external output during recovery.
+Immediately before retrying the saved layout, it also revalidates the expected
+lid state and the complete represented non-recovery topology, including
+inactive connectors.
 
 ## Requirements
 

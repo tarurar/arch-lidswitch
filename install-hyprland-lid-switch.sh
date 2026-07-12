@@ -1764,7 +1764,7 @@ monitor_state_restore_internal_layout_with_last_output_recovery() {
         marker_status=$?
         return "$marker_status"
     fi
-    recovery_rule="hl.monitor({ output = \"$LAST_OUTPUT_RECOVERY_NAME\", disabled = false, mode = \"1280x720@60\", position = \"0x0\", scale = 1 })"
+    recovery_rule="hl.monitor({ output = \"$LAST_OUTPUT_RECOVERY_NAME\", disabled = false, mode = \"1280x720@60\", position = \"auto-right\", scale = 1 })"
     if ! apply_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
         hyprctl eval "$recovery_rule"); then
         monitor_state_abort_last_output_recovery \

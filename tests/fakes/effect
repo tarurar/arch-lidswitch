@@ -332,6 +332,108 @@ structured_monitor_state_file() {
     printf '%s\n' "${TEST_HYPRCTL_MONITORS_STATE_FILE:-$TEST_EFFECT_LOG.monitors-state.json}"
 }
 
+structured_recovery_rule_file() {
+    local state_file=$1
+
+    printf '%s.recovery-rule.json\n' "$state_file"
+}
+
+remember_structured_recovery_rule() {
+    local expression=$1
+    local output mode position scale state_file rule_file placement
+    local width height refresh x y mode_dimensions
+
+    output=$(property_value "$expression" output) || return 0
+    [[ "$output" == ARCH-LIDSWITCH-RECOVERY ]] || return 0
+    mode=$(property_value "$expression" mode) || return 0
+    position=$(property_value "$expression" position) || return 0
+    scale=$(property_value "$expression" scale) || return 0
+    mode_dimensions=${mode%%@*}
+    width=${mode_dimensions%%x*}
+    height=${mode_dimensions#*x}
+    refresh=${mode#*@}
+    placement=explicit
+    if [[ "$position" == auto-right ]]; then
+        placement=auto-right
+        x=0
+        y=0
+    else
+        x=${position%%x*}
+        y=${position#*x}
+    fi
+    if [[ ! "$width" =~ ^[0-9]+$ || ! "$height" =~ ^[0-9]+$ ||
+        ! "$refresh" =~ ^[0-9]+([.][0-9]+)?$ ||
+        ! "$x" =~ ^-?[0-9]+$ || ! "$y" =~ ^-?[0-9]+$ ||
+        ! "$scale" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        printf 'Invalid structured recovery rule: %s\n' "$expression" >&2
+        return 99
+    fi
+    state_file=$(prepare_structured_monitor_state) || return 99
+    rule_file=$(structured_recovery_rule_file "$state_file")
+    jq -nc --argjson width "$width" --argjson height "$height" \
+        --argjson refresh "$refresh" --argjson x "$x" --argjson y "$y" \
+        --argjson scale "$scale" --arg placement "$placement" \
+        '{width: $width, height: $height, refreshRate: $refresh,
+            x: $x, y: $y, scale: $scale, placement: $placement}' \
+        > "$rule_file" || return 99
+}
+
+arrange_structured_auto_right_recovery() {
+    local state_file=$1
+    local rule_file temporary_state placement_status
+
+    rule_file=$(structured_recovery_rule_file "$state_file")
+    [[ -r "$rule_file" ]] || return 0
+    if jq -e '.placement == "auto-right"' "$rule_file" >/dev/null; then
+        :
+    else
+        placement_status=$?
+        (( placement_status == 1 )) && return 0
+        return "$placement_status"
+    fi
+    temporary_state="$state_file.tmp"
+    jq -c '
+        ([.[] | select(.name != "ARCH-LIDSWITCH-RECOVERY" and
+                .disabled == false) |
+            (.x + (.width / .scale))] | max // 0) as $right |
+        map(if .name == "ARCH-LIDSWITCH-RECOVERY" and
+                .disabled == false then
+            .x = $right | .y = 0
+        else . end)
+    ' "$state_file" > "$temporary_state" || return 99
+    mv -f "$temporary_state" "$state_file"
+}
+
+observe_configured_internal_recovery_overlap() {
+    local state_file=$1
+    local observation_file=${TEST_HYPRCTL_OVERLAP_OBSERVATION_FILE:-}
+    local overlap_status
+
+    [[ -n "$observation_file" ]] || return 0
+    jq -ce '
+        def enabled($name):
+            first(.[] | select(.name == $name and .disabled == false));
+        (enabled("eDP-1")) as $internal |
+        (enabled("ARCH-LIDSWITCH-RECOVERY")) as $recovery |
+        select(
+            ($internal.x < ($recovery.x +
+                ($recovery.width / $recovery.scale))) and
+            ($recovery.x < ($internal.x +
+                ($internal.width / $internal.scale))) and
+            ($internal.y < ($recovery.y +
+                ($recovery.height / $recovery.scale))) and
+            ($recovery.y < ($internal.y +
+                ($internal.height / $internal.scale)))) |
+        [$internal, $recovery] | map({
+            name, disabled, x, y, width, height, scale, dpmsStatus
+        })
+    ' "$state_file" >> "$observation_file" || {
+        overlap_status=$?
+        (( overlap_status == 4 )) && return 0
+        return "$overlap_status"
+    }
+}
+
 prepare_structured_monitor_state() {
     local state_file request_file requested_state previous_request=""
 
@@ -358,12 +460,15 @@ apply_monitor_effect_to_structured_state() {
     fi
     output=$(property_value "$expression" output) || return 0
     disabled=$(property_value "$expression" disabled) || return 0
+    remember_structured_recovery_rule "$expression" || return $?
     state_file=$(prepare_structured_monitor_state)
     temporary_state="$state_file.tmp"
     jq -c --arg output "$output" --argjson disabled "$disabled" \
         'map(if .name == $output then .disabled = $disabled else . end)' \
         "$state_file" > "$temporary_state" || return 99
     mv -f "$temporary_state" "$state_file"
+    arrange_structured_auto_right_recovery "$state_file" || return $?
+    observe_configured_internal_recovery_overlap "$state_file" || return $?
 }
 
 configured_last_output_restore_accepted_noop() {
@@ -501,7 +606,7 @@ configured_no_awake_output_dpms_accepted_noop() {
 
 create_headless_output_in_structured_state() {
     local output=$1
-    local state_file temporary_state
+    local state_file temporary_state rule_file recovery_rule
 
     if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" || \
         -z "${TEST_HYPRCTL_MONITORS_JSON+x}" ]]; then
@@ -514,21 +619,28 @@ create_headless_output_in_structured_state() {
         return 99
     fi
     temporary_state="$state_file.tmp"
-    jq -c --arg output "$output" '. + [{
+    rule_file=$(structured_recovery_rule_file "$state_file")
+    recovery_rule='{"width":1280,"height":720,"refreshRate":60,
+        "x":0,"y":0,"scale":1}'
+    if [[ -r "$rule_file" ]]; then
+        recovery_rule=$(<"$rule_file")
+    fi
+    jq -c --arg output "$output" --argjson rule "$recovery_rule" '. + [{
         id: 999,
         name: $output,
-        width: 1280,
-        height: 720,
-        refreshRate: 60,
-        x: 0,
-        y: 0,
-        scale: 1,
+        width: $rule.width,
+        height: $rule.height,
+        refreshRate: $rule.refreshRate,
+        x: $rule.x,
+        y: $rule.y,
+        scale: $rule.scale,
         transform: 0,
         disabled: false,
         mirrorOf: "none",
         dpmsStatus: true
     }]' "$state_file" > "$temporary_state" || return 99
     mv -f "$temporary_state" "$state_file"
+    arrange_structured_auto_right_recovery "$state_file" || return $?
 }
 
 publish_delayed_recovery_output_after_structured_query() {
