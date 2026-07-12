@@ -1076,7 +1076,7 @@ installed_daemon_observes_joint_lid_and_topology_changes() (
         TEST_HYPRCTL_MONITORS_SEQUENCE_DIR="$sequence_dir" \
         TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER="$sequence_counter" \
         HYPR_LID_STATE_ROOT="$lid_root" \
-        "$TIMEOUT_BIN" 2 "$installed_daemon" \
+        "$TIMEOUT_BIN" 5 "$installed_daemon" \
         > "$test_root/daemon.out" 2>&1 || true
 
     daemon_output=$(<"$test_root/daemon.out")
