@@ -2460,8 +2460,8 @@ installer_matches_fixture_expectation() (
                 return 1
             fi
             assert_contains "$effects" \
-                $'hyprctl\teval\tassert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")' \
-                'successful installation should prove the typed monitor and DPMS API contract' \
+                $'hyprctl\teval\tassert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function" and type(hl.dsp.force_renderer_reload) == "function", "required Hyprland Lua APIs unavailable")' \
+                'successful installation should prove the typed monitor, DPMS, and renderer API contract' \
                 || return 1
             assert_not_contains "$effects" $'monitor\t' \
                 'the Hyprland capability probe must not mutate monitor state' \
@@ -2831,10 +2831,10 @@ installer_rejects_non_array_hyprland_monitors() {
         'TEST_HYPRCTL_MONITORS_JSON={"name":"eDP-1"}'
 }
 
-installer_rejects_unavailable_hl_monitor_api() {
+installer_rejects_unavailable_required_lua_api() {
     installer_hyprland_profile_is_rejected \
-        'Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable' \
-        'TEST_HYPRCTL_CAPABILITY_EVAL_OUTPUT=error: hl.monitor unavailable'
+        'Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, hl.dsp.dpms, and hl.dsp.force_renderer_reload APIs are unavailable' \
+        'TEST_HYPRCTL_CAPABILITY_EVAL_OUTPUT=error: hl.dsp.force_renderer_reload unavailable'
 }
 
 installer_policy_profile_is_rejected() (
@@ -3959,7 +3959,7 @@ installed_daemon_separates_observed_applied_and_dpms_state() (
     local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
     local monitor_fixture sequence_dir sequence_counter framework disabled asleep
     local laptop_disabled laptop_awake installed_daemon output command_count
-    local apply_count started_count wake_intent_count lid_writer failures=0
+    local apply_count refresh_count started_count wake_intent_count lid_writer failures=0
     local -a sequence_values=()
     local sequence_index
 
@@ -4026,12 +4026,14 @@ installed_daemon_separates_observed_applied_and_dpms_state() (
         "$TIMEOUT_BIN" 2 "$installed_daemon" \
         > "$test_root/pending.out" 2>&1 || true
     output=$(<"$test_root/pending.out")
-    command_count=$(grep -Fc $'hyprctl\teval\t' "$effect_log" || true)
+    command_count=$(grep -Fc $'hyprctl\teval\thl.monitor(' \
+        "$effect_log" || true)
     apply_count=$(grep -Fxc \
         $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
-    if (( command_count != 4 || apply_count != 1 )); then
-        printf 'same-generation status-3 retries should issue four evals and apply once; got evals=%d applies=%d\n%s\n' \
-            "$command_count" "$apply_count" "$output" >&2
+    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
+    if (( command_count != 4 || apply_count != 1 || refresh_count != 1 )); then
+        printf 'same-generation status-3 retries should issue four monitor evals, apply once, and refresh once; got monitor-evals=%d applies=%d refreshes=%d\n%s\n' \
+            "$command_count" "$apply_count" "$refresh_count" "$output" >&2
         failures=$((failures + 1))
     fi
     assert_contains "$output" \
@@ -7952,7 +7954,8 @@ run_post_layout_hook_daemon_scenario() {
 
 post_layout_hook_runtime_contract() {
     local scenario_status scenario_output scenario_effects hook_record effects_prefix
-    local hook_count query_before failures=0
+    local effects_suffix hook_count refresh_count query_before query_after failures=0
+    local refresh_record=$'renderer-refresh'
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
@@ -7969,6 +7972,22 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" $'pkill\t' \
         'default close must not signal Waybar or another process' \
         || failures=$((failures + 1))
+    refresh_count=$(grep -Fxc "$refresh_record" "$effect_log" || true)
+    effects_prefix=${scenario_effects%%"$refresh_record"*}
+    effects_suffix=${scenario_effects#*"$refresh_record"}
+    query_before=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
+        <<< "$effects_prefix" || true)
+    query_after=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
+        <<< "$effects_suffix" || true)
+    if (( refresh_count != 1 || query_before != 1 || query_after != 1 )); then
+        printf 'accepted close compositor refresh ordering failed; refreshes=%d pre-refresh-queries=%d post-refresh-queries=%d\n%s\n%s\n' \
+            "$refresh_count" "$query_before" "$query_after" "$scenario_output" \
+            "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_before "$scenario_effects" $'sleep\t0.2' "$refresh_record" \
+        'close must let asynchronous layer teardown settle before refreshing' \
+        || failures=$((failures + 1))
 
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$disabled" "$framework"
@@ -7983,6 +8002,12 @@ post_layout_hook_runtime_contract() {
         || failures=$((failures + 1))
     assert_not_contains "$scenario_effects" $'pkill\t' \
         'default open must not signal Waybar or another process' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" "$refresh_record" \
+        'opening the internal output must not force an unrelated renderer reload' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" $'sleep\t0.2' \
+        'opening the internal output must not wait for close-only layer teardown' \
         || failures=$((failures + 1))
 
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
@@ -8000,6 +8025,9 @@ post_layout_hook_runtime_contract() {
             "$scenario_output" "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
+    assert_before "$scenario_effects" "$refresh_record" "$hook_record" \
+        'verified close must refresh compositor geometry before the user hook' \
+        || failures=$((failures + 1))
 
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$disabled" "$disabled"
@@ -8012,6 +8040,9 @@ post_layout_hook_runtime_contract() {
     fi
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a layout no-op must not run the post-layout hook' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" "$refresh_record" \
+        'a layout no-op must not refresh compositor geometry' \
         || failures=$((failures + 1))
 
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
@@ -8029,6 +8060,9 @@ post_layout_hook_runtime_contract() {
             "$scenario_output" "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
+    assert_not_contains "$scenario_effects" "$refresh_record" \
+        'verified open should deliver the user hook without a close-only refresh' \
+        || failures=$((failures + 1))
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" "$asleep" "$awake"
@@ -8044,6 +8078,9 @@ post_layout_hook_runtime_contract() {
         || failures=$((failures + 1))
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a DPMS-only transition must not run the post-layout hook' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" "$refresh_record" \
+        'a DPMS-only transition must not refresh compositor geometry' \
         || failures=$((failures + 1))
 
     rm -rf "$runtime_dir/arch-lidswitch"
@@ -8061,6 +8098,9 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a display apply failure must not run the post-layout hook' \
         || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" "$refresh_record" \
+        'a display apply failure must not refresh compositor geometry' \
+        || failures=$((failures + 1))
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
@@ -8075,6 +8115,32 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a display postcondition failure must not run the post-layout hook' \
         || failures=$((failures + 1))
+    refresh_count=$(grep -Fxc "$refresh_record" "$effect_log" || true)
+    if (( refresh_count != 1 )); then
+        printf 'an accepted close must refresh before a stale postcondition result; got %d\n%s\n%s\n' \
+            "$refresh_count" "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$disabled" "$disabled"
+    run_post_layout_hook_cli_scenario postcondition-retry close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+    if (( scenario_status != 0 )); then
+        printf 'postcondition retry failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=layout_noop action=close reason=internal_already_disabled' \
+        'retry should verify the already-applied close without another mutation' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" "$refresh_record" \
+        'retry must not duplicate the refresh already attempted after apply' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
+        'retry of an already-disabled close must not synthesize a mutation hook' \
+        || failures=$((failures + 1))
 
     (( failures == 0 ))
 }
@@ -8085,7 +8151,70 @@ installed_post_layout_hook_obeys_verified_mutation_contract() {
 
 post_layout_hook_advisory_contract() {
     local scenario_status scenario_output scenario_effects hook_record
-    local hook_count monitor_count attempt_count failures=0
+    local hook_count refresh_count monitor_count attempt_count failures=0
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario renderer-refresh-failure close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        TEST_HYPRCTL_RENDERER_RELOAD_FAILURES=1 \
+        "TEST_HYPRCTL_RENDERER_RELOAD_COUNTER=$test_root/renderer-reload-counter"
+    hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
+    if (( scenario_status != 0 || hook_count != 1 || refresh_count != 1 )); then
+        printf 'renderer refresh failure changed the advisory contract; status=%d hooks=%d refreshes=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$refresh_count" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=compositor_refresh_failed reason=command_failed action=close outcome=disabled internal_output=eDP-1 status=94' \
+        'a failed compositor refresh should be logged without failing reconciliation' \
+        || failures=$((failures + 1))
+    assert_before "$scenario_effects" $'renderer-refresh' "$hook_record" \
+        'a failed compositor refresh must not suppress the configured user hook' \
+        || failures=$((failures + 1))
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario renderer-refresh-unexpected close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        TEST_HYPRCTL_RENDERER_RELOAD_OUTPUT=unexpected
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
+    if (( scenario_status != 0 || hook_count != 1 || refresh_count != 1 )); then
+        printf 'unexpected renderer response changed the advisory contract; status=%d hooks=%d refreshes=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$refresh_count" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=compositor_refresh_failed reason=unexpected_response action=close outcome=disabled internal_output=eDP-1' \
+        'an unexpected renderer response should be logged without failing reconciliation' \
+        || failures=$((failures + 1))
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario renderer-refresh-timeout close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        TEST_HYPRCTL_RENDERER_RELOAD_DELAY_SECONDS=3 \
+        "TEST_REAL_SLEEP_BIN=$REAL_SLEEP_BIN"
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
+    if (( scenario_status != 0 || hook_count != 1 || refresh_count != 1 )); then
+        printf 'renderer timeout changed the advisory contract; status=%d hooks=%d refreshes=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$refresh_count" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=compositor_refresh_failed reason=command_failed action=close outcome=disabled internal_output=eDP-1 status=124' \
+        'a timed-out renderer refresh should be bounded and advisory' \
+        || failures=$((failures + 1))
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
@@ -8177,7 +8306,7 @@ post_layout_hook_advisory_contract() {
     (( failures == 0 ))
 }
 
-installed_post_layout_hook_failures_are_advisory() {
+installed_layout_refresh_failures_are_advisory() {
     with_installed_post_layout_hook_fixture post_layout_hook_advisory_contract
 }
 
@@ -8234,6 +8363,12 @@ installer_preserves_post_layout_hook_configuration_and_docs() (
     assert_contains "$readme_contents" \
         '~/.config/arch-lidswitch/environment' \
         'README should document the service environment file' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" 'hl.dsp.force_renderer_reload()' \
+        'README should document the process-agnostic compositor refresh' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" 'waits 200 milliseconds' \
+        'README should document the asynchronous layer settle window' \
         || failures=$((failures + 1))
     for stale_waybar_claim in SIGUSR1 SIGUSR2 'pkill -x' 'Waybar Layout Refresh'; do
         assert_not_contains "$readme_contents" "$stale_waybar_claim" \
@@ -10901,13 +11036,13 @@ run_test \
 
 run_test \
     'BUG-015-runtime-contract' \
-    'post-layout hook runs directly only after verified layout mutations' \
+    'verified docked close refreshes compositor before the post-layout hook' \
     installed_post_layout_hook_obeys_verified_mutation_contract
 
 run_test \
     'BUG-015-advisory-failures' \
-    'invalid, failed, and timed-out post-layout hooks remain advisory' \
-    installed_post_layout_hook_failures_are_advisory
+    'compositor refresh and post-layout hook failures remain advisory' \
+    installed_layout_refresh_failures_are_advisory
 
 run_test \
     'BUG-015-packaging-docs' \
@@ -11366,8 +11501,8 @@ run_test \
 
 run_test \
     'BUG-016-lua-capability' \
-    'installer rejects an unavailable hl.monitor Lua API' \
-    installer_rejects_unavailable_hl_monitor_api
+    'installer rejects an unavailable required Hyprland Lua API' \
+    installer_rejects_unavailable_required_lua_api
 
 run_test \
     'BUG-005-undocked-policy-conflict' \

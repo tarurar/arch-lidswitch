@@ -1038,6 +1038,27 @@ case "$command_name" in
             fi
             cat "$TEST_MONITORS_FIXTURE"
         elif [[ "${1:-}" == "eval" && \
+            "${2:-}" == 'hl.dispatch(hl.dsp.force_renderer_reload())' ]]; then
+            log_command "$@"
+            printf 'renderer-refresh\n' >> "$TEST_EFFECT_LOG"
+            if [[ -n "${TEST_HYPRCTL_RENDERER_RELOAD_DELAY_SECONDS:-}" ]]; then
+                "${TEST_REAL_SLEEP_BIN:?}" \
+                    "$TEST_HYPRCTL_RENDERER_RELOAD_DELAY_SECONDS"
+            fi
+            if configured_failure_pending \
+                "${TEST_HYPRCTL_RENDERER_RELOAD_FAILURES:-0}" \
+                "${TEST_HYPRCTL_RENDERER_RELOAD_COUNTER:-}" \
+                renderer-reload; then
+                printf 'Configured renderer reload failure\n' >&2
+                exit 94
+            else
+                failure_status=$?
+                if (( failure_status != 1 )); then
+                    exit "$failure_status"
+                fi
+            fi
+            printf '%s\n' "${TEST_HYPRCTL_RENDERER_RELOAD_OUTPUT:-ok}"
+        elif [[ "${1:-}" == "eval" && \
             "${2:-}" == 'hl.dispatch(hl.dsp.dpms({ action = "enable", monitor = "'* ]]; then
             log_command "$@"
             if ! dpms_output=$(property_value "${2:-}" monitor); then

@@ -324,12 +324,12 @@ check_hyprland_capabilities() {
     fi
 
     if ! lua_probe_output=$("$HYPRCTL_BIN" eval \
-        'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")'); then
-        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
+        'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function" and type(hl.dsp.force_renderer_reload) == "function", "required Hyprland Lua APIs unavailable")'); then
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, hl.dsp.dpms, and hl.dsp.force_renderer_reload APIs are unavailable"
         return 1
     fi
     if [[ "$lua_probe_output" != "ok" ]]; then
-        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, hl.dsp.dpms, and hl.dsp.force_renderer_reload APIs are unavailable"
         return 1
     fi
 
@@ -2002,6 +2002,35 @@ if [[ "$REQUIRE_DPMS" != true ]]; then
     REQUIRE_DPMS=false
 fi
 
+refresh_compositor_layout() {
+    local action=$1
+    local outcome=$2
+    local internal_output=$3
+    local refresh_output refresh_status
+
+    # Hyprland can finish moving and removing layer surfaces shortly after its
+    # monitor topology already reports the requested state. Let that teardown
+    # settle before forcing the compositor to rebuild output-local geometry.
+    sleep 0.2
+    if refresh_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
+        hyprctl eval 'hl.dispatch(hl.dsp.force_renderer_reload())'); then
+        if [[ "$refresh_output" == ok ]]; then
+            log_info compositor_refresh_succeeded action="$action" \
+                outcome="$outcome" internal_output="$internal_output"
+        else
+            log_error compositor_refresh_failed reason=unexpected_response \
+                action="$action" outcome="$outcome" \
+                internal_output="$internal_output"
+        fi
+    else
+        refresh_status=$?
+        log_error compositor_refresh_failed reason=command_failed \
+            action="$action" outcome="$outcome" \
+            internal_output="$internal_output" status="$refresh_status"
+    fi
+    return 0
+}
+
 run_post_layout_hook() {
     local action=$1
     local outcome=$2
@@ -2263,6 +2292,12 @@ reconcile_lid_state() {
                 mutation_reason=$MONITOR_STATE_ERROR
             fi
         fi
+    fi
+
+    if [[ "$layout_changed" == true && \
+        "$desired_internal" == disabled ]]; then
+        refresh_compositor_layout \
+            "$action" "$desired_internal" "$LAPTOP_DISPLAY"
     fi
 
     if ! monitor_state_observe_topology "$LAPTOP_DISPLAY"; then
