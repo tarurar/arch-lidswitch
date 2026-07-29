@@ -69,9 +69,10 @@ refresh_layer_client_unit() {
         return 0
     fi
 
-    # Hyprland can finish moving and removing layer surfaces shortly after its
-    # monitor topology already reports the requested state. Let that teardown
-    # settle before replacing the layer client and its output-local surfaces.
+    # Hyprland can finish adding, moving, and removing layer surfaces shortly
+    # after its monitor topology already reports the requested state. Let that
+    # transition settle before replacing the layer client and its output-local
+    # surfaces.
     sleep 0.2
     if timeout --kill-after=1s 2s \
         systemctl --user restart "$LAYER_REFRESH_UNIT"; then
@@ -350,8 +351,7 @@ reconcile_lid_state() {
         fi
     fi
 
-    if [[ "$layout_changed" == true && \
-        "$desired_internal" == disabled ]]; then
+    if [[ "$layout_changed" == true ]]; then
         refresh_layer_client_unit \
             "$action" "$desired_internal" "$LAPTOP_DISPLAY"
     fi

@@ -13,7 +13,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 🔁 **Session-Bound Startup**: Systemd user service starts after Hyprland is reachable and stops with the graphical session
 - 💤 **Single Power-Policy Owner**: Leaves every lid-triggered power decision to systemd-logind
 - 📐 **Display Geometry Preservation**: Restores the internal panel's captured mode, position, scale, transform, and mirror without rewriting external outputs
-- 🖼️ **Optional Layer-Client Refresh**: Replaces one configured active user service after an accepted docked-close output removal
+- 🖼️ **Optional Layer-Client Refresh**: Replaces one configured active user service after an accepted internal-display layout change
 - 🧩 **Optional Post-Layout Hook**: Runs one bounded user command after a verified internal-display layout change
 
 ## How It Works
@@ -34,6 +34,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Restores its exact mode, position, scale, transform, and mirror settings
 - Leaves the external monitor arrangement untouched
 - Does not attempt to restore workspace-to-monitor assignments
+- Optionally lets the layer-surface transition settle, then replaces one configured active layer-client service
 - Runs the optional post-layout hook once with the verified `enabled` outcome
 
 ### Lid Closed + No Enabled External Output
@@ -581,14 +582,14 @@ use the current script version. It configures monitors through Lua:
 hyprctl eval 'hl.monitor({ output = "eDP-1", disabled = true })'
 ```
 
-### Waybar Is Offset After Closing the Lid
+### Waybar Is Offset After Closing or Opening the Lid
 
 Some Hyprland versions can retain a layer surface's old global position after
-normalizing the remaining output to `0x0`. A compositor reload does not
-guarantee that an existing layer client will discard that stale origin. When
-Waybar is managed by a user service, configure the optional layer-client refresh
-below so the accepted docked-close mutation replaces that process and its layer
-surfaces.
+an internal output is removed or restored and another output's global origin
+changes. A compositor reload does not guarantee that an existing layer client
+will discard that stale origin. When Waybar is managed by a user service,
+configure the optional layer-client refresh below so each accepted
+internal-display layout mutation replaces that process and its layer surfaces.
 
 ## Customization
 
@@ -603,8 +604,8 @@ uninstaller never create, modify, or remove this file.
 
 ### Optional Layer-Client Refresh
 
-To replace a systemd-managed layer client after a docked close, add its user
-service name:
+To replace a systemd-managed layer client after an accepted internal-display
+layout change, add its user service name:
 
 ```text
 ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service
@@ -615,13 +616,14 @@ user service manager and never starts an inactive configured unit. The value
 must be a single `.service` unit name; it is passed directly to `systemctl`
 without shell evaluation.
 
-After Hyprland accepts an internal-output removal, arch-lidswitch checks the
-unit, waits 200 milliseconds for asynchronous layer teardown, and restarts the
-unit before querying the monitor postcondition. It does not inspect or restart
-the unit for an open, a layout no-op, a DPMS-only wake, or a rejected display
-mutation. The check and restart are each limited to two seconds, with a
-one-second forced-termination grace period. An invalid name, inactive unit,
-failure, or timeout is logged but does not fail or retry display reconciliation.
+After Hyprland accepts an internal-output removal or restoration,
+arch-lidswitch checks the unit, waits 200 milliseconds for the asynchronous
+layer-surface transition, and restarts the unit before querying the monitor
+postcondition. It does not inspect or restart the unit for a layout no-op, a
+DPMS-only wake, or a rejected display mutation. The check and restart are each
+limited to two seconds, with a one-second forced-termination grace period. An
+invalid name, inactive unit, failure, or timeout is logged but does not fail or
+retry display reconciliation.
 
 Apply an environment-file change by restarting the main service:
 
@@ -648,7 +650,7 @@ ACTION OUTCOME INTERNAL_OUTPUT
 
 For example, a docked close supplies `close disabled eDP-1`; reopening supplies
 `open enabled eDP-1`. Invocation occurs exactly once after the saved layout
-transition and its monitor postconditions. On a configured docked close, the
+transition and its monitor postconditions. On a configured layout change, the
 layer-client restart occurs before that postcondition and therefore before the
 hook. A stale postcondition does not defer or duplicate the restart, but it
 prevents the hook because the layout was not verified. No restart or hook runs

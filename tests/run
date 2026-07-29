@@ -8030,6 +8030,64 @@ installed_cli_replaces_configured_layer_unit_after_normalized_close() {
         layer_refresh_unit_restarts_after_normalized_close
 }
 
+layer_refresh_unit_restarts_after_origin_restoring_open() {
+    local systemctl_state_dir="$test_root/open-layer-refresh-systemd"
+    local normalized_external invocation_before invocation_after failures=0
+
+    normalized_external=$(jq -c 'map(
+        if .name == "eDP-1" then
+            .disabled = true | .dpmsStatus = false
+        elif .name == "DP-2" then
+            .x = 0 | .y = 0
+        else .
+        end
+    )' <<< "$framework")
+
+    activate_test_user_unit "$systemctl_state_dir" waybar.service
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$normalized_external"
+    run_post_layout_hook_cli_scenario open-refresh-setup close \
+        ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    if (( scenario_status != 0 )); then
+        printf 'origin-restoring open setup failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        return 1
+    fi
+    invocation_before=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
+
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$normalized_external" "$framework"
+    run_post_layout_hook_cli_scenario origin-restoring-open open \
+        ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
+
+    if (( scenario_status != 0 )); then
+        printf 'origin-restoring open failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -z "$invocation_before" || -z "$invocation_after" || \
+        "$invocation_before" == "$invocation_after" ]]; then
+        printf 'configured layer refresh unit was not replaced after the external origin was restored from x=0 to x=1440; before=%s after=%s\n%s\n%s\n' \
+            "${invocation_before:-<missing>}" "${invocation_after:-<missing>}" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+}
+
+installed_cli_replaces_configured_layer_unit_after_origin_restoring_open() {
+    with_installed_post_layout_hook_fixture \
+        layer_refresh_unit_restarts_after_origin_restoring_open
+}
+
 unconfigured_normalized_close_avoids_legacy_renderer_refresh() {
     local normalized_external failures=0
 
@@ -8179,26 +8237,32 @@ post_layout_hook_runtime_contract() {
         "$systemctl_state_dir" "$refresh_unit")
     hook_record="$hook_name"$'\topen\tenabled\teDP-1'
     hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    restart_count=$(grep -Fxc "$restart_record" <<< "$scenario_effects" || true)
     effects_prefix=${scenario_effects%%"$hook_record"*}
     query_before=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
         <<< "$effects_prefix" || true)
-    if (( scenario_status != 0 || hook_count != 1 || query_before != 2 )); then
-        printf 'verified open hook contract failed; status=%d hooks=%d pre-hook-queries=%d\n%s\n%s\n' \
-            "$scenario_status" "$hook_count" "$query_before" \
+    if (( scenario_status != 0 || hook_count != 1 || restart_count != 1 || \
+        query_before != 2 )) || [[ -z "$invocation_before" || \
+        -z "$invocation_after" || "$invocation_before" == "$invocation_after" ]]; then
+        printf 'verified open refresh contract failed; status=%d hooks=%d restarts=%d pre-hook-queries=%d before=%s after=%s\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$restart_count" "$query_before" \
+            "${invocation_before:-<missing>}" "${invocation_after:-<missing>}" \
             "$scenario_output" "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
-    assert_not_contains "$scenario_effects" $'systemctl\t' \
-        'verified open must not inspect or replace the close-only layer client' \
+    assert_contains "$scenario_output" \
+        'event=layer_refresh_unit_succeeded action=open outcome=enabled internal_output=eDP-1 unit=waybar.service' \
+        'a configured active layer client should report its replacement on open' \
         || failures=$((failures + 1))
-    assert_not_contains "$scenario_effects" $'sleep\t0.2' \
-        'verified open must not wait for close-only layer teardown' \
+    assert_before "$scenario_effects" "$active_record" $'sleep\t0.2' \
+        'open must verify the configured unit before the settle window' \
         || failures=$((failures + 1))
-    if [[ "$invocation_before" != "$invocation_after" ]]; then
-        printf 'verified open replaced the layer client; before=%s after=%s\n%s\n' \
-            "$invocation_before" "$invocation_after" "$scenario_effects" >&2
-        failures=$((failures + 1))
-    fi
+    assert_before "$scenario_effects" $'sleep\t0.2' "$restart_record" \
+        'open must let the layer-surface transition settle before replacement' \
+        || failures=$((failures + 1))
+    assert_before "$scenario_effects" "$restart_record" "$hook_record" \
+        'verified open must replace the layer client before the user hook' \
+        || failures=$((failures + 1))
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" "$asleep" "$awake"
@@ -8639,6 +8703,9 @@ installer_preserves_post_layout_hook_configuration_and_docs() (
         || failures=$((failures + 1))
     assert_contains "$readme_contents" 'waits 200 milliseconds' \
         'README should document the asynchronous layer settle window' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" 'removal or restoration' \
+        'README should document layer-client replacement for close and open' \
         || failures=$((failures + 1))
     for stale_waybar_claim in \
         SIGUSR1 SIGUSR2 'pkill -x' 'Waybar Layout Refresh' \
@@ -11308,13 +11375,18 @@ run_test \
 
 run_test \
     'BUG-015-runtime-contract' \
-    'verified docked close replaces the layer client before the post-layout hook' \
+    'verified layout changes replace the layer client before the post-layout hook' \
     installed_post_layout_hook_obeys_verified_mutation_contract
 
 run_test \
     'BUG-015-stale-layer-origin' \
     'normalized docked close replaces the configured layer client unit' \
     installed_cli_replaces_configured_layer_unit_after_normalized_close
+
+run_test \
+    'BUG-015-restored-layer-origin' \
+    'restored internal output replaces the configured layer client unit' \
+    installed_cli_replaces_configured_layer_unit_after_origin_restoring_open
 
 run_test \
     'BUG-015-obsolete-renderer-refresh' \
