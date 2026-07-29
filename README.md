@@ -13,7 +13,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - 🔁 **Session-Bound Startup**: Systemd user service starts after Hyprland is reachable and stops with the graphical session
 - 💤 **Single Power-Policy Owner**: Leaves every lid-triggered power decision to systemd-logind
 - 📐 **Display Geometry Preservation**: Restores the internal panel's captured mode, position, scale, transform, and mirror without rewriting external outputs
-- 🖼️ **Layer Geometry Refresh**: Refreshes Hyprland's compositor geometry after an accepted docked-close output removal
+- 🖼️ **Optional Layer-Client Refresh**: Replaces one configured active user service after an accepted docked-close output removal
 - 🧩 **Optional Post-Layout Hook**: Runs one bounded user command after a verified internal-display layout change
 
 ## How It Works
@@ -25,7 +25,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - Disables laptop internal display
 - Leaves every external monitor's mode, position, scale, transform, and mirror untouched
 - Leaves workspace migration and window placement to Hyprland
-- Lets asynchronous layer teardown settle, then refreshes Hyprland's compositor geometry
+- Optionally lets asynchronous layer teardown settle, then replaces one configured active layer-client service
 - Runs the optional post-layout hook once with the verified `disabled` outcome
 
 ### Lid Opened
@@ -78,7 +78,7 @@ inactive connectors.
 - **Session**: Wayland session
 - **Tools**: `hyprctl`, `jq`, Lua's `luac`, util-linux `flock`, GNU diffutils `cmp`, and GNU coreutils 9.11 or newer (`mv`, `sha256sum`, `stat`, `stdbuf`, and `timeout`); transactional publication requires `mv --exchange --no-copy` and `mv --update=none-fail --no-copy`
 - **System manager**: systemd 257 or newer with `systemd-analyze`; the resume listener uses typed `busctl wait` output
-- **Lua APIs**: `hl.monitor`, `hl.dispatch`, `hl.dsp.dpms`, and `hl.dsp.force_renderer_reload`; the installer probes all four without changing display state
+- **Lua APIs**: `hl.monitor`, `hl.dispatch`, and `hl.dsp.dpms`; the installer probes all three without changing display state
 - **Instances**: Exactly one running Hyprland instance matching `HYPRLAND_INSTANCE_SIGNATURE` and the active Wayland socket; automatic instance selection is not supported
 - **Power policy**: systemd-logind with `HandleLidSwitch=suspend`, `HandleLidSwitchDocked=ignore`, and no low-level `handle-lid-switch` inhibitor
 - **Power capability**: login1 must report `CanSuspend=yes`; hibernation and swap/resume configuration are not required because this project never requests hibernation
@@ -497,7 +497,7 @@ the identifier `arch-lidswitch`; it does not create separate log files in
 
 3. **Check the required Lua display APIs without changing the layout**:
    ```bash
-   hyprctl eval 'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function" and type(hl.dsp.force_renderer_reload) == "function", "required Hyprland Lua APIs unavailable")'
+   hyprctl eval 'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")'
    ```
 
    A compatible compositor prints exactly `ok`. The installer runs this
@@ -584,46 +584,63 @@ hyprctl eval 'hl.monitor({ output = "eDP-1", disabled = true })'
 ### Waybar Is Offset After Closing the Lid
 
 Some Hyprland versions can retain a layer surface's old global position after
-normalizing the remaining output to `0x0`. After Hyprland accepts a docked-close
-internal-output removal, arch-lidswitch waits 200 milliseconds for asynchronous
-layer teardown, then invokes Hyprland's `hl.dsp.force_renderer_reload()` before
-querying the monitor postcondition. This makes the compositor rebuild
-output-local layer geometry without inspecting, signaling, hiding, reloading,
-or restarting Waybar. A stale immediate postcondition can therefore be retried
-without losing the refresh attached to the accepted layout mutation.
-
-If a bar still needs client-specific integration, configure the optional
-post-layout hook below with a refresh command supported by that bar and its
-current configuration.
+normalizing the remaining output to `0x0`. A compositor reload does not
+guarantee that an existing layer client will discard that stale origin. When
+Waybar is managed by a user service, configure the optional layer-client refresh
+below so the accepted docked-close mutation replaces that process and its layer
+surfaces.
 
 ## Customization
 
-### Optional Post-Layout Hook
-
-The built-in docked-close compositor refresh is process-agnostic. To run
-additional client-specific integration after any successful internal-display
-layout change, create this user-owned environment file:
+Both optional integrations use this user-owned environment file:
 
 ```text
 ~/.config/arch-lidswitch/environment
 ```
 
-Set one absolute executable path in it; environment-file values do not expand
-shell variables:
+Environment-file values do not expand shell variables. The installer and
+uninstaller never create, modify, or remove this file.
+
+### Optional Layer-Client Refresh
+
+To replace a systemd-managed layer client after a docked close, add its user
+service name:
 
 ```text
-ARCH_LIDSWITCH_POST_LAYOUT_HOOK=/home/your-user/.local/bin/refresh-layout
+ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service
 ```
 
-Then restart the main service:
+The configured unit must already be active. arch-lidswitch checks it with the
+user service manager and never starts an inactive configured unit. The value
+must be a single `.service` unit name; it is passed directly to `systemctl`
+without shell evaluation.
+
+After Hyprland accepts an internal-output removal, arch-lidswitch checks the
+unit, waits 200 milliseconds for asynchronous layer teardown, and restarts the
+unit before querying the monitor postcondition. It does not inspect or restart
+the unit for an open, a layout no-op, a DPMS-only wake, or a rejected display
+mutation. The check and restart are each limited to two seconds, with a
+one-second forced-termination grace period. An invalid name, inactive unit,
+failure, or timeout is logged but does not fail or retry display reconciliation.
+
+Apply an environment-file change by restarting the main service:
 
 ```bash
 systemctl --user restart lid-monitor.service
 ```
 
-The installer and uninstaller never create, modify, or remove this environment
-file. The configured path must be absolute, regular, and executable. The hook is
-invoked directly, without shell evaluation, with exactly three arguments:
+### Optional Post-Layout Hook
+
+To run additional user-specific integration after any successful
+internal-display layout change, add one absolute executable path:
+
+```text
+ARCH_LIDSWITCH_POST_LAYOUT_HOOK=/home/your-user/.local/bin/refresh-layout
+```
+
+Then restart the main service as shown above. The configured path must be
+absolute, regular, and executable. The hook is invoked directly, without shell
+evaluation, with exactly three arguments:
 
 ```text
 ACTION OUTCOME INTERNAL_OUTPUT
@@ -631,13 +648,14 @@ ACTION OUTCOME INTERNAL_OUTPUT
 
 For example, a docked close supplies `close disabled eDP-1`; reopening supplies
 `open enabled eDP-1`. Invocation occurs exactly once after the saved layout
-transition and its monitor postconditions; on a docked close it follows the
-built-in compositor refresh. The close refresh runs immediately after Hyprland
-accepts the mutation, so a later stale postcondition does not defer or duplicate
-it. No refresh or hook runs for an ordinary no-op or a DPMS-only wake. Hook
-runtime is limited to two seconds, with a one-second forced-termination grace
-period. Invalid hooks, refresh failures, hook failures, and hook timeouts are
-logged but advisory: they do not fail or retry display reconciliation.
+transition and its monitor postconditions. On a configured docked close, the
+layer-client restart occurs before that postcondition and therefore before the
+hook. A stale postcondition does not defer or duplicate the restart, but it
+prevents the hook because the layout was not verified. No restart or hook runs
+for an ordinary no-op or a DPMS-only wake. Hook runtime is limited to two
+seconds, with a one-second forced-termination grace period. Invalid hooks, layer
+refresh failures, hook failures, and hook timeouts are logged but advisory: they
+do not fail or retry display reconciliation.
 
 ### Workspace Assignment Scope
 

@@ -2460,8 +2460,11 @@ installer_matches_fixture_expectation() (
                 return 1
             fi
             assert_contains "$effects" \
-                $'hyprctl\teval\tassert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function" and type(hl.dsp.force_renderer_reload) == "function", "required Hyprland Lua APIs unavailable")' \
-                'successful installation should prove the typed monitor, DPMS, and renderer API contract' \
+                $'hyprctl\teval\tassert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")' \
+                'successful installation should prove only the Lua APIs used by the runtime' \
+                || return 1
+            assert_not_contains "$effects" 'force_renderer_reload' \
+                'installation must not require the obsolete renderer refresh API' \
                 || return 1
             assert_not_contains "$effects" $'monitor\t' \
                 'the Hyprland capability probe must not mutate monitor state' \
@@ -2833,8 +2836,8 @@ installer_rejects_non_array_hyprland_monitors() {
 
 installer_rejects_unavailable_required_lua_api() {
     installer_hyprland_profile_is_rejected \
-        'Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, hl.dsp.dpms, and hl.dsp.force_renderer_reload APIs are unavailable' \
-        'TEST_HYPRCTL_CAPABILITY_EVAL_OUTPUT=error: hl.dsp.force_renderer_reload unavailable'
+        'Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable' \
+        'TEST_HYPRCTL_CAPABILITY_EVAL_OUTPUT=error: hl.monitor unavailable'
 }
 
 installer_policy_profile_is_rejected() (
@@ -3959,7 +3962,7 @@ installed_daemon_separates_observed_applied_and_dpms_state() (
     local test_root home fake_bin safe_bin effect_log runtime_dir lid_root
     local monitor_fixture sequence_dir sequence_counter framework disabled asleep
     local laptop_disabled laptop_awake installed_daemon output command_count
-    local apply_count refresh_count started_count wake_intent_count lid_writer failures=0
+    local apply_count started_count wake_intent_count lid_writer failures=0
     local -a sequence_values=()
     local sequence_index
 
@@ -4030,12 +4033,14 @@ installed_daemon_separates_observed_applied_and_dpms_state() (
         "$effect_log" || true)
     apply_count=$(grep -Fxc \
         $'monitor\toutput=eDP-1\tdisabled=true' "$effect_log" || true)
-    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
-    if (( command_count != 4 || apply_count != 1 || refresh_count != 1 )); then
-        printf 'same-generation status-3 retries should issue four monitor evals, apply once, and refresh once; got monitor-evals=%d applies=%d refreshes=%d\n%s\n' \
-            "$command_count" "$apply_count" "$refresh_count" "$output" >&2
+    if (( command_count != 4 || apply_count != 1 )); then
+        printf 'same-generation status-3 retries should issue four monitor evals and apply once; got monitor-evals=%d applies=%d\n%s\n' \
+            "$command_count" "$apply_count" "$output" >&2
         failures=$((failures + 1))
     fi
+    assert_not_contains "$(<"$effect_log")" $'renderer-refresh' \
+        'unconfigured daemon recovery must not invoke the obsolete renderer refresh' \
+        || failures=$((failures + 1))
     assert_contains "$output" \
         'event=reconciliation_cooldown_started ticks=5 reason=mutation_rejected' \
         'three status-3 failures should arm a five-tick cooldown' \
@@ -7952,10 +7957,128 @@ run_post_layout_hook_daemon_scenario() {
     scenario_effects=$(<"$effect_log")
 }
 
+observed_user_unit_invocation() {
+    local systemctl_state_dir=$1
+    local unit=$2
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_SYSTEMCTL_STATE_DIR="$systemctl_state_dir" \
+        "$fake_bin/systemctl" --user show --no-pager \
+        --property=LoadState --property=ActiveState \
+        --property=SubState --property=MainPID \
+        --property=InvocationID "$unit" \
+        | awk -F= '$1 == "InvocationID" { print $2 }'
+}
+
+activate_test_user_unit() {
+    local systemctl_state_dir=$1
+    local unit=$2
+
+    "$ENV_BIN" -i \
+        HOME="$home" PATH="$fake_bin:$safe_bin" \
+        TEST_EFFECT_LOG="$effect_log" \
+        TEST_SYSTEMCTL_STATE_DIR="$systemctl_state_dir" \
+        "$fake_bin/systemctl" --user restart "$unit"
+}
+
+layer_refresh_unit_restarts_after_normalized_close() {
+    local systemctl_state_dir="$test_root/layer-refresh-systemd"
+    local normalized_external invocation_before invocation_after failures=0
+
+    normalized_external=$(jq -c 'map(
+        if .name == "eDP-1" then
+            .disabled = true | .dpmsStatus = false
+        elif .name == "DP-2" then
+            .x = 0 | .y = 0
+        else .
+        end
+    )' <<< "$framework")
+
+    activate_test_user_unit "$systemctl_state_dir" waybar.service
+    invocation_before=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$normalized_external"
+    run_post_layout_hook_cli_scenario normalized-close close \
+        ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
+
+    if (( scenario_status != 0 )); then
+        printf 'normalized close failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -z "$invocation_before" || -z "$invocation_after" || \
+        "$invocation_before" == "$invocation_after" ]]; then
+        printf 'configured layer refresh unit was not replaced after external origin normalized from x=1440 to x=0; before=%s after=%s\n%s\n%s\n' \
+            "${invocation_before:-<missing>}" "${invocation_after:-<missing>}" \
+            "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+
+    (( failures == 0 ))
+}
+
+installed_cli_replaces_configured_layer_unit_after_normalized_close() {
+    with_installed_post_layout_hook_fixture \
+        layer_refresh_unit_restarts_after_normalized_close
+}
+
+unconfigured_normalized_close_avoids_legacy_renderer_refresh() {
+    local normalized_external failures=0
+
+    normalized_external=$(jq -c 'map(
+        if .name == "eDP-1" then
+            .disabled = true | .dpmsStatus = false
+        elif .name == "DP-2" then
+            .x = 0 | .y = 0
+        else .
+        end
+    )' <<< "$framework")
+
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$normalized_external"
+    run_post_layout_hook_cli_scenario unconfigured-normalized-close close
+
+    if (( scenario_status != 0 )); then
+        printf 'unconfigured normalized close failed with status %d\n%s\n' \
+            "$scenario_status" "$scenario_output" >&2
+        failures=$((failures + 1))
+    fi
+    assert_not_contains "$scenario_effects" $'renderer-refresh' \
+        'an unconfigured close must not invoke the legacy renderer refresh' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_output" \
+        'event=compositor_refresh_succeeded' \
+        'an unconfigured close must not claim an unverified geometry repair' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" $'sleep\t0.2' \
+        'an unconfigured close must not wait for a refresh it will not perform' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installed_cli_avoids_legacy_unconfigured_renderer_refresh() {
+    with_installed_post_layout_hook_fixture \
+        unconfigured_normalized_close_avoids_legacy_renderer_refresh
+}
+
 post_layout_hook_runtime_contract() {
+    local systemctl_state_dir="$test_root/layer-refresh-systemd"
+    local refresh_unit=waybar.service
     local scenario_status scenario_output scenario_effects hook_record effects_prefix
-    local effects_suffix hook_count refresh_count query_before query_after failures=0
-    local refresh_record=$'renderer-refresh'
+    local hook_count query_before restart_count invocation_before invocation_after
+    local failures=0
+    local active_record=$'systemctl\t--user\tis-active\t--quiet\twaybar.service'
+    local restart_record=$'systemctl\t--user\trestart\twaybar.service'
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
@@ -7972,67 +8095,62 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" $'pkill\t' \
         'default close must not signal Waybar or another process' \
         || failures=$((failures + 1))
-    refresh_count=$(grep -Fxc "$refresh_record" "$effect_log" || true)
-    effects_prefix=${scenario_effects%%"$refresh_record"*}
-    effects_suffix=${scenario_effects#*"$refresh_record"}
-    query_before=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
-        <<< "$effects_prefix" || true)
-    query_after=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
-        <<< "$effects_suffix" || true)
-    if (( refresh_count != 1 || query_before != 1 || query_after != 1 )); then
-        printf 'accepted close compositor refresh ordering failed; refreshes=%d pre-refresh-queries=%d post-refresh-queries=%d\n%s\n%s\n' \
-            "$refresh_count" "$query_before" "$query_after" "$scenario_output" \
-            "$scenario_effects" >&2
-        failures=$((failures + 1))
-    fi
-    assert_before "$scenario_effects" $'sleep\t0.2' "$refresh_record" \
-        'close must let asynchronous layer teardown settle before refreshing' \
-        || failures=$((failures + 1))
-
-    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
-        "$disabled" "$framework"
-    run_post_layout_hook_cli_scenario default-open open
-    if (( scenario_status != 0 )); then
-        printf 'default open failed with status %d\n%s\n' \
-            "$scenario_status" "$scenario_output" >&2
-        failures=$((failures + 1))
-    fi
-    assert_not_contains "$scenario_effects" $'pgrep\t' \
-        'default open must not inspect Waybar or another process' \
-        || failures=$((failures + 1))
-    assert_not_contains "$scenario_effects" $'pkill\t' \
-        'default open must not signal Waybar or another process' \
-        || failures=$((failures + 1))
-    assert_not_contains "$scenario_effects" "$refresh_record" \
-        'opening the internal output must not force an unrelated renderer reload' \
+    assert_not_contains "$scenario_effects" $'systemctl\t' \
+        'an unconfigured close must not manage an implicit layer client' \
         || failures=$((failures + 1))
     assert_not_contains "$scenario_effects" $'sleep\t0.2' \
-        'opening the internal output must not wait for close-only layer teardown' \
+        'an unconfigured close must not wait for an absent layer refresh' \
         || failures=$((failures + 1))
 
+    activate_test_user_unit "$systemctl_state_dir" "$refresh_unit"
+    invocation_before=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" "$refresh_unit")
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$framework" "$disabled"
     run_post_layout_hook_cli_scenario success-close close \
-        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        "ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=$refresh_unit" \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" "$refresh_unit")
     hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
     hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    restart_count=$(grep -Fxc "$restart_record" <<< "$scenario_effects" || true)
     effects_prefix=${scenario_effects%%"$hook_record"*}
     query_before=$(grep -Fxc $'hyprctl\t-j\tmonitors\tall' \
         <<< "$effects_prefix" || true)
-    if (( scenario_status != 0 || hook_count != 1 || query_before != 2 )); then
-        printf 'verified close hook contract failed; status=%d hooks=%d pre-hook-queries=%d\n%s\n%s\n' \
-            "$scenario_status" "$hook_count" "$query_before" \
+    if (( scenario_status != 0 || hook_count != 1 || restart_count != 1 || \
+        query_before != 2 )) || [[ -z "$invocation_before" || \
+        -z "$invocation_after" || "$invocation_before" == "$invocation_after" ]]; then
+        printf 'verified close refresh contract failed; status=%d hooks=%d restarts=%d pre-hook-queries=%d before=%s after=%s\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$restart_count" "$query_before" \
+            "${invocation_before:-<missing>}" "${invocation_after:-<missing>}" \
             "$scenario_output" "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
-    assert_before "$scenario_effects" "$refresh_record" "$hook_record" \
-        'verified close must refresh compositor geometry before the user hook' \
+    assert_contains "$scenario_output" \
+        'event=layer_refresh_unit_succeeded action=close outcome=disabled internal_output=eDP-1 unit=waybar.service' \
+        'a configured active layer client should report its replacement' \
+        || failures=$((failures + 1))
+    assert_before "$scenario_effects" "$active_record" $'sleep\t0.2' \
+        'close must verify the configured unit before the settle window' \
+        || failures=$((failures + 1))
+    assert_before "$scenario_effects" $'sleep\t0.2' "$restart_record" \
+        'close must let asynchronous layer teardown settle before replacement' \
+        || failures=$((failures + 1))
+    assert_before "$scenario_effects" "$restart_record" "$hook_record" \
+        'verified close must replace the layer client before the user hook' \
         || failures=$((failures + 1))
 
+    invocation_before=$invocation_after
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$disabled" "$disabled"
     run_post_layout_hook_cli_scenario noop-close close \
-        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        "ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=$refresh_unit" \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" "$refresh_unit")
     if (( scenario_status != 0 )); then
         printf 'layout no-op failed with status %d\n%s\n' \
             "$scenario_status" "$scenario_output" >&2
@@ -8041,14 +8159,24 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a layout no-op must not run the post-layout hook' \
         || failures=$((failures + 1))
-    assert_not_contains "$scenario_effects" "$refresh_record" \
-        'a layout no-op must not refresh compositor geometry' \
+    assert_not_contains "$scenario_effects" $'systemctl\t' \
+        'a layout no-op must not inspect or replace the layer client' \
         || failures=$((failures + 1))
+    if [[ "$invocation_before" != "$invocation_after" ]]; then
+        printf 'layout no-op replaced the layer client; before=%s after=%s\n%s\n' \
+            "$invocation_before" "$invocation_after" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
 
+    invocation_before=$invocation_after
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$disabled" "$framework"
     run_post_layout_hook_cli_scenario success-open open \
-        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        "ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=$refresh_unit" \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" "$refresh_unit")
     hook_record="$hook_name"$'\topen\tenabled\teDP-1'
     hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
     effects_prefix=${scenario_effects%%"$hook_record"*}
@@ -8060,14 +8188,24 @@ post_layout_hook_runtime_contract() {
             "$scenario_output" "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
-    assert_not_contains "$scenario_effects" "$refresh_record" \
-        'verified open should deliver the user hook without a close-only refresh' \
+    assert_not_contains "$scenario_effects" $'systemctl\t' \
+        'verified open must not inspect or replace the close-only layer client' \
         || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" $'sleep\t0.2' \
+        'verified open must not wait for close-only layer teardown' \
+        || failures=$((failures + 1))
+    if [[ "$invocation_before" != "$invocation_after" ]]; then
+        printf 'verified open replaced the layer client; before=%s after=%s\n%s\n' \
+            "$invocation_before" "$invocation_after" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" "$asleep" "$awake"
     run_post_layout_hook_cli_scenario dpms-only open \
-        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        "ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=$refresh_unit" \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
     if (( scenario_status != 0 )); then
         printf 'DPMS-only transition failed with status %d\n%s\n' \
             "$scenario_status" "$scenario_output" >&2
@@ -8079,8 +8217,8 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a DPMS-only transition must not run the post-layout hook' \
         || failures=$((failures + 1))
-    assert_not_contains "$scenario_effects" "$refresh_record" \
-        'a DPMS-only transition must not refresh compositor geometry' \
+    assert_not_contains "$scenario_effects" $'systemctl\t' \
+        'a DPMS-only transition must not inspect or replace the layer client' \
         || failures=$((failures + 1))
 
     rm -rf "$runtime_dir/arch-lidswitch"
@@ -8088,6 +8226,8 @@ post_layout_hook_runtime_contract() {
         "$framework" "$framework"
     run_post_layout_hook_cli_scenario apply-failure close \
         "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        "ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=$refresh_unit" \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir" \
         TEST_HYPRCTL_EVAL_FAILURES=1 \
         "TEST_HYPRCTL_EVAL_COUNTER=$test_root/eval-counter"
     if (( scenario_status != 3 )); then
@@ -8098,15 +8238,21 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a display apply failure must not run the post-layout hook' \
         || failures=$((failures + 1))
-    assert_not_contains "$scenario_effects" "$refresh_record" \
-        'a display apply failure must not refresh compositor geometry' \
+    assert_not_contains "$scenario_effects" $'systemctl\t' \
+        'a display apply failure must not inspect or replace the layer client' \
         || failures=$((failures + 1))
 
     rm -rf "$runtime_dir/arch-lidswitch"
+    invocation_before=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" "$refresh_unit")
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$framework" "$framework"
     run_post_layout_hook_cli_scenario postcondition-failure close \
-        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        "ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=$refresh_unit" \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" "$refresh_unit")
     if (( scenario_status != 4 )); then
         printf 'display postcondition failure should return 4, got %d\n%s\n' \
             "$scenario_status" "$scenario_output" >&2
@@ -8115,17 +8261,23 @@ post_layout_hook_runtime_contract() {
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'a display postcondition failure must not run the post-layout hook' \
         || failures=$((failures + 1))
-    refresh_count=$(grep -Fxc "$refresh_record" "$effect_log" || true)
-    if (( refresh_count != 1 )); then
-        printf 'an accepted close must refresh before a stale postcondition result; got %d\n%s\n%s\n' \
-            "$refresh_count" "$scenario_output" "$scenario_effects" >&2
+    restart_count=$(grep -Fxc "$restart_record" <<< "$scenario_effects" || true)
+    if (( restart_count != 1 )) || [[ "$invocation_before" == "$invocation_after" ]]; then
+        printf 'accepted close did not replace the layer client before a stale postcondition; restarts=%d before=%s after=%s\n%s\n%s\n' \
+            "$restart_count" "$invocation_before" "$invocation_after" \
+            "$scenario_output" "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
 
+    invocation_before=$invocation_after
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$disabled" "$disabled"
     run_post_layout_hook_cli_scenario postcondition-retry close \
-        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook"
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        "ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=$refresh_unit" \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" "$refresh_unit")
     if (( scenario_status != 0 )); then
         printf 'postcondition retry failed with status %d\n%s\n' \
             "$scenario_status" "$scenario_output" >&2
@@ -8135,12 +8287,17 @@ post_layout_hook_runtime_contract() {
         'event=layout_noop action=close reason=internal_already_disabled' \
         'retry should verify the already-applied close without another mutation' \
         || failures=$((failures + 1))
-    assert_not_contains "$scenario_effects" "$refresh_record" \
-        'retry must not duplicate the refresh already attempted after apply' \
+    assert_not_contains "$scenario_effects" $'systemctl\t' \
+        'retry must not duplicate the layer-client replacement already attempted' \
         || failures=$((failures + 1))
     assert_not_contains "$scenario_effects" "$hook_name"$'\t' \
         'retry of an already-disabled close must not synthesize a mutation hook' \
         || failures=$((failures + 1))
+    if [[ "$invocation_before" != "$invocation_after" ]]; then
+        printf 'postcondition retry duplicated the layer-client replacement; before=%s after=%s\n%s\n' \
+            "$invocation_before" "$invocation_after" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
 
     (( failures == 0 ))
 }
@@ -8149,72 +8306,180 @@ installed_post_layout_hook_obeys_verified_mutation_contract() {
     with_installed_post_layout_hook_fixture post_layout_hook_runtime_contract
 }
 
-post_layout_hook_advisory_contract() {
-    local scenario_status scenario_output scenario_effects hook_record
-    local hook_count refresh_count monitor_count attempt_count failures=0
+invalid_layer_refresh_unit_is_advisory() {
+    local hook_record hook_count failures=0
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$framework" "$disabled"
-    run_post_layout_hook_cli_scenario renderer-refresh-failure close \
+    run_post_layout_hook_cli_scenario invalid-layer-refresh-unit close \
         "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
-        TEST_HYPRCTL_RENDERER_RELOAD_FAILURES=1 \
-        "TEST_HYPRCTL_RENDERER_RELOAD_COUNTER=$test_root/renderer-reload-counter"
+        'ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service;touch-invalid'
     hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
     hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
-    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
-    if (( scenario_status != 0 || hook_count != 1 || refresh_count != 1 )); then
-        printf 'renderer refresh failure changed the advisory contract; status=%d hooks=%d refreshes=%d\n%s\n%s\n' \
-            "$scenario_status" "$hook_count" "$refresh_count" \
-            "$scenario_output" "$scenario_effects" >&2
+    if (( scenario_status != 0 || hook_count != 1 )); then
+        printf 'invalid layer refresh unit changed reconciliation; status=%d hooks=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$scenario_output" \
+            "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
     assert_contains "$scenario_output" \
-        'event=compositor_refresh_failed reason=command_failed action=close outcome=disabled internal_output=eDP-1 status=94' \
-        'a failed compositor refresh should be logged without failing reconciliation' \
+        'event=layer_refresh_unit_invalid reason=invalid_service_name action=close outcome=disabled internal_output=eDP-1 unit=waybar.service;touch-invalid' \
+        'an invalid layer refresh unit should be rejected explicitly' \
         || failures=$((failures + 1))
-    assert_before "$scenario_effects" $'renderer-refresh' "$hook_record" \
-        'a failed compositor refresh must not suppress the configured user hook' \
+    assert_not_contains "$scenario_effects" $'systemctl\t' \
+        'an invalid unit must not reach systemd' \
         || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" $'sleep\t0.2' \
+        'an invalid unit must not wait for a replacement it cannot perform' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installed_invalid_layer_refresh_unit_is_advisory() {
+    with_installed_post_layout_hook_fixture \
+        invalid_layer_refresh_unit_is_advisory
+}
+
+inactive_layer_refresh_unit_is_advisory() {
+    local systemctl_state_dir="$test_root/inactive-layer-refresh-systemd"
+    local hook_record hook_count failures=0
+    local active_record=$'systemctl\t--user\tis-active\t--quiet\twaybar.service'
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$framework" "$disabled"
-    run_post_layout_hook_cli_scenario renderer-refresh-unexpected close \
+    run_post_layout_hook_cli_scenario inactive-layer-refresh-unit close \
         "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
-        TEST_HYPRCTL_RENDERER_RELOAD_OUTPUT=unexpected
+        ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir"
+    hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
     hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
-    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
-    if (( scenario_status != 0 || hook_count != 1 || refresh_count != 1 )); then
-        printf 'unexpected renderer response changed the advisory contract; status=%d hooks=%d refreshes=%d\n%s\n%s\n' \
-            "$scenario_status" "$hook_count" "$refresh_count" \
-            "$scenario_output" "$scenario_effects" >&2
+    if (( scenario_status != 0 || hook_count != 1 )); then
+        printf 'inactive layer refresh unit changed reconciliation; status=%d hooks=%d\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$scenario_output" \
+            "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
     assert_contains "$scenario_output" \
-        'event=compositor_refresh_failed reason=unexpected_response action=close outcome=disabled internal_output=eDP-1' \
-        'an unexpected renderer response should be logged without failing reconciliation' \
+        'event=layer_refresh_unit_skipped reason=inactive action=close outcome=disabled internal_output=eDP-1 unit=waybar.service' \
+        'an inactive layer refresh unit should be skipped explicitly' \
+        || failures=$((failures + 1))
+    assert_contains "$scenario_effects" "$active_record" \
+        'the configured unit should be checked through systemd' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" \
+        $'systemctl\t--user\trestart\twaybar.service' \
+        'an inactive unit must not be started implicitly' \
+        || failures=$((failures + 1))
+    assert_not_contains "$scenario_effects" $'sleep\t0.2' \
+        'an inactive unit must not wait for a replacement it will not perform' \
+        || failures=$((failures + 1))
+    assert_before "$scenario_effects" "$active_record" "$hook_record" \
+        'skipping an inactive unit must not suppress the user hook' \
         || failures=$((failures + 1))
 
+    (( failures == 0 ))
+}
+
+installed_inactive_layer_refresh_unit_is_advisory() {
+    with_installed_post_layout_hook_fixture \
+        inactive_layer_refresh_unit_is_advisory
+}
+
+failed_layer_refresh_unit_restart_is_advisory() {
+    local systemctl_state_dir="$test_root/failed-layer-refresh-systemd"
+    local hook_record hook_count invocation_before invocation_after failures=0
+    local restart_record=$'systemctl\t--user\trestart\twaybar.service'
+
+    activate_test_user_unit "$systemctl_state_dir" waybar.service
+    invocation_before=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
         "$framework" "$disabled"
-    run_post_layout_hook_cli_scenario renderer-refresh-timeout close \
+    run_post_layout_hook_cli_scenario failed-layer-refresh-unit close \
         "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
-        TEST_HYPRCTL_RENDERER_RELOAD_DELAY_SECONDS=3 \
+        ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir" \
+        TEST_SYSTEMCTL_FAIL_OPERATION=restart \
+        "TEST_SYSTEMCTL_FAILURE_COUNTER=$test_root/systemctl-failure-counter"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
+    hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
+    hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
+    if (( scenario_status != 0 || hook_count != 1 )) || \
+        [[ "$invocation_before" != "$invocation_after" ]]; then
+        printf 'failed layer refresh changed reconciliation; status=%d hooks=%d before=%s after=%s\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$invocation_before" \
+            "$invocation_after" "$scenario_output" "$scenario_effects" >&2
+        failures=$((failures + 1))
+    fi
+    assert_contains "$scenario_output" \
+        'event=layer_refresh_unit_failed action=close outcome=disabled internal_output=eDP-1 unit=waybar.service status=94' \
+        'a failed layer-client restart should be logged without failing reconciliation' \
+        || failures=$((failures + 1))
+    assert_before "$scenario_effects" "$restart_record" "$hook_record" \
+        'a failed layer-client restart must not suppress the user hook' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installed_failed_layer_refresh_unit_restart_is_advisory() {
+    with_installed_post_layout_hook_fixture \
+        failed_layer_refresh_unit_restart_is_advisory
+}
+
+timed_out_layer_refresh_unit_restart_is_advisory() {
+    local systemctl_state_dir="$test_root/timed-out-layer-refresh-systemd"
+    local hook_record hook_count invocation_before invocation_after failures=0
+    local restart_record=$'systemctl\t--user\trestart\twaybar.service'
+
+    activate_test_user_unit "$systemctl_state_dir" waybar.service
+    invocation_before=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
+    rm -rf "$runtime_dir/arch-lidswitch"
+    write_monitor_sequence "$sequence_dir" "$sequence_counter" \
+        "$framework" "$disabled"
+    run_post_layout_hook_cli_scenario timed-out-layer-refresh-unit close \
+        "ARCH_LIDSWITCH_POST_LAYOUT_HOOK=$hook" \
+        ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service \
+        "TEST_SYSTEMCTL_STATE_DIR=$systemctl_state_dir" \
+        TEST_SYSTEMCTL_DELAY_OPERATION=restart \
+        TEST_SYSTEMCTL_DELAY_SECONDS=3 \
         "TEST_REAL_SLEEP_BIN=$REAL_SLEEP_BIN"
+    invocation_after=$(observed_user_unit_invocation \
+        "$systemctl_state_dir" waybar.service)
+    hook_record="$hook_name"$'\tclose\tdisabled\teDP-1'
     hook_count=$(grep -Fxc "$hook_record" "$effect_log" || true)
-    refresh_count=$(grep -Fxc $'renderer-refresh' "$effect_log" || true)
-    if (( scenario_status != 0 || hook_count != 1 || refresh_count != 1 )); then
-        printf 'renderer timeout changed the advisory contract; status=%d hooks=%d refreshes=%d\n%s\n%s\n' \
-            "$scenario_status" "$hook_count" "$refresh_count" \
-            "$scenario_output" "$scenario_effects" >&2
+    if (( scenario_status != 0 || hook_count != 1 )) || \
+        [[ "$invocation_before" != "$invocation_after" ]]; then
+        printf 'timed-out layer refresh changed reconciliation; status=%d hooks=%d before=%s after=%s\n%s\n%s\n' \
+            "$scenario_status" "$hook_count" "$invocation_before" \
+            "$invocation_after" "$scenario_output" "$scenario_effects" >&2
         failures=$((failures + 1))
     fi
     assert_contains "$scenario_output" \
-        'event=compositor_refresh_failed reason=command_failed action=close outcome=disabled internal_output=eDP-1 status=124' \
-        'a timed-out renderer refresh should be bounded and advisory' \
+        'event=layer_refresh_unit_failed action=close outcome=disabled internal_output=eDP-1 unit=waybar.service status=124' \
+        'a timed-out layer-client restart should be bounded and advisory' \
         || failures=$((failures + 1))
+    assert_before "$scenario_effects" "$restart_record" "$hook_record" \
+        'a timed-out layer-client restart must not suppress the user hook' \
+        || failures=$((failures + 1))
+
+    (( failures == 0 ))
+}
+
+installed_timed_out_layer_refresh_unit_restart_is_advisory() {
+    with_installed_post_layout_hook_fixture \
+        timed_out_layer_refresh_unit_restart_is_advisory
+}
+
+post_layout_hook_advisory_contract() {
+    local scenario_status scenario_output scenario_effects hook_record
+    local hook_count monitor_count attempt_count failures=0
 
     rm -rf "$runtime_dir/arch-lidswitch"
     write_monitor_sequence "$sequence_dir" "$sequence_counter" \
@@ -8330,6 +8595,7 @@ installer_preserves_post_layout_hook_configuration_and_docs() (
     mkdir -p "${environment_file%/*}"
     printf '%s\n' \
         'ARCH_LIDSWITCH_POST_LAYOUT_HOOK=/user/owned/hook' \
+        'ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service' \
         'USER_OWNED_SENTINEL=preserve-byte-for-byte' > "$environment_file"
     chmod 0640 "$environment_file"
     cp -p "$environment_file" "$environment_copy"
@@ -8364,13 +8630,19 @@ installer_preserves_post_layout_hook_configuration_and_docs() (
         '~/.config/arch-lidswitch/environment' \
         'README should document the service environment file' \
         || failures=$((failures + 1))
-    assert_contains "$readme_contents" 'hl.dsp.force_renderer_reload()' \
-        'README should document the process-agnostic compositor refresh' \
+    assert_contains "$readme_contents" \
+        'ARCH_LIDSWITCH_LAYER_REFRESH_UNIT=waybar.service' \
+        'README should document the opt-in layer-client service replacement' \
+        || failures=$((failures + 1))
+    assert_contains "$readme_contents" 'must already be active' \
+        'README should state that an inactive layer-client unit is never started' \
         || failures=$((failures + 1))
     assert_contains "$readme_contents" 'waits 200 milliseconds' \
         'README should document the asynchronous layer settle window' \
         || failures=$((failures + 1))
-    for stale_waybar_claim in SIGUSR1 SIGUSR2 'pkill -x' 'Waybar Layout Refresh'; do
+    for stale_waybar_claim in \
+        SIGUSR1 SIGUSR2 'pkill -x' 'Waybar Layout Refresh' \
+        'hl.dsp.force_renderer_reload()'; do
         assert_not_contains "$readme_contents" "$stale_waybar_claim" \
             "README must remove the stale Waybar signal claim: $stale_waybar_claim" \
             || failures=$((failures + 1))
@@ -11036,17 +11308,47 @@ run_test \
 
 run_test \
     'BUG-015-runtime-contract' \
-    'verified docked close refreshes compositor before the post-layout hook' \
+    'verified docked close replaces the layer client before the post-layout hook' \
     installed_post_layout_hook_obeys_verified_mutation_contract
 
 run_test \
-    'BUG-015-advisory-failures' \
-    'compositor refresh and post-layout hook failures remain advisory' \
+    'BUG-015-stale-layer-origin' \
+    'normalized docked close replaces the configured layer client unit' \
+    installed_cli_replaces_configured_layer_unit_after_normalized_close
+
+run_test \
+    'BUG-015-obsolete-renderer-refresh' \
+    'unconfigured normalized close avoids the obsolete renderer refresh' \
+    installed_cli_avoids_legacy_unconfigured_renderer_refresh
+
+run_test \
+    'BUG-015-invalid-layer-unit' \
+    'invalid layer refresh unit remains advisory' \
+    installed_invalid_layer_refresh_unit_is_advisory
+
+run_test \
+    'BUG-015-inactive-layer-unit' \
+    'inactive layer refresh unit is not started implicitly' \
+    installed_inactive_layer_refresh_unit_is_advisory
+
+run_test \
+    'BUG-015-failed-layer-restart' \
+    'failed layer refresh unit restart remains advisory' \
+    installed_failed_layer_refresh_unit_restart_is_advisory
+
+run_test \
+    'BUG-015-timed-out-layer-restart' \
+    'timed-out layer refresh unit restart remains advisory' \
+    installed_timed_out_layer_refresh_unit_restart_is_advisory
+
+run_test \
+    'BUG-015-advisory-hook-failures' \
+    'post-layout hook failures remain advisory' \
     installed_layout_refresh_failures_are_advisory
 
 run_test \
     'BUG-015-packaging-docs' \
-    'installer and docs preserve the user-owned post-layout hook contract' \
+    'installer and docs preserve user-owned layer integration configuration' \
     installer_preserves_post_layout_hook_configuration_and_docs
 
 run_test \

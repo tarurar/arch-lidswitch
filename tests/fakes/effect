@@ -1164,6 +1164,10 @@ case "$command_name" in
             -e "$(systemctl_state_directory)/.candidate-started" ]]; then
             failure_operation=health
         fi
+        if [[ -n "${TEST_SYSTEMCTL_DELAY_OPERATION:-}" && \
+            "$failure_operation" == "$TEST_SYSTEMCTL_DELAY_OPERATION" ]]; then
+            "${TEST_REAL_SLEEP_BIN:?}" "${TEST_SYSTEMCTL_DELAY_SECONDS:?}"
+        fi
         if [[ "$failure_operation" == daemon-reload && \
             -n "${TEST_SYSTEMCTL_FAIL_DAEMON_RELOAD_CALL:-}" ]]; then
             exact_failure_count=0

@@ -324,12 +324,12 @@ check_hyprland_capabilities() {
     fi
 
     if ! lua_probe_output=$("$HYPRCTL_BIN" eval \
-        'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function" and type(hl.dsp.force_renderer_reload) == "function", "required Hyprland Lua APIs unavailable")'); then
-        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, hl.dsp.dpms, and hl.dsp.force_renderer_reload APIs are unavailable"
+        'assert(type(hl) == "table" and type(hl.monitor) == "function" and type(hl.dispatch) == "function" and type(hl.dsp) == "table" and type(hl.dsp.dpms) == "function", "required Hyprland Lua APIs unavailable")'); then
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
         return 1
     fi
     if [[ "$lua_probe_output" != "ok" ]]; then
-        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, hl.dsp.dpms, and hl.dsp.force_renderer_reload APIs are unavailable"
+        log_error "Hyprland Lua capability probe failed: required hl.monitor, hl.dispatch, and hl.dsp.dpms APIs are unavailable"
         return 1
     fi
 
@@ -1997,36 +1997,53 @@ LAPTOP_DISPLAY="LAPTOP_MONITOR_PLACEHOLDER"
 EXPECTED_LID=${ARCH_LIDSWITCH_EXPECTED_LID:-}
 EXPECTED_POLICY_TOKEN=${ARCH_LIDSWITCH_EXPECTED_POLICY_TOKEN:-}
 POST_LAYOUT_HOOK=${ARCH_LIDSWITCH_POST_LAYOUT_HOOK:-}
+LAYER_REFRESH_UNIT=${ARCH_LIDSWITCH_LAYER_REFRESH_UNIT:-}
 REQUIRE_DPMS=${ARCH_LIDSWITCH_REQUIRE_DPMS:-false}
 if [[ "$REQUIRE_DPMS" != true ]]; then
     REQUIRE_DPMS=false
 fi
 
-refresh_compositor_layout() {
+refresh_layer_client_unit() {
     local action=$1
     local outcome=$2
     local internal_output=$3
-    local refresh_output refresh_status
+    local refresh_status
+
+    if [[ -z "$LAYER_REFRESH_UNIT" ]]; then
+        return 0
+    fi
+
+    if [[ ! "$LAYER_REFRESH_UNIT" =~ \
+        ^[A-Za-z0-9][A-Za-z0-9_.@:-]*[.]service$ ]]; then
+        log_error layer_refresh_unit_invalid reason=invalid_service_name \
+            action="$action" outcome="$outcome" \
+            internal_output="$internal_output" \
+            unit="$LAYER_REFRESH_UNIT"
+        return 0
+    fi
+    if ! timeout --kill-after=1s 2s \
+        systemctl --user is-active --quiet "$LAYER_REFRESH_UNIT"; then
+        log_error layer_refresh_unit_skipped reason=inactive \
+            action="$action" outcome="$outcome" \
+            internal_output="$internal_output" \
+            unit="$LAYER_REFRESH_UNIT"
+        return 0
+    fi
 
     # Hyprland can finish moving and removing layer surfaces shortly after its
     # monitor topology already reports the requested state. Let that teardown
-    # settle before forcing the compositor to rebuild output-local geometry.
+    # settle before replacing the layer client and its output-local surfaces.
     sleep 0.2
-    if refresh_output=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
-        hyprctl eval 'hl.dispatch(hl.dsp.force_renderer_reload())'); then
-        if [[ "$refresh_output" == ok ]]; then
-            log_info compositor_refresh_succeeded action="$action" \
-                outcome="$outcome" internal_output="$internal_output"
-        else
-            log_error compositor_refresh_failed reason=unexpected_response \
-                action="$action" outcome="$outcome" \
-                internal_output="$internal_output"
-        fi
+    if timeout --kill-after=1s 2s \
+        systemctl --user restart "$LAYER_REFRESH_UNIT"; then
+        log_info layer_refresh_unit_succeeded action="$action" \
+            outcome="$outcome" internal_output="$internal_output" \
+            unit="$LAYER_REFRESH_UNIT"
     else
         refresh_status=$?
-        log_error compositor_refresh_failed reason=command_failed \
-            action="$action" outcome="$outcome" \
-            internal_output="$internal_output" status="$refresh_status"
+        log_error layer_refresh_unit_failed action="$action" \
+            outcome="$outcome" internal_output="$internal_output" \
+            unit="$LAYER_REFRESH_UNIT" status="$refresh_status"
     fi
     return 0
 }
@@ -2296,7 +2313,7 @@ reconcile_lid_state() {
 
     if [[ "$layout_changed" == true && \
         "$desired_internal" == disabled ]]; then
-        refresh_compositor_layout \
+        refresh_layer_client_unit \
             "$action" "$desired_internal" "$LAPTOP_DISPLAY"
     fi
 
