@@ -907,6 +907,208 @@ LAST_OUTPUT_RECOVERY_NAME=ARCH-LIDSWITCH-RECOVERY
 MONITOR_STATE_RECOVERY_OUTPUT=""
 MONITOR_STATE_RECOVERY_USED=false
 MONITOR_STATE_RECOVERY_CLEANUP_DEFERRED=false
+MONITOR_STATE_VALIDATION=unavailable
+MONITOR_STATE_VALIDATION_REASON=not_observed
+MONITOR_STATE_VALIDATION_SINCE=""
+MONITOR_STATE_VALIDATION_GENERATION=""
+MONITOR_STATE_VALIDATION_DETAILS="validation=unavailable reason=not_observed"
+MONITOR_STATE_KERNEL_CONNECTOR=unknown
+MONITOR_STATE_KERNEL_ENABLED=unknown
+MONITOR_STATE_VALIDATION_WORKER=false
+MONITOR_STATE_VALIDATION_WAITED=false
+
+# Kernel enablement corroborates encoder attachment, not panel illumination.
+monitor_state_observe_kernel_enabled() {
+    local output=$1
+    local drm_root=${HYPR_DRM_ROOT:-/sys/class/drm}
+    local candidate name card value
+    local -a connectors=()
+
+    MONITOR_STATE_KERNEL_CONNECTOR=unknown
+    MONITOR_STATE_KERNEL_ENABLED=unknown
+    MONITOR_STATE_VALIDATION_REASON=connector_missing
+    for candidate in "$drm_root"/card[0-9]*-"$output"; do
+        [[ -d "$candidate" ]] || continue
+        name=${candidate##*/}
+        card=${name%-"$output"}
+        [[ "$card" =~ ^card[0-9]+$ ]] || continue
+        connectors+=("$candidate")
+    done
+    if (( ${#connectors[@]} > 1 )); then
+        MONITOR_STATE_VALIDATION_REASON=connector_ambiguous
+    elif (( ${#connectors[@]} == 1 )); then
+        candidate=${connectors[0]}
+        MONITOR_STATE_KERNEL_CONNECTOR=${candidate##*/}
+        MONITOR_STATE_VALIDATION_REASON=kernel_enabled_unreadable
+        if [[ -f "$candidate/enabled" && -r "$candidate/enabled" ]] &&
+            value=$(jq -Rrs '
+                if . == "enabled\n" or . == "enabled" then "enabled"
+                elif . == "disabled\n" or . == "disabled" then "disabled"
+                else "malformed" end
+            ' "$candidate/enabled" 2>/dev/null); then
+            case "$value" in
+                enabled|disabled)
+                    MONITOR_STATE_KERNEL_ENABLED=$value
+                    MONITOR_STATE_VALIDATION_REASON=kernel_$value
+                    ;;
+                *) MONITOR_STATE_VALIDATION_REASON=kernel_enabled_malformed ;;
+            esac
+        fi
+    fi
+    return 0
+}
+
+monitor_state_validation_unavailable() {
+    MONITOR_STATE_VALIDATION=unavailable
+    MONITOR_STATE_VALIDATION_REASON=$1
+    MONITOR_STATE_VALIDATION_SINCE=""
+    MONITOR_STATE_VALIDATION_GENERATION=""
+    MONITOR_STATE_KERNEL_CONNECTOR=unknown
+    MONITOR_STATE_KERNEL_ENABLED=unknown
+    monitor_state_format_validation "$2" unknown unknown
+}
+
+monitor_state_assess_output() {
+    local lid=$1
+    local output enabled dpms external_count
+
+    if ! read -r output enabled dpms external_count < <(jq -r '[
+        .internal.output, .internal.enabled, .internal.dpms,
+        ([.externals[] | select(.enabled)] | length)
+    ] | map(tostring) | @tsv' <<< "$MONITOR_STATE_TOPOLOGY"); then
+        monitor_state_validation_unavailable topology_unavailable \
+            "${LAPTOP_DISPLAY:-unknown}"
+        return 0
+    fi
+    monitor_state_observe_kernel_enabled "$output"
+    MONITOR_STATE_VALIDATION=unavailable
+    if [[ "$lid" != open && "$lid" != closed ]]; then
+        MONITOR_STATE_VALIDATION_REASON=lid_unavailable
+    elif [[ "$lid" == closed && "$external_count" -gt 0 ]]; then
+        MONITOR_STATE_VALIDATION=exempt
+        MONITOR_STATE_VALIDATION_REASON=policy_internal_disabled
+    elif [[ "$dpms" == false ]]; then
+        MONITOR_STATE_VALIDATION=suspended
+        MONITOR_STATE_VALIDATION_REASON=dpms_sleep
+    elif [[ "$enabled" != true || "$dpms" != true ]]; then
+        MONITOR_STATE_VALIDATION_REASON=compositor_not_restored
+    elif [[ "$MONITOR_STATE_KERNEL_ENABLED" == enabled ]]; then
+        MONITOR_STATE_VALIDATION=agreement
+    elif [[ "$MONITOR_STATE_KERNEL_ENABLED" == disabled ]]; then
+        monitor_state_settle_disagreement \
+            "$lid:$MONITOR_STATE_TOPOLOGY:$MONITOR_STATE_KERNEL_CONNECTOR"
+    fi
+    if [[ "$MONITOR_STATE_VALIDATION" != pending &&
+        "$MONITOR_STATE_VALIDATION" != degraded ]]; then
+        MONITOR_STATE_VALIDATION_SINCE=""
+        MONITOR_STATE_VALIDATION_GENERATION=""
+    fi
+    monitor_state_format_validation "$output" "$enabled" "$dpms"
+}
+
+monitor_state_settle_disagreement() {
+    local generation=$1 uptime ignored now
+
+    # /proc/uptime is monotonic across clock corrections and includes suspend.
+    if ! read -r uptime ignored < /proc/uptime ||
+        [[ ! "$uptime" =~ ^[0-9]+\.[0-9]{2}$ ]]; then
+        MONITOR_STATE_VALIDATION_REASON=clock_unavailable
+        return 0
+    fi
+    now=${uptime/./}
+    now=$((10#$now))
+    if [[ "$generation" != "$MONITOR_STATE_VALIDATION_GENERATION" ]]; then
+        MONITOR_STATE_VALIDATION_SINCE=$now
+        MONITOR_STATE_VALIDATION_GENERATION=$generation
+    fi
+    MONITOR_STATE_VALIDATION=pending
+    MONITOR_STATE_VALIDATION_REASON=settling
+    # Require a full two seconds even when the first timestamp was rounded down.
+    if (( now - MONITOR_STATE_VALIDATION_SINCE > 200 )); then
+        MONITOR_STATE_VALIDATION=degraded
+        MONITOR_STATE_VALIDATION_REASON=persistent_disagreement
+    fi
+}
+
+monitor_state_format_validation() {
+    MONITOR_STATE_VALIDATION_DETAILS="validation=$MONITOR_STATE_VALIDATION"
+    MONITOR_STATE_VALIDATION_DETAILS+=" reason=$MONITOR_STATE_VALIDATION_REASON"
+    MONITOR_STATE_VALIDATION_DETAILS+=" internal_output=$1"
+    MONITOR_STATE_VALIDATION_DETAILS+=" connector=$MONITOR_STATE_KERNEL_CONNECTOR"
+    MONITOR_STATE_VALIDATION_DETAILS+=" compositor_enabled=$2 compositor_dpms=$3"
+    MONITOR_STATE_VALIDATION_DETAILS+=" kernel_enabled=$MONITOR_STATE_KERNEL_ENABLED"
+}
+
+monitor_state_accept_validation_sample() {
+    local outcome reason output connector enabled dpms kernel
+    local report since generation
+
+    IFS=$'\t' read -r report since generation <<< "$1"
+    read -r outcome reason output connector enabled dpms kernel <<< "$report"
+    MONITOR_STATE_VALIDATION=${outcome#validation=}
+    MONITOR_STATE_VALIDATION_REASON=${reason#reason=}
+    MONITOR_STATE_KERNEL_CONNECTOR=${connector#connector=}
+    MONITOR_STATE_KERNEL_ENABLED=${kernel#kernel_enabled=}
+    monitor_state_format_validation "${output#internal_output=}" \
+        "${enabled#compositor_enabled=}" "${dpms#compositor_dpms=}"
+    MONITOR_STATE_VALIDATION_SINCE=${since#none}
+    MONITOR_STATE_VALIDATION_GENERATION=${generation#none}
+}
+
+# This worker only observes. Its caller bounds the whole process group, including
+# any slow compositor query, rather than adding per-query timeouts to the budget.
+monitor_state_sample_output_validation() {
+    local output=$1 lid
+
+    while true; do
+        sleep 0.05 || return 1
+        if ! lid=$(read_lid_state 2>/dev/null); then
+            monitor_state_validation_unavailable lid_unavailable "$output"
+        elif ! monitor_state_observe_topology "$output" 2>/dev/null; then
+            monitor_state_validation_unavailable topology_unavailable "$output"
+        else
+            monitor_state_assess_output "$lid"
+        fi
+        printf '%s\t%s\t%s\n' "$MONITOR_STATE_VALIDATION_DETAILS" \
+            "${MONITOR_STATE_VALIDATION_SINCE:-none}" \
+            "${MONITOR_STATE_VALIDATION_GENERATION:-none}"
+        [[ "$MONITOR_STATE_VALIDATION" == pending ]] || break
+    done
+}
+
+monitor_state_validate_output_once() {
+    local output=$1 script_dir=$2 lid observations worker_status=0
+
+    MONITOR_STATE_VALIDATION_WAITED=false
+    lid=$(read_lid_state 2>/dev/null) || lid=unknown
+    monitor_state_assess_output "$lid"
+    if [[ "$MONITOR_STATE_VALIDATION" != pending ||
+        "${ARCH_LIDSWITCH_VALIDATION_MODE:-}" == sample ]]; then
+        return 0
+    fi
+
+    MONITOR_STATE_VALIDATION_WAITED=true
+    observations=$(
+        { timeout --signal=KILL 2s /bin/bash -c '
+            . "$1/monitor-state.sh" || exit 1
+            . "$1/lid-state.sh" || exit 1
+            MONITOR_STATE_VALIDATION_WORKER=true
+            MONITOR_STATE_VALIDATION_SINCE=$3
+            MONITOR_STATE_VALIDATION_GENERATION=$4
+            monitor_state_sample_output_validation "$2"
+        ' validation "$script_dir" "$output" \
+            "$MONITOR_STATE_VALIDATION_SINCE" \
+            "$MONITOR_STATE_VALIDATION_GENERATION"; } 2>/dev/null
+    ) || worker_status=$?
+    if (( worker_status != 0 && worker_status != 137 )); then
+        monitor_state_validation_unavailable validation_worker_failed "$output"
+    elif [[ -n "$observations" ]]; then
+        monitor_state_accept_validation_sample "${observations##*$'\n'}"
+    elif (( worker_status == 0 )); then
+        monitor_state_validation_unavailable validation_worker_failed "$output"
+    fi
+    return 0
+}
 
 monitor_state_fail() {
     MONITOR_STATE_ERROR=$1
@@ -930,11 +1132,16 @@ monitor_state_recovery_deadline_reached() {
 monitor_state_observe_topology() {
     local output=$1
     local monitors_json
+    local -a query_timeout=(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS")
 
+    # The validation worker already has a process-group deadline. A nested
+    # timeout would put its query in a separate group that could outlive it.
+    if [[ "$MONITOR_STATE_VALIDATION_WORKER" == true ]]; then
+        query_timeout=()
+    fi
     MONITOR_STATE_ERROR=""
     MONITOR_STATE_TOPOLOGY=""
-    if ! monitors_json=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
-        hyprctl -j monitors all); then
+    if ! monitors_json=$("${query_timeout[@]}" hyprctl -j monitors all); then
         monitor_state_fail monitor_query_failed
         return
     fi
@@ -2499,9 +2706,11 @@ reconcile_lid_state() {
         log_info power_delegated owner=systemd-logind action=close \
             reason=no_enabled_external
     fi
+    monitor_state_validate_output_once "$LAPTOP_DISPLAY" "$SCRIPT_DIR"
     log_info reconciliation_verified action="$action" \
         desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
-        topology="$topology_snapshot"
+        topology="$topology_snapshot" verification_scope=compositor \
+        "$MONITOR_STATE_VALIDATION_DETAILS"
 }
 
 preserve_dpms=false
@@ -2778,6 +2987,11 @@ RECONCILIATION_COOLDOWN_TICKS=5
 MAX_STABILITY_SAMPLES=40
 REQUIRED_STABLE_SAMPLES=3
 STABILITY_SAMPLE_INTERVAL=0.25
+last_validation_details=""
+settle_validation_once=false
+if [[ "${1:-}" == --once || "${1:-}" == --resume-once ]]; then
+    settle_validation_once=true
+fi
 
 log_record() {
     local level=$1
@@ -2899,6 +3113,8 @@ observe_joint_state() {
         log_error recovery_state_cleanup_failed phase=policy_observation \
             trigger="$trigger" status="$observation_status" \
             reason="$MONITOR_STATE_ERROR"
+        monitor_state_validation_unavailable observation_failed "$LAPTOP_DISPLAY"
+        report_output_validation
         return "$observation_status"
     fi
     if monitor_state_reconcile_stale_recovery_output; then
@@ -2927,7 +3143,25 @@ observe_joint_state() {
                 status="$observation_status" reason="$MONITOR_STATE_ERROR"
         fi
     fi
+    if (( observation_status == 0 )); then
+        monitor_state_assess_output "$current_state"
+    else
+        monitor_state_validation_unavailable observation_failed "$LAPTOP_DISPLAY"
+    fi
+    report_output_validation
     return "$observation_status"
+}
+
+report_output_validation() {
+    if [[ "$MONITOR_STATE_VALIDATION_DETAILS" != "$last_validation_details" ]]; then
+        if [[ "$MONITOR_STATE_VALIDATION" == degraded ]]; then
+            log_record warning output_validation_changed \
+                "$MONITOR_STATE_VALIDATION_DETAILS"
+        else
+            log_info output_validation_changed "$MONITOR_STATE_VALIDATION_DETAILS"
+        fi
+        last_validation_details=$MONITOR_STATE_VALIDATION_DETAILS
+    fi
 }
 
 stabilize_joint_state() {
@@ -3090,7 +3324,8 @@ apply_observed_joint_state() {
         state="$attempted_state" preserve_dpms="$preserve_dpms" \
         commit_generation="$commit_generation" topology="$attempted_topology" \
         policy_token="$attempted_policy_token"
-    invoke_lid_switch "$attempted_state" "$preserve_dpms" \
+    ARCH_LIDSWITCH_VALIDATION_MODE=sample \
+        invoke_lid_switch "$attempted_state" "$preserve_dpms" \
         "$commit_generation" "$attempted_state" "$attempted_policy_token"
     reconciliation_status=$?
     if (( reconciliation_status != 0 )); then
@@ -3100,66 +3335,75 @@ apply_observed_joint_state() {
         return "$reconciliation_status"
     fi
 
-    if observe_joint_state post_action; then
-        :
-    else
-        reconciliation_status=$?
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status="$reconciliation_status" \
-            reason=post_action_observation_failed applied_ready="$applied_ready"
-        return "$reconciliation_status"
-    fi
-    if [[ "$commit_generation" == true ]] && \
-        { [[ "$current_state" != "$attempted_state" ]] || \
-            [[ "$current_policy_token" != "$attempted_policy_token" ]]; }; then
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status=5 \
-            reason=post_action_generation_mismatch \
-            observed_state="$current_state" \
-            expected_policy_token="$attempted_policy_token" \
-            observed_policy_token="$current_policy_token" \
-            applied_ready="$applied_ready"
-        return 5
-    elif [[ "$current_state" != "$attempted_state" ]]; then
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status=4 \
-            reason=lid_state_changed_during_reconciliation \
-            observed_state="$current_state" applied_ready="$applied_ready"
-        return 4
-    fi
+    while true; do
+        if observe_joint_state post_action; then
+            :
+        else
+            reconciliation_status=$?
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status="$reconciliation_status" \
+                reason=post_action_observation_failed applied_ready="$applied_ready"
+            return "$reconciliation_status"
+        fi
+        if [[ "$commit_generation" == true ]] && \
+            { [[ "$current_state" != "$attempted_state" ]] || \
+                [[ "$current_policy_token" != "$attempted_policy_token" ]]; }; then
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status=5 \
+                reason=post_action_generation_mismatch \
+                observed_state="$current_state" \
+                expected_policy_token="$attempted_policy_token" \
+                observed_policy_token="$current_policy_token" \
+                applied_ready="$applied_ready"
+            return 5
+        elif [[ "$current_state" != "$attempted_state" ]]; then
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status=4 \
+                reason=lid_state_changed_during_reconciliation \
+                observed_state="$current_state" applied_ready="$applied_ready"
+            return 4
+        fi
 
-    attempted_internal=$(jq -er '.internal.enabled | tostring' \
-        <<< "$attempted_topology")
-    attempted_enabled_external_count=$(jq -er \
-        '[.externals[] | select(.enabled)] | length' \
-        <<< "$attempted_topology")
-    if [[ "$attempted_state" == closed && \
-        "$attempted_enabled_external_count" -gt 0 ]]; then
-        attempted_desired_internal=disabled
-    else
-        attempted_desired_internal=enabled
-    fi
-    if [[ "$attempted_desired_internal" == enabled ]] && \
-        { [[ "$preserve_dpms" != true ]] || \
-            [[ "$attempted_internal" == false ]]; }; then
-        wake_required=true
-    fi
-    if ! observed_joint_state_matches_policy "$attempted_state" \
-        "$wake_required"; then
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status=4 \
-            reason=post_action_policy_mismatch topology="$current_topology" \
-            applied_ready="$applied_ready"
-        return 4
-    fi
+        attempted_internal=$(jq -er '.internal.enabled | tostring' \
+            <<< "$attempted_topology")
+        attempted_enabled_external_count=$(jq -er \
+            '[.externals[] | select(.enabled)] | length' \
+            <<< "$attempted_topology")
+        if [[ "$attempted_state" == closed && \
+            "$attempted_enabled_external_count" -gt 0 ]]; then
+            attempted_desired_internal=disabled
+        else
+            attempted_desired_internal=enabled
+        fi
+        if [[ "$attempted_desired_internal" == enabled ]] && \
+            { [[ "$preserve_dpms" != true ]] || \
+                [[ "$attempted_internal" == false ]]; }; then
+            wake_required=true
+        fi
+        if ! observed_joint_state_matches_policy "$attempted_state" \
+            "$wake_required"; then
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status=4 \
+                reason=post_action_policy_mismatch topology="$current_topology" \
+                applied_ready="$applied_ready"
+            return 4
+        fi
 
+        [[ "$settle_validation_once" == true ]] || break
+        monitor_state_validate_output_once "$LAPTOP_DISPLAY" "$SCRIPT_DIR"
+        report_output_validation
+        [[ "$MONITOR_STATE_VALIDATION_WAITED" == true ]] || break
+        # Recheck after settling, but never spend another budget on a retry.
+        settle_validation_once=false
+    done
     applied_state=$current_state
     applied_topology=$current_topology
     applied_policy_token=$current_policy_token
     applied_ready=true
     log_info reconciliation_succeeded trigger="$trigger" attempt="$attempt" \
         state="$applied_state" topology="$applied_topology" \
-        policy_token="$applied_policy_token"
+        policy_token="$applied_policy_token" verification_scope=compositor \
+        "$MONITOR_STATE_VALIDATION_DETAILS"
 }
 
 run_immediate_reconciliation_attempt() {
@@ -3402,6 +3646,7 @@ log_info monitor_started observed_state="$last_observed_state" \
 while true; do
     if [[ "$resume_pending" == true ]]; then
         resume_pending=false
+        monitor_state_validation_unavailable resume_pending "$LAPTOP_DISPLAY"
         pending_reconciliation=true
         pending_requires_stability=true
         pending_preserve_dpms=false

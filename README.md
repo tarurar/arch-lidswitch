@@ -57,6 +57,33 @@ daemon requires three identical full lid/topology samples plus an immediate
 matching precommit sample. A dedicated login1 listener keeps one subscription
 across the sleep cycle and coalesces resume requests into the main daemon.
 
+Reconciliation success is **compositor-reported**: `reconciliation_verified`
+and `reconciliation_succeeded` carry `verification_scope=compositor` and a
+separate `validation` outcome. When policy expects the internal display enabled
+and Hyprland reports it enabled with DPMS on, the runtime also reads its DRM
+connector's `enabled` attribute under `/sys/class/drm`. It requires a unique
+connector-name match across all DRM cards; missing, unreadable, malformed, or
+ambiguous evidence produces `validation=unavailable`, never agreement.
+
+Consecutive disagreeing observations spanning two seconds with the same lid,
+full compositor topology, and mapped connector produce `validation=degraded`.
+Before that, validation is `pending`. Agreement, unavailable evidence, a lid
+or topology change, or intentional compositor DPMS sleep cancels that period.
+DPMS sleep reports `validation=suspended` and never causes a wake command.
+Policy that disables the internal output reports `validation=exempt`.
+The daemon continues assessment even when compositor topology is unchanged,
+logging validation transitions (including recovery to `agreement`) once per
+change. Ordinary and resume one-shot invocations allow at most two additional
+seconds for settling observations, reporting `pending` if a complete period
+was not observed before the budget expired.
+
+Independent validation does not change reconciliation exit status, trigger
+retries, or add display or power actions. Diagnostics include the internal
+output, mapped connector when known, compositor enabled/DPMS state, kernel
+enablement, and outcome/reason. Kernel enablement corroborates encoder
+attachment; neither it nor kernel DPMS proves that the panel displays pixels.
+This detects disagreement without diagnosing or repairing a display-stack fault.
+
 Hyprland can accept an internal-output restore while applying nothing when no
 output is currently active. After that exact accepted-but-unverified result,
 arch-lidswitch creates one private, named headless recovery output, waits for

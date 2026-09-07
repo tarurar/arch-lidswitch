@@ -918,6 +918,13 @@ case "$command_name" in
         elif [[ "${1:-}" == "-j" && "${2:-}" == "monitors" && \
             "${3:-}" == "all" ]]; then
             log_command "$@"
+            if [[ -n "${TEST_HYPRCTL_QUERY_DELAY_MARKER:-}" &&
+                -e "$TEST_HYPRCTL_QUERY_DELAY_MARKER" ]]; then
+                if [[ -n "${TEST_HYPRCTL_QUERY_PID_FILE:-}" ]]; then
+                    printf '%s\n' "$BASHPID" > "$TEST_HYPRCTL_QUERY_PID_FILE"
+                fi
+                "${TEST_REAL_SLEEP_BIN:?}" 10
+            fi
             if [[ -n "${TEST_HYPRCTL_MONITORS_SEQUENCE_DIR:-}" ]]; then
                 sequence_counter=${TEST_HYPRCTL_MONITORS_SEQUENCE_COUNTER:?}
                 sequence_index=0

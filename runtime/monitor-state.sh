@@ -18,6 +18,208 @@ LAST_OUTPUT_RECOVERY_NAME=ARCH-LIDSWITCH-RECOVERY
 MONITOR_STATE_RECOVERY_OUTPUT=""
 MONITOR_STATE_RECOVERY_USED=false
 MONITOR_STATE_RECOVERY_CLEANUP_DEFERRED=false
+MONITOR_STATE_VALIDATION=unavailable
+MONITOR_STATE_VALIDATION_REASON=not_observed
+MONITOR_STATE_VALIDATION_SINCE=""
+MONITOR_STATE_VALIDATION_GENERATION=""
+MONITOR_STATE_VALIDATION_DETAILS="validation=unavailable reason=not_observed"
+MONITOR_STATE_KERNEL_CONNECTOR=unknown
+MONITOR_STATE_KERNEL_ENABLED=unknown
+MONITOR_STATE_VALIDATION_WORKER=false
+MONITOR_STATE_VALIDATION_WAITED=false
+
+# Kernel enablement corroborates encoder attachment, not panel illumination.
+monitor_state_observe_kernel_enabled() {
+    local output=$1
+    local drm_root=${HYPR_DRM_ROOT:-/sys/class/drm}
+    local candidate name card value
+    local -a connectors=()
+
+    MONITOR_STATE_KERNEL_CONNECTOR=unknown
+    MONITOR_STATE_KERNEL_ENABLED=unknown
+    MONITOR_STATE_VALIDATION_REASON=connector_missing
+    for candidate in "$drm_root"/card[0-9]*-"$output"; do
+        [[ -d "$candidate" ]] || continue
+        name=${candidate##*/}
+        card=${name%-"$output"}
+        [[ "$card" =~ ^card[0-9]+$ ]] || continue
+        connectors+=("$candidate")
+    done
+    if (( ${#connectors[@]} > 1 )); then
+        MONITOR_STATE_VALIDATION_REASON=connector_ambiguous
+    elif (( ${#connectors[@]} == 1 )); then
+        candidate=${connectors[0]}
+        MONITOR_STATE_KERNEL_CONNECTOR=${candidate##*/}
+        MONITOR_STATE_VALIDATION_REASON=kernel_enabled_unreadable
+        if [[ -f "$candidate/enabled" && -r "$candidate/enabled" ]] &&
+            value=$(jq -Rrs '
+                if . == "enabled\n" or . == "enabled" then "enabled"
+                elif . == "disabled\n" or . == "disabled" then "disabled"
+                else "malformed" end
+            ' "$candidate/enabled" 2>/dev/null); then
+            case "$value" in
+                enabled|disabled)
+                    MONITOR_STATE_KERNEL_ENABLED=$value
+                    MONITOR_STATE_VALIDATION_REASON=kernel_$value
+                    ;;
+                *) MONITOR_STATE_VALIDATION_REASON=kernel_enabled_malformed ;;
+            esac
+        fi
+    fi
+    return 0
+}
+
+monitor_state_validation_unavailable() {
+    MONITOR_STATE_VALIDATION=unavailable
+    MONITOR_STATE_VALIDATION_REASON=$1
+    MONITOR_STATE_VALIDATION_SINCE=""
+    MONITOR_STATE_VALIDATION_GENERATION=""
+    MONITOR_STATE_KERNEL_CONNECTOR=unknown
+    MONITOR_STATE_KERNEL_ENABLED=unknown
+    monitor_state_format_validation "$2" unknown unknown
+}
+
+monitor_state_assess_output() {
+    local lid=$1
+    local output enabled dpms external_count
+
+    if ! read -r output enabled dpms external_count < <(jq -r '[
+        .internal.output, .internal.enabled, .internal.dpms,
+        ([.externals[] | select(.enabled)] | length)
+    ] | map(tostring) | @tsv' <<< "$MONITOR_STATE_TOPOLOGY"); then
+        monitor_state_validation_unavailable topology_unavailable \
+            "${LAPTOP_DISPLAY:-unknown}"
+        return 0
+    fi
+    monitor_state_observe_kernel_enabled "$output"
+    MONITOR_STATE_VALIDATION=unavailable
+    if [[ "$lid" != open && "$lid" != closed ]]; then
+        MONITOR_STATE_VALIDATION_REASON=lid_unavailable
+    elif [[ "$lid" == closed && "$external_count" -gt 0 ]]; then
+        MONITOR_STATE_VALIDATION=exempt
+        MONITOR_STATE_VALIDATION_REASON=policy_internal_disabled
+    elif [[ "$dpms" == false ]]; then
+        MONITOR_STATE_VALIDATION=suspended
+        MONITOR_STATE_VALIDATION_REASON=dpms_sleep
+    elif [[ "$enabled" != true || "$dpms" != true ]]; then
+        MONITOR_STATE_VALIDATION_REASON=compositor_not_restored
+    elif [[ "$MONITOR_STATE_KERNEL_ENABLED" == enabled ]]; then
+        MONITOR_STATE_VALIDATION=agreement
+    elif [[ "$MONITOR_STATE_KERNEL_ENABLED" == disabled ]]; then
+        monitor_state_settle_disagreement \
+            "$lid:$MONITOR_STATE_TOPOLOGY:$MONITOR_STATE_KERNEL_CONNECTOR"
+    fi
+    if [[ "$MONITOR_STATE_VALIDATION" != pending &&
+        "$MONITOR_STATE_VALIDATION" != degraded ]]; then
+        MONITOR_STATE_VALIDATION_SINCE=""
+        MONITOR_STATE_VALIDATION_GENERATION=""
+    fi
+    monitor_state_format_validation "$output" "$enabled" "$dpms"
+}
+
+monitor_state_settle_disagreement() {
+    local generation=$1 uptime ignored now
+
+    # /proc/uptime is monotonic across clock corrections and includes suspend.
+    if ! read -r uptime ignored < /proc/uptime ||
+        [[ ! "$uptime" =~ ^[0-9]+\.[0-9]{2}$ ]]; then
+        MONITOR_STATE_VALIDATION_REASON=clock_unavailable
+        return 0
+    fi
+    now=${uptime/./}
+    now=$((10#$now))
+    if [[ "$generation" != "$MONITOR_STATE_VALIDATION_GENERATION" ]]; then
+        MONITOR_STATE_VALIDATION_SINCE=$now
+        MONITOR_STATE_VALIDATION_GENERATION=$generation
+    fi
+    MONITOR_STATE_VALIDATION=pending
+    MONITOR_STATE_VALIDATION_REASON=settling
+    # Require a full two seconds even when the first timestamp was rounded down.
+    if (( now - MONITOR_STATE_VALIDATION_SINCE > 200 )); then
+        MONITOR_STATE_VALIDATION=degraded
+        MONITOR_STATE_VALIDATION_REASON=persistent_disagreement
+    fi
+}
+
+monitor_state_format_validation() {
+    MONITOR_STATE_VALIDATION_DETAILS="validation=$MONITOR_STATE_VALIDATION"
+    MONITOR_STATE_VALIDATION_DETAILS+=" reason=$MONITOR_STATE_VALIDATION_REASON"
+    MONITOR_STATE_VALIDATION_DETAILS+=" internal_output=$1"
+    MONITOR_STATE_VALIDATION_DETAILS+=" connector=$MONITOR_STATE_KERNEL_CONNECTOR"
+    MONITOR_STATE_VALIDATION_DETAILS+=" compositor_enabled=$2 compositor_dpms=$3"
+    MONITOR_STATE_VALIDATION_DETAILS+=" kernel_enabled=$MONITOR_STATE_KERNEL_ENABLED"
+}
+
+monitor_state_accept_validation_sample() {
+    local outcome reason output connector enabled dpms kernel
+    local report since generation
+
+    IFS=$'\t' read -r report since generation <<< "$1"
+    read -r outcome reason output connector enabled dpms kernel <<< "$report"
+    MONITOR_STATE_VALIDATION=${outcome#validation=}
+    MONITOR_STATE_VALIDATION_REASON=${reason#reason=}
+    MONITOR_STATE_KERNEL_CONNECTOR=${connector#connector=}
+    MONITOR_STATE_KERNEL_ENABLED=${kernel#kernel_enabled=}
+    monitor_state_format_validation "${output#internal_output=}" \
+        "${enabled#compositor_enabled=}" "${dpms#compositor_dpms=}"
+    MONITOR_STATE_VALIDATION_SINCE=${since#none}
+    MONITOR_STATE_VALIDATION_GENERATION=${generation#none}
+}
+
+# This worker only observes. Its caller bounds the whole process group, including
+# any slow compositor query, rather than adding per-query timeouts to the budget.
+monitor_state_sample_output_validation() {
+    local output=$1 lid
+
+    while true; do
+        sleep 0.05 || return 1
+        if ! lid=$(read_lid_state 2>/dev/null); then
+            monitor_state_validation_unavailable lid_unavailable "$output"
+        elif ! monitor_state_observe_topology "$output" 2>/dev/null; then
+            monitor_state_validation_unavailable topology_unavailable "$output"
+        else
+            monitor_state_assess_output "$lid"
+        fi
+        printf '%s\t%s\t%s\n' "$MONITOR_STATE_VALIDATION_DETAILS" \
+            "${MONITOR_STATE_VALIDATION_SINCE:-none}" \
+            "${MONITOR_STATE_VALIDATION_GENERATION:-none}"
+        [[ "$MONITOR_STATE_VALIDATION" == pending ]] || break
+    done
+}
+
+monitor_state_validate_output_once() {
+    local output=$1 script_dir=$2 lid observations worker_status=0
+
+    MONITOR_STATE_VALIDATION_WAITED=false
+    lid=$(read_lid_state 2>/dev/null) || lid=unknown
+    monitor_state_assess_output "$lid"
+    if [[ "$MONITOR_STATE_VALIDATION" != pending ||
+        "${ARCH_LIDSWITCH_VALIDATION_MODE:-}" == sample ]]; then
+        return 0
+    fi
+
+    MONITOR_STATE_VALIDATION_WAITED=true
+    observations=$(
+        { timeout --signal=KILL 2s /bin/bash -c '
+            . "$1/monitor-state.sh" || exit 1
+            . "$1/lid-state.sh" || exit 1
+            MONITOR_STATE_VALIDATION_WORKER=true
+            MONITOR_STATE_VALIDATION_SINCE=$3
+            MONITOR_STATE_VALIDATION_GENERATION=$4
+            monitor_state_sample_output_validation "$2"
+        ' validation "$script_dir" "$output" \
+            "$MONITOR_STATE_VALIDATION_SINCE" \
+            "$MONITOR_STATE_VALIDATION_GENERATION"; } 2>/dev/null
+    ) || worker_status=$?
+    if (( worker_status != 0 && worker_status != 137 )); then
+        monitor_state_validation_unavailable validation_worker_failed "$output"
+    elif [[ -n "$observations" ]]; then
+        monitor_state_accept_validation_sample "${observations##*$'\n'}"
+    elif (( worker_status == 0 )); then
+        monitor_state_validation_unavailable validation_worker_failed "$output"
+    fi
+    return 0
+}
 
 monitor_state_fail() {
     MONITOR_STATE_ERROR=$1
@@ -41,11 +243,16 @@ monitor_state_recovery_deadline_reached() {
 monitor_state_observe_topology() {
     local output=$1
     local monitors_json
+    local -a query_timeout=(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS")
 
+    # The validation worker already has a process-group deadline. A nested
+    # timeout would put its query in a separate group that could outlive it.
+    if [[ "$MONITOR_STATE_VALIDATION_WORKER" == true ]]; then
+        query_timeout=()
+    fi
     MONITOR_STATE_ERROR=""
     MONITOR_STATE_TOPOLOGY=""
-    if ! monitors_json=$(timeout --kill-after=1s "$HYPRCTL_TIMEOUT_SECONDS" \
-        hyprctl -j monitors all); then
+    if ! monitors_json=$("${query_timeout[@]}" hyprctl -j monitors all); then
         monitor_state_fail monitor_query_failed
         return
     fi

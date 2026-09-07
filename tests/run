@@ -11255,6 +11255,8 @@ tests_run=0
 tests_failed=0
 tests_selected=0
 
+. "$ROOT_DIR/tests/output-validation.sh"
+
 run_test() {
     local test_id=$1
     local description=$2
@@ -11532,6 +11534,86 @@ run_test \
     'BUG-009-idempotent-restart' \
     'repeated one-shot reconciliation is outcome-idempotent' \
     installed_daemon_once_is_outcome_idempotent
+
+run_test \
+    'ISSUE-1-once-total-budget' \
+    'daemon one-shot has a single settling budget across lid changes' \
+    validation_once_bounds_total_budget
+
+run_test \
+    'ISSUE-1-resume-total-budget' \
+    'resume one-shot has a single settling budget across lid changes' \
+    validation_resume_bounds_total_budget
+
+run_test \
+    'ISSUE-1-worker-failure' \
+    'validation worker failures remain explicit and nonfatal' \
+    validation_reports_worker_failure
+
+run_test \
+    'ISSUE-1-connector-mapping' \
+    'validation maps the unique internal connector across DRM cards' \
+    validation_maps_unique_connector
+
+run_test \
+    'ISSUE-1-no-reconciliation' \
+    'kernel disagreement adds no reconciliation or display commands' \
+    validation_does_not_reconcile_kernel_changes
+
+run_test \
+    'ISSUE-1-topology-reset' \
+    'full topology changes reset validation without another reconciliation' \
+    validation_generation_resets_settling
+
+run_test \
+    'ISSUE-1-lid-reset' \
+    'lid changes reset validation even when display policy is unchanged' \
+    validation_lid_resets_settling
+
+run_test \
+    'ISSUE-1-unavailable-reset' \
+    'unavailable observations reset the settling period' \
+    validation_unavailable_resets_settling
+
+run_test \
+    'ISSUE-1-resume' \
+    'resume validation preserves operation status and mutations' \
+    validation_resume_keeps_operation_status
+
+run_test \
+    'ISSUE-1-slow-query' \
+    'one-shot validation bounds even a slow compositor query' \
+    validation_budget_includes_slow_queries
+
+run_test \
+    'ISSUE-1-unavailable' \
+    'unavailable evidence preserves compositor success' \
+    validation_unavailable_evidence
+
+run_test \
+    'ISSUE-1-recovery' \
+    'daemon reports recovery to agreement' \
+    validation_reports_recovery
+
+run_test \
+    'ISSUE-1-transient' \
+    'transient disagreement does not degrade validation' \
+    validation_clears_transient_disagreement
+
+run_test \
+    'ISSUE-1-dpms-sleep' \
+    'intentional DPMS sleep cancels pending validation without waking' \
+    validation_dpms_sleep_resets_settling
+
+run_test \
+    'ISSUE-1-cli-budget' \
+    'CLI qualifies compositor success within its settling budget' \
+    validation_cli_bounds_settling
+
+run_test \
+    'ISSUE-1-persistent-disagreement' \
+    'daemon reports persistent disagreement without reconciliation retries' \
+    validation_persistent_disagreement
 
 run_test \
     'BUG-010-cli-postconditions' \

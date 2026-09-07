@@ -8,6 +8,11 @@ RECONCILIATION_COOLDOWN_TICKS=5
 MAX_STABILITY_SAMPLES=40
 REQUIRED_STABLE_SAMPLES=3
 STABILITY_SAMPLE_INTERVAL=0.25
+last_validation_details=""
+settle_validation_once=false
+if [[ "${1:-}" == --once || "${1:-}" == --resume-once ]]; then
+    settle_validation_once=true
+fi
 
 log_record() {
     local level=$1
@@ -129,6 +134,8 @@ observe_joint_state() {
         log_error recovery_state_cleanup_failed phase=policy_observation \
             trigger="$trigger" status="$observation_status" \
             reason="$MONITOR_STATE_ERROR"
+        monitor_state_validation_unavailable observation_failed "$LAPTOP_DISPLAY"
+        report_output_validation
         return "$observation_status"
     fi
     if monitor_state_reconcile_stale_recovery_output; then
@@ -157,7 +164,25 @@ observe_joint_state() {
                 status="$observation_status" reason="$MONITOR_STATE_ERROR"
         fi
     fi
+    if (( observation_status == 0 )); then
+        monitor_state_assess_output "$current_state"
+    else
+        monitor_state_validation_unavailable observation_failed "$LAPTOP_DISPLAY"
+    fi
+    report_output_validation
     return "$observation_status"
+}
+
+report_output_validation() {
+    if [[ "$MONITOR_STATE_VALIDATION_DETAILS" != "$last_validation_details" ]]; then
+        if [[ "$MONITOR_STATE_VALIDATION" == degraded ]]; then
+            log_record warning output_validation_changed \
+                "$MONITOR_STATE_VALIDATION_DETAILS"
+        else
+            log_info output_validation_changed "$MONITOR_STATE_VALIDATION_DETAILS"
+        fi
+        last_validation_details=$MONITOR_STATE_VALIDATION_DETAILS
+    fi
 }
 
 stabilize_joint_state() {
@@ -320,7 +345,8 @@ apply_observed_joint_state() {
         state="$attempted_state" preserve_dpms="$preserve_dpms" \
         commit_generation="$commit_generation" topology="$attempted_topology" \
         policy_token="$attempted_policy_token"
-    invoke_lid_switch "$attempted_state" "$preserve_dpms" \
+    ARCH_LIDSWITCH_VALIDATION_MODE=sample \
+        invoke_lid_switch "$attempted_state" "$preserve_dpms" \
         "$commit_generation" "$attempted_state" "$attempted_policy_token"
     reconciliation_status=$?
     if (( reconciliation_status != 0 )); then
@@ -330,66 +356,75 @@ apply_observed_joint_state() {
         return "$reconciliation_status"
     fi
 
-    if observe_joint_state post_action; then
-        :
-    else
-        reconciliation_status=$?
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status="$reconciliation_status" \
-            reason=post_action_observation_failed applied_ready="$applied_ready"
-        return "$reconciliation_status"
-    fi
-    if [[ "$commit_generation" == true ]] && \
-        { [[ "$current_state" != "$attempted_state" ]] || \
-            [[ "$current_policy_token" != "$attempted_policy_token" ]]; }; then
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status=5 \
-            reason=post_action_generation_mismatch \
-            observed_state="$current_state" \
-            expected_policy_token="$attempted_policy_token" \
-            observed_policy_token="$current_policy_token" \
-            applied_ready="$applied_ready"
-        return 5
-    elif [[ "$current_state" != "$attempted_state" ]]; then
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status=4 \
-            reason=lid_state_changed_during_reconciliation \
-            observed_state="$current_state" applied_ready="$applied_ready"
-        return 4
-    fi
+    while true; do
+        if observe_joint_state post_action; then
+            :
+        else
+            reconciliation_status=$?
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status="$reconciliation_status" \
+                reason=post_action_observation_failed applied_ready="$applied_ready"
+            return "$reconciliation_status"
+        fi
+        if [[ "$commit_generation" == true ]] && \
+            { [[ "$current_state" != "$attempted_state" ]] || \
+                [[ "$current_policy_token" != "$attempted_policy_token" ]]; }; then
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status=5 \
+                reason=post_action_generation_mismatch \
+                observed_state="$current_state" \
+                expected_policy_token="$attempted_policy_token" \
+                observed_policy_token="$current_policy_token" \
+                applied_ready="$applied_ready"
+            return 5
+        elif [[ "$current_state" != "$attempted_state" ]]; then
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status=4 \
+                reason=lid_state_changed_during_reconciliation \
+                observed_state="$current_state" applied_ready="$applied_ready"
+            return 4
+        fi
 
-    attempted_internal=$(jq -er '.internal.enabled | tostring' \
-        <<< "$attempted_topology")
-    attempted_enabled_external_count=$(jq -er \
-        '[.externals[] | select(.enabled)] | length' \
-        <<< "$attempted_topology")
-    if [[ "$attempted_state" == closed && \
-        "$attempted_enabled_external_count" -gt 0 ]]; then
-        attempted_desired_internal=disabled
-    else
-        attempted_desired_internal=enabled
-    fi
-    if [[ "$attempted_desired_internal" == enabled ]] && \
-        { [[ "$preserve_dpms" != true ]] || \
-            [[ "$attempted_internal" == false ]]; }; then
-        wake_required=true
-    fi
-    if ! observed_joint_state_matches_policy "$attempted_state" \
-        "$wake_required"; then
-        log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
-            state="$attempted_state" status=4 \
-            reason=post_action_policy_mismatch topology="$current_topology" \
-            applied_ready="$applied_ready"
-        return 4
-    fi
+        attempted_internal=$(jq -er '.internal.enabled | tostring' \
+            <<< "$attempted_topology")
+        attempted_enabled_external_count=$(jq -er \
+            '[.externals[] | select(.enabled)] | length' \
+            <<< "$attempted_topology")
+        if [[ "$attempted_state" == closed && \
+            "$attempted_enabled_external_count" -gt 0 ]]; then
+            attempted_desired_internal=disabled
+        else
+            attempted_desired_internal=enabled
+        fi
+        if [[ "$attempted_desired_internal" == enabled ]] && \
+            { [[ "$preserve_dpms" != true ]] || \
+                [[ "$attempted_internal" == false ]]; }; then
+            wake_required=true
+        fi
+        if ! observed_joint_state_matches_policy "$attempted_state" \
+            "$wake_required"; then
+            log_error reconciliation_failed trigger="$trigger" attempt="$attempt" \
+                state="$attempted_state" status=4 \
+                reason=post_action_policy_mismatch topology="$current_topology" \
+                applied_ready="$applied_ready"
+            return 4
+        fi
 
+        [[ "$settle_validation_once" == true ]] || break
+        monitor_state_validate_output_once "$LAPTOP_DISPLAY" "$SCRIPT_DIR"
+        report_output_validation
+        [[ "$MONITOR_STATE_VALIDATION_WAITED" == true ]] || break
+        # Recheck after settling, but never spend another budget on a retry.
+        settle_validation_once=false
+    done
     applied_state=$current_state
     applied_topology=$current_topology
     applied_policy_token=$current_policy_token
     applied_ready=true
     log_info reconciliation_succeeded trigger="$trigger" attempt="$attempt" \
         state="$applied_state" topology="$applied_topology" \
-        policy_token="$applied_policy_token"
+        policy_token="$applied_policy_token" verification_scope=compositor \
+        "$MONITOR_STATE_VALIDATION_DETAILS"
 }
 
 run_immediate_reconciliation_attempt() {
@@ -632,6 +667,7 @@ log_info monitor_started observed_state="$last_observed_state" \
 while true; do
     if [[ "$resume_pending" == true ]]; then
         resume_pending=false
+        monitor_state_validation_unavailable resume_pending "$LAPTOP_DISPLAY"
         pending_reconciliation=true
         pending_requires_stability=true
         pending_preserve_dpms=false

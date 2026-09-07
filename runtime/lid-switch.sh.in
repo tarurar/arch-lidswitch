@@ -538,9 +538,11 @@ reconcile_lid_state() {
         log_info power_delegated owner=systemd-logind action=close \
             reason=no_enabled_external
     fi
+    monitor_state_validate_output_once "$LAPTOP_DISPLAY" "$SCRIPT_DIR"
     log_info reconciliation_verified action="$action" \
         desired_internal="$desired_internal" desired_dpms="$desired_dpms" \
-        topology="$topology_snapshot"
+        topology="$topology_snapshot" verification_scope=compositor \
+        "$MONITOR_STATE_VALIDATION_DETAILS"
 }
 
 preserve_dpms=false

@@ -25,7 +25,11 @@ if [[ "${1:-}" == -i && "$installer_invocation" == true ]]; then
     fi
     runtime_dir="$home/.test-xdg-runtime"
     mkdir -m 0700 -p "$runtime_dir"
-    exec "$REAL_ENV_BIN" -i XDG_RUNTIME_DIR="$runtime_dir" "${@:2}"
+    exec "$REAL_ENV_BIN" -i HYPR_DRM_ROOT="$home/.test-drm" \
+        XDG_RUNTIME_DIR="$runtime_dir" "${@:2}"
 fi
 
+if [[ "${1:-}" == -i ]]; then
+    exec "$REAL_ENV_BIN" -i HYPR_DRM_ROOT="$home/.test-drm" "${@:2}"
+fi
 exec "$REAL_ENV_BIN" "$@"
