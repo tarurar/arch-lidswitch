@@ -11536,6 +11536,16 @@ run_test \
     installed_daemon_once_is_outcome_idempotent
 
 run_test \
+    'ISSUE-1-cleanup-status' \
+    'validation cleanup reports errors without masking assertion failures' \
+    validation_cleanup_preserves_failure_status
+
+run_test \
+    'ISSUE-1-cleanup-query' \
+    'validation fixture cleanup stops in-flight monitor queries' \
+    validation_cleanup_stops_inflight_query
+
+run_test \
     'ISSUE-1-once-total-budget' \
     'daemon one-shot has a single settling budget across lid changes' \
     validation_once_bounds_total_budget

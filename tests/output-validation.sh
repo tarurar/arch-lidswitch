@@ -35,14 +35,13 @@ prepare_validation_fixture() {
 
 validation_persistent_disagreement() (
     set -euo pipefail
-    local test_root validation_cli validation_daemon
+    local test_root validation_cli validation_daemon validation_pid
     local -a validation_environment
     local status=0 output
     prepare_validation_fixture || return
 
-    "$ENV_BIN" -i "${validation_environment[@]}" \
-        "$TIMEOUT_BIN" 3.5 "$validation_daemon" \
-        > "$test_root/daemon.out" 2>&1 || status=$?
+    start_validation_daemon "$TIMEOUT_BIN" 3.5 || return
+    wait "$validation_pid" || status=$?
 
     [[ "$status" == 124 ]] || return 1
     output=$(<"$test_root/daemon.out")
@@ -147,12 +146,109 @@ wait_for_validation_log() {
 
 start_validation_daemon() {
     setsid "$ENV_BIN" -i "${validation_environment[@]}" \
-        "$validation_daemon" > "$test_root/daemon.out" 2>&1 &
+        "$@" "$validation_daemon" > "$test_root/daemon.out" 2>&1 &
     validation_pid=$!
-    trap 'kill -KILL -- "-$validation_pid" 2>/dev/null || true;
-        wait "$validation_pid" 2>/dev/null || true; rm -rf "$test_root"' EXIT
+    trap cleanup_validation_fixture EXIT
     wait_for_validation_log 'event=monitor_started'
 }
+
+stop_validation_daemon() {
+    local attempt status
+
+    # Query timeouts create their own process groups within this test session.
+    # Drain every live descendant before deleting files it could still recreate.
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        pkill -KILL --session "$validation_pid" 2>/dev/null || true
+        if pgrep --session "$validation_pid" --runstates D,R,S,T,t >/dev/null; then
+            "$REAL_SLEEP_BIN" 0.01
+        else
+            status=$?
+            (( status == 1 )) || return "$status"
+            wait "$validation_pid" 2>/dev/null || true
+            return 0
+        fi
+    done
+    printf 'Unable to stop validation test session %s\n' "$validation_pid" >&2
+    return 1
+}
+
+cleanup_validation_fixture() {
+    local test_status=$? cleanup_status=0
+
+    trap - EXIT
+    stop_validation_daemon || cleanup_status=$?
+    if (( cleanup_status == 0 )); then
+        rm -rf "$test_root" || cleanup_status=$?
+    fi
+    if (( test_status != 0 )); then
+        exit "$test_status"
+    fi
+    exit "$cleanup_status"
+}
+
+validation_cleanup_stops_inflight_query() (
+    set -euo pipefail
+    local test_root validation_cli validation_daemon validation_pid query_pid
+    local query_state ignored attempt
+    local -a validation_environment
+    prepare_validation_fixture || return
+    validation_environment+=(
+        TEST_HYPRCTL_QUERY_DELAY_MARKER="$test_root/delay-query"
+        TEST_HYPRCTL_QUERY_PID_FILE="$test_root/query-pid"
+        TEST_REAL_SLEEP_BIN="$REAL_SLEEP_BIN"
+    )
+    start_validation_daemon || return
+    : > "$test_root/delay-query"
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        [[ -s "$test_root/query-pid" ]] && break
+        "$REAL_SLEEP_BIN" 0.01
+    done
+    [[ -s "$test_root/query-pid" ]] || return 1
+    query_pid=$(<"$test_root/query-pid")
+
+    stop_validation_daemon || return
+
+    if [[ -r "/proc/$query_pid/stat" ]] &&
+        read -r ignored ignored query_state ignored \
+            < "/proc/$query_pid/stat" 2>/dev/null; then
+        if [[ "$query_state" != Z ]]; then
+            printf 'Cleanup left monitor query %s running and able to recreate fixture files\n' \
+                "$query_pid" >&2
+            return 1
+        fi
+    fi
+)
+
+validation_cleanup_preserves_failure_status() (
+    set -euo pipefail
+    local test_root validation_cli validation_daemon validation_pid
+    local trap_definition initial_status actual_status expected_status
+    local -a validation_environment
+    prepare_validation_fixture || return
+    start_validation_daemon || return
+    trap_definition=$(trap -p EXIT)
+    mkdir "$test_root/cleanup-fakes"
+    printf '#!/bin/bash\nexit 2\n' > "$test_root/cleanup-fakes/pgrep"
+    chmod +x "$test_root/cleanup-fakes/pgrep"
+
+    for initial_status in 0 42; do
+        actual_status=0
+        # Exercise the fixture's registered EXIT trap, including command errors.
+        (
+            eval "$trap_definition"
+            PATH="$test_root/cleanup-fakes:$PATH"
+            exit "$initial_status"
+        ) > "$test_root/cleanup.out" 2>&1 || actual_status=$?
+
+        expected_status=$initial_status
+        (( initial_status != 0 )) || expected_status=2
+        if (( actual_status != expected_status )); then
+            printf 'Cleanup status: initial=%s expected=%s actual=%s\n' \
+                "$initial_status" "$expected_status" "$actual_status" >&2
+            return 1
+        fi
+    done
+)
 
 validation_reports_recovery() (
     set -euo pipefail
