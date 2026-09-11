@@ -521,7 +521,7 @@ detect_monitors() {
     log_info "Detected internal output: $laptop_monitor ($internal_status)"
 
     external_records=$("$JQ_BIN" -r --arg internal "$laptop_monitor" '
-        [.[] | select(.name != $internal)]
+        [.[] | select(.name != $internal and .name != "FALLBACK")]
         | sort_by(.name)
         | .[]
         | [.name, (if .disabled then "inactive" else "enabled" end)]

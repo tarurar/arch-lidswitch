@@ -5,7 +5,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 ## Features
 
 - 🔄 **Automatic Monitor Management**: Reconciles the internal display when either lid state or represented output topology changes
-- 🖥️ **Structured Detection**: Reads `hyprctl -j monitors all`; uses one unique `eDP*` output as the default internal display and treats every other represented output as external, regardless of connector name
+- 🖥️ **Structured Detection**: Reads `hyprctl -j monitors all`; uses one unique `eDP*` output as the default internal display and treats other represented outputs as external, except Hyprland's synthetic `FALLBACK`
 - ⚡ **Instant Response**: Real-time lid and output-topology monitoring with ~1 second response time
 - 🛡️ **Hyprland Lua Compatible**: Uses `hyprctl eval`/`hl.monitor()` for modern Hyprland Lua configs
 - 🔧 **Zero Configuration**: Works out of the box after installation
@@ -20,7 +20,7 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 
 ### Lid Closed + Enabled External Output
 
-- Counts every represented output other than the configured internal display; only records with `disabled=false` are enabled
+- Counts represented outputs other than the configured internal display and Hyprland's synthetic `FALLBACK`; only records with `disabled=false` are enabled
 - Captures the active internal panel layout in the private runtime directory
 - Disables laptop internal display
 - Leaves every external monitor's mode, position, scale, transform, and mirror untouched
@@ -44,6 +44,17 @@ An automatic lid switch handler for Hyprland that intelligently manages monitor 
 - On resume, explicitly powers that restored internal display on before success
 - Delegates the lid event to systemd-logind
 - With the supported default policy, logind suspends when undocked and ignores a docked lid close
+
+Hyprland's exact, case-sensitive output name `FALLBACK` is reserved for its
+headless placeholder when no physical output is active. It is excluded from
+the runtime's external-output list and normal lid/topology reconciliation
+fingerprints, so it cannot keep the internal panel disabled after undocking.
+The service does not disable or remove that compositor-owned output.
+Intentional virtual outputs such as `HEADLESS-1` and `WL-1` still count as
+external, as do distinct names such as `FALLBACK-1` and `fallback`. Connector
+prefixes are not used to classify physical versus virtual outputs. The
+service's private `ARCH-LIDSWITCH-RECOVERY` output retains its separate
+ownership and cleanup rules.
 
 The daemon observes a joint lid-and-topology fingerprint. It reconciles the
 first complete observation immediately at service startup, then uses that
@@ -271,8 +282,9 @@ HYPR_LID_INTERNAL_OUTPUT=DSI-1 ./install-hyprland-lid-switch.sh
 
 The selected output may be inactive during installation, but it must appear in
 `hyprctl -j monitors all`. The installer records that identity in both runtime
-scripts. Every other represented output is external; connector prefixes are
-not used to classify external displays.
+scripts. Other represented outputs are external except the exact reserved
+name `FALLBACK`, as described above; connector prefixes are not used to
+classify external displays.
 
 ### Publishing Releases (Maintainers)
 

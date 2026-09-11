@@ -270,6 +270,9 @@ monitor_state_observe_topology() {
             integer and . > 0;
         def output_name:
             type == "string" and test("^[A-Za-z0-9_.:-]+$");
+        # Hyprland owns FALLBACK: it is a headless placeholder, not a dock.
+        def external:
+            .name != $output and .name != "FALLBACK";
         def valid_layout:
             (.width | positive_integer) and
             (.height | positive_integer) and
@@ -295,7 +298,7 @@ monitor_state_observe_topology() {
         | select(length == 1)
         | .[0] as $internal
         | select($internal.disabled or ($internal | valid_layout))
-        | select(all($monitors[] | select(.name != $output);
+        | select(all($monitors[] | select(external);
             .disabled or (. | valid_layout)))
         | {
             internal: {
@@ -317,7 +320,7 @@ monitor_state_observe_topology() {
                 } end)
             },
             externals: ([$monitors[]
-                | select(.name != $output)
+                | select(external)
                 | {
                     output: .name,
                     enabled: (.disabled == false),

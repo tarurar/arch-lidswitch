@@ -211,6 +211,90 @@ installed_cli_dry_run_reports_real_decision_without_mutation() (
     (( failures == 0 ))
 )
 
+assert_installed_cli_external_policy() (
+    set -euo pipefail
+
+    local topology=$1 expected_count=$2 expected_decision=$3
+    local expected_diagnostic=$4
+    local test_root home fake_bin safe_bin effect_log monitor_fixture output
+
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    home="$test_root/home"
+    fake_bin="$test_root/fake-bin"
+    safe_bin="$test_root/safe-bin"
+    effect_log="$test_root/effects.log"
+    monitor_fixture="$ROOT_DIR/tests/fixtures/monitors/one-external.txt"
+    mkdir -m 0700 -p "$home" "$test_root/runtime"
+    prepare_hyprland_config "$home"
+    : > "$effect_log"
+    install_safe_path "$fake_bin" "$safe_bin"
+
+    "$ENV_BIN" -i HOME="$home" PATH="$fake_bin:$safe_bin" \
+        WAYLAND_DISPLAY=wayland-test \
+        HYPRLAND_INSTANCE_SIGNATURE=test-instance XDG_SESSION_TYPE=wayland \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$topology" \
+        "$ROOT_DIR/install-hyprland-lid-switch.sh" \
+        > "$test_root/installer.out" 2>&1
+
+    assert_not_contains "$(<"$test_root/installer.out")" \
+        'Detected external output: FALLBACK (' \
+        'installer diagnostics must exclude the synthetic FALLBACK output' \
+        || return 1
+    assert_contains "$(<"$test_root/installer.out")" "$expected_diagnostic" \
+        'installer diagnostics must retain eligible external outputs' \
+        || return 1
+
+    output=$("$ENV_BIN" -i HOME="$home" PATH="$fake_bin:$safe_bin" \
+        XDG_RUNTIME_DIR="$test_root/runtime" \
+        TEST_EFFECT_LOG="$effect_log" TEST_MONITORS_FIXTURE="$monitor_fixture" \
+        TEST_HYPRCTL_MONITORS_JSON="$topology" \
+        "$home/.config/hypr/scripts/lid-switch.sh" --dry-run close)
+
+    assert_contains "$output" "decision=$expected_decision" \
+        'closed-lid policy must distinguish FALLBACK from usable external outputs' \
+        || return 1
+    assert_contains "$output" "enabled_external_count=$expected_count" \
+        'only eligible enabled outputs should satisfy the external condition'
+)
+
+installed_cli_restores_internal_with_only_fallback() {
+    local topology
+
+    # Reconstructed from the 2026-09-11 undock observation: internal disabled,
+    # last physical external removed, compositor-owned FALLBACK enabled.
+    topology=$(<"$ROOT_DIR/tests/fixtures/monitors-json/fallback.json")
+
+    assert_installed_cli_external_policy "$topology" 0 enable_internal \
+        'No external outputs detected'
+}
+
+installed_cli_keeps_physical_external_with_fallback() {
+    local topology
+
+    topology=$(jq -s '.[0] + [.[1][] | select(.name == "DP-2")]' \
+        "$ROOT_DIR/tests/fixtures/monitors-json/fallback.json" \
+        "$ROOT_DIR/tests/fixtures/monitors-json/framework.json")
+
+    assert_installed_cli_external_policy "$topology" 1 disable_internal \
+        'Detected external output: DP-2 (enabled)'
+}
+
+installed_cli_keeps_intentional_virtual_externals() {
+    local name topology
+
+    for name in HEADLESS-1 WL-1 FALLBACK-1 fallback; do
+        topology=$(jq --arg name "$name" \
+            'map(if .name == "FALLBACK" then .name = $name else . end)' \
+            "$ROOT_DIR/tests/fixtures/monitors-json/fallback.json")
+
+        assert_installed_cli_external_policy "$topology" 1 disable_internal \
+            "Detected external output: $name (enabled)" \
+            || return 1
+    done
+}
+
 installed_cli_dry_run_parser_and_errors_are_safe() (
     set -euo pipefail
 
@@ -11499,6 +11583,21 @@ run_test \
     'BUG-008-open-hotplug-noop' \
     'installed CLI leaves an already-enabled internal and all externals untouched on open' \
     installed_cli_noops_open_when_internal_is_enabled
+
+run_test \
+    'fallback-classification-undocked' \
+    'installed CLI restores the internal panel when only FALLBACK remains' \
+    installed_cli_restores_internal_with_only_fallback
+
+run_test \
+    'fallback-classification-physical' \
+    'installed CLI still counts a physical external alongside FALLBACK' \
+    installed_cli_keeps_physical_external_with_fallback
+
+run_test \
+    'fallback-classification-virtual' \
+    'installed CLI preserves intentional virtual outputs and similar names' \
+    installed_cli_keeps_intentional_virtual_externals
 
 run_test \
     'BUG-008-closed-topology-policy' \
