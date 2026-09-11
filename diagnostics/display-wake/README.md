@@ -1,5 +1,8 @@
 # Display wake incident: 2026-09-11
 
+For the separate USB-C port-switch incident, see the
+[port-switch workaround](port-switch-workaround.md).
+
 ## Findings
 
 The failure followed an idle suspend/resume while docked with the lid closed.
